@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# LinuxPlay runtime state / secrets
+host_ca.key
+host_ca.pem
+trusted_clients.json
+issued_clients/
+client_cert.pem
+client_key.pem
+*.log

@@ -31,16 +31,23 @@ Usage:
   ./run.sh client [args...]   # Run client.py
 
 Behavior:
+  - Host: Linux only (X11 or Wayland). Clients: Linux, Windows, macOS
   - Uses a local .venv in this repo (no global pip installs)
   - Installs only missing system deps (where supported)
   - Installs only missing Python deps into .venv
 
 Python deps (inside .venv):
   PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography
+  (pynput/evdev are skipped on macOS — client-only platform)
 EOF
 }
 
 detect_pm() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    need_cmd brew && { echo brew; return; }
+    echo unknown
+    return
+  fi
   if   need_cmd apt-get; then echo apt
   elif need_cmd dnf;      then echo dnf
   elif need_cmd zypper;   then echo zypper
@@ -54,6 +61,12 @@ detect_pm() {
 pkg_for() {
   local pm="$1" cmd="$2"
   case "$pm" in
+    brew)
+      case "$cmd" in
+        ffmpeg|ffplay)          echo "ffmpeg" ;;
+        python3)                echo "python" ;;
+      esac
+      ;;
     apt)
       case "$cmd" in
         ffmpeg|ffplay)          echo "ffmpeg" ;;
@@ -181,6 +194,9 @@ auto_install_missing_system() {
     pacman)
       sudo pacman -Sy --noconfirm --needed "${pkgs[@]}"
       ;;
+    brew)
+      brew install "${pkgs[@]}"
+      ;;
     apk)
       sudo apk add --no-cache "${pkgs[@]}"
       ;;
@@ -237,7 +253,15 @@ check_system_deps() {
 
   check_python_version || missing+=("python3")
 
-  for cmd in ffmpeg ffplay xdotool xclip pactl setcap wg qrencode pkg-config; do
+  local tool_list
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # macOS is a client-only platform; host-side tools are not required
+    tool_list="ffmpeg ffplay python3"
+    msg "macOS detected: client mode (host-only tools skipped)."
+  else
+    tool_list="ffmpeg ffplay xdotool xclip pactl setcap wg qrencode pkg-config"
+  fi
+  for cmd in $tool_list; do
     if need_cmd "$cmd"; then
       printf "OK:    %-10s (%s)\n" "$cmd" "$cmd"
     else
@@ -302,6 +326,7 @@ ensure_pydeps() {
     python - <<'EOF'
 import importlib, sys
 
+MAC = sys.platform == "darwin"
 MODS = {
     "PyQt5":                "PyQt5",
     "OpenGL":               "PyOpenGL",
@@ -309,12 +334,14 @@ MODS = {
     "PyOpenGL_accelerate":  "PyOpenGL_accelerate",
     "av":                   "av",
     "numpy":                "numpy",
-    "pynput":               "pynput",
     "pyperclip":            "pyperclip",
     "psutil":               "psutil",
-    "evdev":                "evdev",
     "cryptography":         "cryptography",
 }
+if not MAC:
+    # host / Linux-client only modules
+    MODS["pynput"] = "pynput"
+    MODS["evdev"] = "evdev"
 
 missing = {}
 for mod, pkg in MODS.items():

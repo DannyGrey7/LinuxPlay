@@ -4,8 +4,8 @@
 > Built with FFmpeg, UDP, Qt, and zero corporate junk.
 
 [![License: GPLv2](https://img.shields.io/badge/License-GPLv2-blue.svg)](LICENSE)
-![Platform: Linux](https://img.shields.io/badge/Platform-Linux-green.svg)
-![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)
+![Host: Linux (X11 + Wayland)](https://img.shields.io/badge/Host-Linux%20(X11%20%2B%20Wayland)-green.svg)
+![Clients: Linux Windows macOS](https://img.shields.io/badge/Clients-Linux%20%2B%20Windows%20%2B%20macOS-blue.svg)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-Required-critical)
 [![GitHub stars](https://img.shields.io/github/stars/Techlm77/LinuxPlay?style=flat)](https://github.com/Techlm77/LinuxPlay/stargazers)
 
@@ -73,7 +73,7 @@ Thanks for believing in something made by one person, from scratch, with actual 
 - **Granular Encoder Control**
   - Direct control over FFmpeg parameters: **GOP, QP/CRF, Preset, Tune, and Pixel Format (`yuv420p`, `yuv444p`)** are fully exposed via command line arguments.
 - **Advanced Capture Methods**
-  - Host supports both **kmsgrab** (lowest latency/overhead, requires setcap) and **x11grab** (general fallback, supports cursor capture).
+  - Host supports both **kmsgrab** (lowest latency/overhead, works on X11 **and** Wayland, requires setcap) and **x11grab** (X11-only fallback).
 - **Secure Handshake Layer**
   - Rotating 6-digit PIN, refreshes every 30 seconds.
   - PIN rotation pauses while a session is active.
@@ -91,7 +91,7 @@ Thanks for believing in something made by one person, from scratch, with actual 
     - Uses certificate-based authentication automatically.
 - **Controller Support**
   - Full gamepad forwarding over UDP using a virtual uinput device.
-  - Works with Xbox, DualSense, 8BitDo and other HID controllers (Linux client → Linux host).
+  - Works with Xbox, DualSense, 8BitDo and other HID controllers (Linux client → Linux host; not yet available on the macOS client).
 - **Multi-Monitor**
   - Stream one or more displays.
   - Resolutions and offsets auto-detected per monitor.
@@ -106,8 +106,9 @@ Thanks for believing in something made by one person, from scratch, with actual 
 - **Stats Overlay (Client)**
   - Real-time **FPS, CPU, RAM, GPU** metrics via OpenGL with triple-buffered PBO uploads.
 - **Cross-Platform**
-  - Host: Linux.
-  - Clients: Linux and Windows.
+  - Host: Linux (X11 and Wayland sessions).
+  - Clients: Linux, Windows, and macOS.
+  - Wayland hosts: input via virtual uinput devices (kernel-level, no X11 required); monitor layout auto-detected via kscreen-doctor / wlr-randr / hyprctl.
 
 ---
 
@@ -202,6 +203,26 @@ python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperc
 
 `evdev` is required on Linux clients for controller capture.
 
+### Option 3: macOS client (Homebrew)
+
+The host is Linux-only, but macOS can run the **client**:
+
+```bash
+brew install ffmpeg python
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -U pip wheel setuptools
+python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pyperclip psutil cryptography
+
+# Exactly like on Linux:
+python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio enable
+```
+
+- `--hwaccel auto` selects **VideoToolbox** decoding when available (CPU fallback is automatic).
+- `./run.sh check` / `./run.sh client ...` also work on macOS — the bootstrap detects Homebrew and skips Linux-only pieces.
+- Controller (gamepad) forwarding is not yet available on macOS; keyboard/mouse, video, audio, clipboard and certificate auth all work.
+- `ffplay` for audio playback ships with Homebrew's `ffmpeg`.
+
 ---
 
 ## Usage
@@ -274,10 +295,31 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
   ```bash
   sudo setcap cap_sys_admin+ep "$(command -v ffmpeg)"
   ```
-- **x11grab** fallback when kmsgrab is not available or cursor capture needed.
+- **x11grab** fallback on X11 when kmsgrab is not available.
 - **VAAPI**:
   - Needs `/dev/dri/renderD128`.
   - Add your user to `video` group if needed.
+
+### Wayland Hosts
+
+LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`):
+
+- **Capture**: kmsgrab is compositor-agnostic (kernel/DRM level) and is the only correct capture
+  method on Wayland — `x11grab` only sees XWayland windows and is refused under Wayland unless
+  explicitly forced with `LINUXPLAY_CAPTURE=x11grab`.
+- **Monitors**: layout (including rotated/portrait displays and offsets) is auto-detected via
+  `hyprctl` (Hyprland), `kscreen-doctor` (KDE Plasma) or `wlr-randr` (sway/wlroots), with
+  `xrandr` under XWayland as a last resort.
+- **Input**: mouse/keyboard are injected through virtual **uinput** devices
+  (LinuxPlay Virtual Keyboard / Pointer / Wheel) — kernel-level, so they work identically on
+  X11 and Wayland. Your user needs write access to `/dev/uinput`
+  (e.g. `sudo usermod -aG input $USER` + re-login, or a udev rule; many distros already grant
+  this to the active seat user). The gamepad server uses the same mechanism.
+- **Audio / clipboard**: unchanged — PipeWire exposes PulseAudio compatibility on Wayland
+  desktops, so `pactl` / `-f pulse` keep working.
+- **Limitations**: no cursor is composited into the stream (same as X11 kmsgrab);
+  NVIDIA proprietary users may need `nvidia-drm.modeset=1`.
+
 
 ---
 

@@ -551,7 +551,7 @@ class StreamThread(threading.Thread):
         except Exception:
             pass
 
-def _detect_monitors_linux():
+def _detect_monitors_xrandr():
     try:
         out = subprocess.check_output(["xrandr", "--listmonitors"], universal_newlines=True)
     except Exception as e:
@@ -571,8 +571,126 @@ def _detect_monitors_linux():
                     continue
     return mons
 
+def _session_type():
+    st = (os.environ.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if st in ("x11", "wayland"):
+        return st
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+def _detect_monitors_kscreen():
+    """KDE Plasma Wayland: kscreen-doctor -o (Geometry: X,Y WxH)."""
+    if not which("kscreen-doctor"):
+        return []
+    try:
+        out = subprocess.check_output(
+            ["kscreen-doctor", "-o"], universal_newlines=True, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return []
+    import re
+    out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)   # kscreen-doctor colorizes even when piped
+    mons = []
+    for block in out.split("Output: ")[1:]:
+        if not any(ln.strip() == "enabled" for ln in block.splitlines()):
+            continue
+        m = re.search(r"Geometry:\s*(-?\d+)\s*,\s*(-?\d+)\s+(\d+)x(\d+)", block)
+        if m:
+            ox, oy, w, h = (int(g) for g in m.groups())
+            mons.append((w, h, ox, oy))
+    return mons
+
+def _detect_monitors_hyprctl():
+    """Hyprland: hyprctl -j monitors."""
+    if not which("hyprctl"):
+        return []
+    try:
+        import json
+        out = subprocess.check_output(
+            ["hyprctl", "-j", "monitors"], universal_newlines=True, stderr=subprocess.DEVNULL
+        )
+        data = json.loads(out)
+    except Exception:
+        return []
+    mons = []
+    for m in data:
+        if m.get("disabled"):
+            continue
+        try:
+            mons.append((int(m["width"]), int(m["height"]), int(m["x"]), int(m["y"])))
+        except Exception:
+            continue
+    return mons
+
+def _detect_monitors_wlr_randr():
+    """wlroots compositors (sway, etc.): wlr-randr."""
+    if not which("wlr-randr"):
+        return []
+    try:
+        out = subprocess.check_output(["wlr-randr"], universal_newlines=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    import re
+    mons = []
+    cur = None
+    def _flush():
+        if cur and cur.get("enabled") and cur.get("mode") and cur.get("pos") is not None:
+            w, h = cur["mode"]
+            ox, oy = cur["pos"]
+            mons.append((w, h, ox, oy))
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        if not ln.startswith((" ", "\t")):
+            _flush()
+            cur = {"name": ln.strip().split()[0]}
+        elif cur is not None:
+            s = ln.strip()
+            if s.startswith("Enabled:"):
+                cur["enabled"] = s.split(":", 1)[1].strip().lower() == "yes"
+            elif s.startswith("Position:"):
+                m = re.match(r"(-?\d+)\s*,\s*(-?\d+)", s.split(":", 1)[1].strip())
+                cur["pos"] = (int(m.group(1)), int(m.group(2))) if m else None
+            elif "(current)" in s:
+                m = re.match(r"(\d+)x(\d+)", s)
+                if m:
+                    cur["mode"] = (int(m.group(1)), int(m.group(2)))
+    _flush()
+    return mons
+
+def _detect_monitors_linux():
+    sess = _session_type()
+    if sess == "wayland":
+        for probe in (_detect_monitors_hyprctl, _detect_monitors_kscreen, _detect_monitors_wlr_randr):
+            try:
+                mons = probe()
+            except Exception as e:
+                logging.debug("Monitor probe %s failed: %s", probe.__name__, e)
+                mons = []
+            if mons:
+                logging.info("Detected %d monitor(s) via %s (Wayland session).", len(mons), probe.__name__)
+                return mons
+        logging.warning("Wayland monitor probes failed; falling back to xrandr (XWayland).")
+    return _detect_monitors_xrandr()
+
 def detect_monitors():
     return _detect_monitors_linux()
+
+def _kmsgrab_perms_ok():
+    try:
+        if os.geteuid() == 0:
+            return True
+        ff = which("ffmpeg")
+        if not ff:
+            return True
+        r = subprocess.run(["getcap", ff], capture_output=True, universal_newlines=True, timeout=5)
+        return "cap_sys_admin" in (r.stdout or "")
+    except Exception:
+        return True
+
 
 def _input_ll_flags():
     return [
@@ -902,6 +1020,27 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
             or (args.hwenc == "cpu")):
             use_kms = True
 
+    session = _session_type()
+    if session == "wayland" and not use_kms:
+        if capture_pref == "auto" and kms_available:
+            logging.warning("Wayland session: forcing kmsgrab capture (x11grab only sees XWayland windows).")
+            use_kms = True
+        elif capture_pref == "auto":
+            raise RuntimeError(
+                "Wayland session detected but FFmpeg has no kmsgrab device. "
+                "Native Wayland windows cannot be captured with x11grab; "
+                "install an FFmpeg build with kmsgrab or run the host under X11."
+            )
+        else:
+            logging.warning(
+                "LINUXPLAY_CAPTURE=%s forced under Wayland: native Wayland windows will NOT appear in the stream.",
+                capture_pref,
+            )
+    if use_kms and session == "wayland" and not _kmsgrab_perms_ok():
+        logging.warning(
+            "kmsgrab under Wayland needs elevated capture permissions; if capture fails, run:\n"
+            "    sudo setcap cap_sys_admin+ep \"$(command -v ffmpeg)\""
+        )
     if use_kms:
         kms_dev = os.environ.get("LINUXPLAY_KMS_DEVICE", _pick_kms_device())
         logging.info("Linux capture: kmsgrab (%s) selected (pref=%s).", kms_dev, capture_pref)
@@ -1054,7 +1193,214 @@ def build_audio_cmd():
 
     return input_side + output_side + encode + out
 
+def _virtual_screen_size():
+    mons = getattr(host_state, "monitors", None)
+    if not mons:
+        try:
+            mons = detect_monitors()
+        except Exception:
+            mons = []
+    if not mons:
+        return 1920, 1080
+    return max(m[0] + m[2] for m in mons), max(m[1] + m[3] for m in mons)
+
+class _UInputInjector:
+    """Virtual input devices via evdev/uinput (mouse + keyboard).
+
+    Events are injected at the kernel input layer, so this works identically
+    on X11 and Wayland — no xdotool/X-server access needed. Mirrors the
+    device split used by other streaming hosts: an absolute pointer
+    (position + buttons), a wheel-only relative device, and a keyboard.
+    """
+
+    def __init__(self):
+        if not HAVE_UINPUT:
+            raise RuntimeError("evdev/UInput not available")
+        from evdev import UInput, ecodes, AbsInfo
+        ec = self._ec = ecodes
+
+        self._key_map = {
+            "Escape": ec.KEY_ESC, "Tab": ec.KEY_TAB, "BackSpace": ec.KEY_BACKSPACE,
+            "Return": ec.KEY_ENTER, "Insert": ec.KEY_INSERT, "Delete": ec.KEY_DELETE,
+            "Pause": ec.KEY_PAUSE, "Print": getattr(ec, "KEY_PRINT", ec.KEY_SYSRQ),
+            "Home": ec.KEY_HOME, "End": ec.KEY_END,
+            "Left": ec.KEY_LEFT, "Right": ec.KEY_RIGHT, "Up": ec.KEY_UP, "Down": ec.KEY_DOWN,
+            "Page_Up": ec.KEY_PAGEUP, "Page_Down": ec.KEY_PAGEDOWN,
+            "Shift_L": ec.KEY_LEFTSHIFT, "Shift_R": ec.KEY_RIGHTSHIFT,
+            "Control_L": ec.KEY_LEFTCTRL, "Control_R": ec.KEY_RIGHTCTRL,
+            "Super_L": ec.KEY_LEFTMETA, "Super_R": ec.KEY_RIGHTMETA,
+            "Alt_L": ec.KEY_LEFTALT, "Alt_R": ec.KEY_RIGHTALT,
+            "Caps_Lock": ec.KEY_CAPSLOCK, "Num_Lock": ec.KEY_NUMLOCK,
+            "Scroll_Lock": ec.KEY_SCROLLLOCK, "space": ec.KEY_SPACE,
+        }
+        base_chars = {
+            "-": ec.KEY_MINUS, "=": ec.KEY_EQUAL, "[": ec.KEY_LEFTBRACE,
+            "]": ec.KEY_RIGHTBRACE, "\\": ec.KEY_BACKSLASH, ";": ec.KEY_SEMICOLON,
+            "'": ec.KEY_APOSTROPHE, "`": ec.KEY_GRAVE, ",": ec.KEY_COMMA,
+            ".": ec.KEY_DOT, "/": ec.KEY_SLASH,
+        }
+        shifted_src = {
+            "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+            "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
+            "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "~": "`",
+            "<": ",", ">": ".", "?": "/",
+        }
+        def _base_key(ch):
+            if ch in base_chars:
+                return base_chars[ch]
+            if ch.isascii() and ch.isalpha():
+                return ec.KEY_A + (ord(ch.lower()) - ord("a"))
+            if ch.isdigit() and ch.isascii():
+                return ec.KEY_1 + (int(ch) + 9) % 10   # '1'..'9' -> KEY_1..KEY_9, '0' -> KEY_0
+            return None
+        def _char_to_key(ch):
+            if ch in base_chars:
+                return base_chars[ch], False
+            if ch in shifted_src:
+                code = _base_key(shifted_src[ch])
+                if code is not None:
+                    return code, True
+            if ch.isascii() and ch.isalpha():
+                return ec.KEY_A + (ord(ch.lower()) - ord("a")), ch.isupper()
+            if ch.isdigit() and ch.isascii():
+                return (ec.KEY_1 + (int(ch) + 9) % 10), False
+            return None, False
+        self._char_to_key = _char_to_key
+
+        key_caps = set(self._key_map.values()) | set(base_chars.values())
+        key_caps |= {ec.KEY_A + i for i in range(26)}
+        key_caps |= {ec.KEY_1 + i for i in range(10)}
+        key_caps |= {ec.KEY_SPACE, ec.KEY_LEFTSHIFT, ec.KEY_RIGHTSHIFT}
+
+        self._vw, self._vh = _virtual_screen_size()
+        self.kbd = UInput(
+            {ec.EV_KEY: sorted(key_caps)},
+            name="LinuxPlay Virtual Keyboard",
+        )
+        self.abs_mouse = UInput(
+            {
+                ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_MIDDLE, ec.BTN_RIGHT],
+                ec.EV_ABS: [
+                    (ec.ABS_X, AbsInfo(0, 0, max(0, self._vw - 1), 0, 0, 0)),
+                    (ec.ABS_Y, AbsInfo(0, 0, max(0, self._vh - 1), 0, 0, 0)),
+                ],
+            },
+            name="LinuxPlay Virtual Pointer",
+        )
+        self.wheel_dev = UInput(
+            {ec.EV_REL: [ec.REL_WHEEL, ec.REL_HWHEEL]},
+            name="LinuxPlay Virtual Wheel",
+        )
+        self._btn_map = {"1": ec.BTN_LEFT, "2": ec.BTN_MIDDLE, "3": ec.BTN_RIGHT}
+        self._wheel_map = {
+            "4": (ec.REL_WHEEL, 1), "5": (ec.REL_WHEEL, -1),
+            "6": (ec.REL_HWHEEL, -1), "7": (ec.REL_HWHEEL, 1),
+        }
+        self._auto_shift_keys = set()
+        self._shift_pressed = False
+        logging.info("uinput virtual devices created; virtual screen %dx%d.", self._vw, self._vh)
+
+    def _resolve_key(self, name):
+        if isinstance(name, str) and name in self._key_map:
+            return self._key_map[name], False
+        if isinstance(name, str) and len(name) == 1:
+            return self._char_to_key(name)
+        return None, False
+
+    def mouse_abs(self, x, y):
+        ec = self._ec
+        try:
+            x = max(0, min(int(x), self._vw - 1))
+            y = max(0, min(int(y), self._vh - 1))
+            self.abs_mouse.write(ec.EV_ABS, ec.ABS_X, x)
+            self.abs_mouse.write(ec.EV_ABS, ec.ABS_Y, y)
+            self.abs_mouse.syn()
+            return True
+        except Exception as e:
+            logging.debug("uinput mouse_abs failed: %s", e)
+            return False
+
+    def mouse_button(self, btn, down):
+        ec = self._ec
+        code = self._btn_map.get(str(btn))
+        if code is None:
+            return False
+        try:
+            self.abs_mouse.write(ec.EV_KEY, code, 1 if down else 0)
+            self.abs_mouse.syn()
+            return True
+        except Exception as e:
+            logging.debug("uinput mouse_button failed: %s", e)
+            return False
+
+    def wheel(self, btn):
+        ec = self._ec
+        entry = self._wheel_map.get(str(btn))
+        if entry is None:
+            return False
+        axis, val = entry
+        try:
+            self.wheel_dev.write(ec.EV_REL, axis, val)
+            self.wheel_dev.syn()
+            return True
+        except Exception as e:
+            logging.debug("uinput wheel failed: %s", e)
+            return False
+
+    def key(self, action, name):
+        ec = self._ec
+        code, needs_shift = self._resolve_key(name)
+        if code is None:
+            return False
+        down = (action == "down")
+        try:
+            if needs_shift:
+                if down:
+                    if not self._shift_pressed:
+                        self.kbd.write(ec.EV_KEY, ec.KEY_LEFTSHIFT, 1)
+                        self._shift_pressed = True
+                    self.kbd.write(ec.EV_KEY, code, 1)
+                    self.kbd.syn()
+                    self._auto_shift_keys.add(code)
+                else:
+                    self.kbd.write(ec.EV_KEY, code, 0)
+                    self.kbd.syn()
+                    self._auto_shift_keys.discard(code)
+                    if not self._auto_shift_keys and self._shift_pressed:
+                        self.kbd.write(ec.EV_KEY, ec.KEY_LEFTSHIFT, 0)
+                        self._shift_pressed = False
+                        self.kbd.syn()
+            else:
+                self.kbd.write(ec.EV_KEY, code, 1 if down else 0)
+                self.kbd.syn()
+            return True
+        except Exception as e:
+            logging.debug("uinput key failed for %r: %s", name, e)
+            return False
+
+_uinput_injector = None
+_uinput_injector_lock = threading.Lock()
+
+def _get_uinput_injector():
+    """Lazily create the uinput injector; None => fall back to legacy paths.
+
+    Failure is cached as False so we don't retry (and log) on every packet.
+    """
+    global _uinput_injector
+    if _uinput_injector is None and HAVE_UINPUT:
+        with _uinput_injector_lock:
+            if _uinput_injector is None:
+                try:
+                    _uinput_injector = _UInputInjector()
+                except Exception as e:
+                    logging.warning("uinput injection unavailable (%s); using legacy input path.", e)
+                    _uinput_injector = False
+    return _uinput_injector or None
+
 def _inject_mouse_move(x,y):
+    inj = _get_uinput_injector()
+    if inj and inj.mouse_abs(x, y):
+        return
     if HAVE_PYNPUT:
         try: _mouse.position = (int(x), int(y))
         except Exception as e: logging.debug("pynput move failed: %s", e)
@@ -1062,6 +1408,9 @@ def _inject_mouse_move(x,y):
         subprocess.Popen(["xdotool","mousemove",str(x),str(y)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _inject_mouse_down(btn):
+    inj = _get_uinput_injector()
+    if inj and inj.mouse_button(btn, True):
+        return
     if HAVE_PYNPUT:
         b = {"1": Button.left, "2": Button.middle, "3": Button.right}.get(btn, Button.left)
         try: _mouse.press(b)
@@ -1070,6 +1419,9 @@ def _inject_mouse_down(btn):
         subprocess.Popen(["xdotool","mousedown",btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _inject_mouse_up(btn):
+    inj = _get_uinput_injector()
+    if inj and inj.mouse_button(btn, False):
+        return
     if HAVE_PYNPUT:
         b = {"1": Button.left, "2": Button.middle, "3": Button.right}.get(btn, Button.left)
         try: _mouse.release(b)
@@ -1078,6 +1430,9 @@ def _inject_mouse_up(btn):
         subprocess.Popen(["xdotool","mouseup",btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _inject_scroll(btn):
+    inj = _get_uinput_injector()
+    if inj and inj.wheel(btn):
+        return
     if HAVE_PYNPUT:
         try:
             if btn == "4": _mouse.scroll(0, +1)
@@ -1124,6 +1479,9 @@ NAME_TO_CHAR = {
 }
 
 def _inject_key(action, name):
+    inj = _get_uinput_injector()
+    if inj and inj.key(action, name):
+        return
     if HAVE_PYNPUT:
         k = _key_map.get(name)
         try:
@@ -2010,6 +2368,7 @@ def core_main(args, use_signals=True) -> int:
 
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920,1080,0,0)]
+    logging.info("Session type: %s; monitors: %s", _session_type(), host_state.monitors)
 
     global HOST_ARGS
     HOST_ARGS = args
@@ -2065,15 +2424,14 @@ def core_main(args, use_signals=True) -> int:
             time.sleep(0.2)
     except KeyboardInterrupt:
         trigger_shutdown("KeyboardInterrupt")
-    finally:
-        reason = host_state.shutdown_reason
-        stop_all()
-        if reason:
-            logging.critical("Stopped due to error: %s", reason)
-            return 1
-        else:
-            logging.info("Shutdown complete.")
-            return 0
+
+    reason = host_state.shutdown_reason
+    stop_all()
+    if reason:
+        logging.critical("Stopped due to error: %s", reason)
+        return 1
+    logging.info("Shutdown complete.")
+    return 0
 
 class LogEmitter(QObject):
     log = pyqtSignal(str)

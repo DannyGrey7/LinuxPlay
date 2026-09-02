@@ -37,6 +37,7 @@ DEFAULT_RESOLUTION = "1920x1080"
 
 IS_WINDOWS = py_platform.system() == "Windows"
 IS_LINUX   = py_platform.system() == "Linux"
+IS_MAC     = py_platform.system() == "Darwin"
 
 CLIPBOARD_INBOX = Queue()
 audio_proc = None
@@ -120,11 +121,15 @@ def choose_auto_hwaccel():
             if cand in accels:
                 return cand
         return "cpu"
-    else:
-        for cand in ("vaapi", "qsv", "cuda"):
+    if IS_MAC:
+        for cand in ("videotoolbox",):
             if cand in accels:
                 return cand
         return "cpu"
+    for cand in ("vaapi", "qsv", "cuda"):
+        if cand in accels:
+            return cand
+    return "cpu"
 
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     if mtu_guess <= 0:
@@ -146,6 +151,26 @@ def detect_network_mode(host_ip: str) -> str:
                 return "wifi"
             if iface.startswith("wl"):
                 return "wifi"
+            return "lan"
+        elif IS_MAC:
+            import subprocess, re
+            out = subprocess.check_output(["route", "-n", "get", host_ip],
+                                          universal_newlines=True,
+                                          stderr=subprocess.DEVNULL)
+            m = re.search(r"interface:\s*(\S+)", out)
+            dev = m.group(1) if m else ""
+            if dev:
+                ports = subprocess.check_output(["networksetup", "-listallhardwareports"],
+                                                universal_newlines=True,
+                                                stderr=subprocess.DEVNULL)
+                cur_dev = None
+                for line in ports.splitlines():
+                    if line.startswith("Device:"):
+                        cur_dev = line.split(":", 1)[1].strip()
+                    elif line.startswith("Hardware Port:") and cur_dev == dev:
+                        if "wi-fi" in line.lower() or "airdrop" in line.lower():
+                            return "wifi"
+                        return "lan"
             return "lan"
         elif IS_WINDOWS:
             import subprocess
@@ -461,6 +486,7 @@ class DecoderThread(QThread):
                         "qsv": "qsv",
                         "d3d11va": "d3d11va",
                         "dxva2": "dxva2",
+                        "videotoolbox": "videotoolbox",
                     }
                     hw_type_norm = hw_type_map.get(hw_type, hw_type)
 
@@ -1147,6 +1173,8 @@ class GamepadThread(threading.Thread):
 
     def run(self):
         if not IS_LINUX:
+            if IS_MAC:
+                logging.info("Gamepad capture is not supported on macOS yet — controller input disabled.")
             return
         try:
             from evdev import ecodes, InputDevice
@@ -1499,13 +1527,13 @@ def main():
     from PyQt5.QtWidgets import QApplication, QMessageBox
     from PyQt5.QtGui import QSurfaceFormat
 
-    p = argparse.ArgumentParser(description="LinuxPlay Client (Linux/Windows)")
+    p = argparse.ArgumentParser(description="LinuxPlay Client (Linux/Windows/macOS)")
     p.add_argument("--decoder", choices=["none", "h.264", "h.265"], default="none")
     p.add_argument("--host_ip", required=True)
     p.add_argument("--pin", default=None, help="6-digit host PIN (optional; will prompt if required)")
     p.add_argument("--audio", choices=["enable", "disable"], default="disable")
     p.add_argument("--monitor", default="0", help="Index or 'all'")
-    p.add_argument("--hwaccel", choices=["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi"], default="auto")
+    p.add_argument("--hwaccel", choices=["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi", "videotoolbox"], default="auto")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--net", choices=["auto", "lan", "wifi"], default="auto")
     p.add_argument("--ultra", action="store_true", help="Enable ultra-low-latency (LAN only). Auto-disabled on Wi-Fi/WAN.")
