@@ -68,6 +68,26 @@ ok("explicit LINUXPLAY_CAPTURE=x11grab override still honored (with warning)")
 host.ffmpeg_has_device = old_probe
 os.environ.pop("LINUXPLAY_CAPTURE", None)
 
+# ── 3b. Path-MTU-aware TS packet sizing + VAAPI GOP passthrough ─────
+host.host_state.client_ip = "100.104.182.44"   # CGNAT range → tunnel (tailscale0, MTU 1280 here)
+cmd_tun = host.build_video_cmd(args, "8M", (1920, 1080, 0, 0), 5000)
+url_tun = next(x for x in cmd_tun if x.startswith("udp://"))
+rt = host._route_mtu("100.104.182.44")
+if rt and rt < 1500:
+    fit = host._best_ts_pkt_size(rt, False)
+    assert f"pkt_size={fit}" in url_tun, url_tun
+    assert fit + 28 <= rt, (fit, rt)
+    print(f"  path mtu {rt} → TS pkt_size {fit} (datagram {fit + 28} B, unfragmented)")
+else:
+    assert "pkt_size=1316" in url_tun, url_tun
+    print("  no sub-1500 route MTU found; fallback pkt_size 1316 kept")
+ok("TS pkt_size fits path MTU (no IP fragmentation over tunnels)")
+
+assert cmd_tun[cmd_tun.index("-g") + 1] == "15", cmd_tun
+ok("VAAPI encoder honors --gop")
+
+host.host_state.client_ip = "127.0.0.1"
+
 # ── 4. uinput injector: kernel registration + injection calls ────────
 import re  # noqa: E402
 

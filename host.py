@@ -14,6 +14,7 @@ import signal
 import struct
 import datetime
 import platform as py_platform
+import re
 
 from shutil import which
 
@@ -769,6 +770,36 @@ def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     overhead = 48 if ipv6 else 28
     max_payload = max(512, mtu_guess - overhead)
     return max(188, (max_payload // 188) * 188)
+def _route_mtu(ip: str) -> int:
+    """Best-effort path MTU to a client via the kernel routing table (Linux `ip`); 0 when unknown."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "get", str(ip)],
+            stderr=subprocess.DEVNULL, universal_newlines=True, timeout=1.0,
+        )
+        m = re.search(r"\bdev (\S+)", out)
+        if not m:
+            return 0
+        out = subprocess.check_output(
+            ["ip", "-o", "link", "show", "dev", m.group(1)],
+            stderr=subprocess.DEVNULL, universal_newlines=True, timeout=1.0,
+        )
+        m = re.search(r"\bmtu (\d+)", out)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+def _udp_ts_pkt_size(ip: str) -> int:
+    """MPEG-TS UDP payload size that fits inside the path MTU to ip (never IP-fragmented)."""
+    mtu_guess = 1500
+    rt_mtu = _route_mtu(ip)
+    if rt_mtu:
+        mtu_guess = min(mtu_guess, rt_mtu)
+    pkt = _best_ts_pkt_size(mtu_guess, ":" in str(ip))
+    if mtu_guess < 1500:
+        logging.info("Path MTU to %s is %d → TS pkt_size %d (avoids IP fragmentation).",
+                     ip, mtu_guess, pkt)
+    return pkt
 
 def _parse_bitrate_bits(bstr: str) -> int:
     if not bstr: return 0
@@ -952,6 +983,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
             enc = [
                 "-c:v", "h264_vaapi",
                 "-bf", "0",
+                *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "h264_mp4toannexb"
@@ -997,6 +1029,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
             enc = [
                 "-c:v", "hevc_vaapi",
                 "-bf", "0",
+                *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "hevc_mp4toannexb"
@@ -1099,9 +1132,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
         else:
             extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
         output_side = _output_sync_flags()
-        mtu_guess = 1500
-        ipv6 = ":" in ip
-        pkt_size = _best_ts_pkt_size(mtu_guess, ipv6)
+        pkt_size = _udp_ts_pkt_size(ip)
         fifo_size = 32768
         buffer_size = 65536
         if getattr(host_state, "net_mode", "lan") == "wifi":
@@ -1187,9 +1218,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
         )
 
     output_side = _output_sync_flags()
-    mtu_guess = 1500
-    ipv6 = ":" in ip
-    pkt_size = _best_ts_pkt_size(mtu_guess, ipv6)
+    pkt_size = _udp_ts_pkt_size(ip)
     fifo_size = 32768
     buffer_size = 65536
     if getattr(host_state, "net_mode", "lan") == "wifi":
@@ -1286,12 +1315,13 @@ def build_audio_cmd():
         "-frame_duration", opus_fd,
     ]
 
+    aud_pkt = _udp_ts_pkt_size(str(host_state.client_ip))
     out = [
         *(_mpegts_ll_mux_flags()),
         *_marker_opt(),
         "-f", "mpegts",
         f"udp://{host_state.client_ip}:{UDP_AUDIO_PORT}"
-        f"?pkt_size=1316&buffer_size={aud_buf}&overrun_nonfatal=1&max_delay={aud_delay}"
+        f"?pkt_size={aud_pkt}&buffer_size={aud_buf}&overrun_nonfatal=1&max_delay={aud_delay}"
     ]
 
     return input_side + output_side + encode + out
