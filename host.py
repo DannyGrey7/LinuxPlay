@@ -904,16 +904,21 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
     bitrate_s = str(bitrate or "").lower()
 
     if "vaapi" in hwenc:
-        qp_val = qp or "23"
-        dynamic_flags = [
-            "-rc_mode", "CQP",
-            "-qp", qp_val,
-        ]
         if bitrate and str(bitrate).lower() not in ("0", "auto"):
-            dynamic_flags += [
+            # Peak-constrained VBR: caps per-frame size (esp. I-frames) and total
+            # datagram rate. CQP ignores the bitrate cap entirely — I-frames can
+            # hit ~10x the average frame size, and on lossy paths every IDR
+            # datagram is a corruption opportunity.
+            dynamic_flags = [
+                "-rc_mode", "VBR",
                 "-b:v", bitrate,
                 "-maxrate", bitrate,
                 "-bufsize", bitrate,
+            ]
+        else:
+            dynamic_flags = [
+                "-rc_mode", "CQP",
+                "-qp", qp or "23",
             ]
 
     elif "nvenc" in hwenc:
@@ -1072,13 +1077,17 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
     codec_name = (args.encoder if args.encoder and args.encoder.lower() != "none" else "h.264")
     min_bits = int(w) * int(h) * max(1, fps_i) * _target_bpp(codec_name, fps_i)
     cur_bits = _parse_bitrate_bits(bitrate)
-    if cur_bits < min_bits:
-        safe_bits = int(min_bits)
-        safe_str = _format_bits(safe_bits)
+    bitrate_off = str(bitrate).strip().lower() in ("0", "auto", "")
+    if cur_bits < min_bits and not bitrate_off:
         logging.warning(
-            "Bitrate too low for %dx%d@%dfps (%s < %s). Bumping to %s.",
-            w, h, fps_i, str(bitrate), _format_bits(cur_bits), safe_str
+            "Bitrate %s is below the recommended %s for %dx%d@%dfps — honoring your "
+            "setting (expect quality loss on busy scenes). --bitrate 0 = CQP quality "
+            "mode; leave unset for the auto floor.",
+            str(bitrate), _format_bits(int(min_bits)), w, h, fps_i
         )
+    elif bitrate_off and str(bitrate).strip() not in ("0", "auto"):
+        safe_str = _format_bits(int(min_bits))
+        logging.warning("No bitrate set; using %s for %dx%d@%dfps.", safe_str, w, h, fps_i)
         bitrate = safe_str
         host_state.current_bitrate = safe_str
 
