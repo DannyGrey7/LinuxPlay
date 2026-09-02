@@ -1097,7 +1097,7 @@ class VideoWidgetGL(QOpenGLWidget):
 
     def _get_key_name(self, event):
         text = event.text()
-        if text and len(text) == 1 and ord(text) >= 0x20:
+        if text and len(text) == 1 and ord(text) >= 0x20 and ord(text) != 0x7f:
             return "space" if text == " " else text
         key = event.key()
         key_map = {
