@@ -221,6 +221,31 @@ try:
 except Exception:
     HAVE_UINPUT = False
 
+try:
+    import portal_capture
+    HAVE_PORTAL = True
+except Exception as _pe:
+    portal_capture = None
+    HAVE_PORTAL = False
+
+
+def _resolve_capture_mode():
+    """Pick the video capture backend once at startup: portal | kmsgrab | x11grab."""
+    sess = _session_type()
+    pref = (os.environ.get("LINUXPLAY_CAPTURE", "auto") or "auto").strip().lower()
+    if sess != "wayland":
+        return "x11grab"
+    if pref in ("portal", "pipewire"):
+        return "portal"
+    if pref in ("kmsgrab", "kms"):
+        return "kmsgrab"
+    if pref == "x11grab":
+        return "x11grab"
+    # auto under Wayland: portal first (KDE/GNOME/wlroots), kmsgrab as fallback
+    if HAVE_PORTAL and portal_capture.gst_pipewiresrc_available():
+        return "portal"
+    return "kmsgrab"
+
 class HostState:
     def __init__(self):
         self.video_threads = {}
@@ -381,6 +406,13 @@ def stop_all():
             pass
 
     host_state.starting_streams = False
+    portal = getattr(host_state, "portal", None)
+    if portal:
+        try:
+            portal.close()
+        except Exception:
+            pass
+        host_state.portal = None
 
 def stop_streams_only():
     with host_state.video_thread_lock:
@@ -494,18 +526,32 @@ def ffmpeg_has_device(name: str) -> bool:
         return False
 
 class StreamThread(threading.Thread):
-    def __init__(self, cmd, name):
+    def __init__(self, cmd, name, feeder_cmd=None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.name = name
+        self.feeder_cmd = feeder_cmd
+        self.feeder = None
         self.process = None
         self._running = True
 
     def run(self):
         logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
+        if self.feeder_cmd:
+            logging.info("Starting %s feeder: %s", self.name, " ".join(self.feeder_cmd))
+            try:
+                self.feeder = subprocess.Popen(
+                    self.feeder_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                trigger_shutdown(f"{self.name} feeder failed to start: {e}")
+                return
         try:
             self.process = subprocess.Popen(
                 self.cmd,
+                stdin=(self.feeder.stdout if self.feeder else None),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 universal_newlines=True
@@ -550,6 +596,16 @@ class StreamThread(threading.Thread):
                     self.process.kill()
         except Exception:
             pass
+        if self.feeder:
+            try:
+                if self.feeder.poll() is None:
+                    self.feeder.terminate()
+                    try:
+                        self.feeder.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        self.feeder.kill()
+            except Exception:
+                pass
 
 def _detect_monitors_xrandr():
     try:
@@ -968,7 +1024,7 @@ def _pick_kms_device():
             return p
     return "/dev/dri/card0"
 
-def build_video_cmd(args, bitrate, monitor_info, video_port):
+def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None):
     try:
         fps_i = int(str(args.framerate))
     except Exception:
@@ -1021,15 +1077,62 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
             use_kms = True
 
     session = _session_type()
+    if portal_stream:
+        pw, ph = int(portal_stream["w"]), int(portal_stream["h"])
+        logging.info("Linux capture: portal/PipeWire node %s (%sx%s) selected (pref=%s).",
+                     portal_stream.get("node"), pw, ph, capture_pref)
+        input_side = [
+            *base_in,
+            "-f", "rawvideo",
+            "-pixel_format", "bgr0",
+            "-video_size", f"{pw}x{ph}",
+            "-framerate", str(fps_i),
+            "-i", "-",
+        ]
+        extra_filters, encode = _pick_encoder_args(
+            codec=args.encoder, hwenc=args.hwenc, preset=preset,
+            gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
+        )
+        if any(x in encode for x in ("h264_vaapi", "hevc_vaapi")):
+            extra_filters = ["-vf", "format=nv12,hwupload",
+                             "-vaapi_device", "/dev/dri/renderD128"]
+        else:
+            extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
+        output_side = _output_sync_flags()
+        mtu_guess = 1500
+        ipv6 = ":" in ip
+        pkt_size = _best_ts_pkt_size(mtu_guess, ipv6)
+        fifo_size = 32768
+        buffer_size = 65536
+        if getattr(host_state, "net_mode", "lan") == "wifi":
+            fifo_size = 131072
+            buffer_size = 262144
+        out = [
+            *(_mpegts_ll_mux_flags()),
+            "-flags", "+low_delay",
+            "-f", "mpegts",
+            *_marker_opt(),
+            (
+                f"udp://{ip}:{video_port}"
+                f"?pkt_size={pkt_size}"
+                f"&buffer_size={buffer_size}"
+                f"&fifo_size={fifo_size}"
+                f"&overrun_nonfatal=1"
+                f"&max_delay=0"
+            ),
+        ]
+        return input_side + output_side + (extra_filters or []) + encode + out
+
     if session == "wayland" and not use_kms:
         if capture_pref == "auto" and kms_available:
             logging.warning("Wayland session: forcing kmsgrab capture (x11grab only sees XWayland windows).")
             use_kms = True
         elif capture_pref == "auto":
             raise RuntimeError(
-                "Wayland session detected but FFmpeg has no kmsgrab device. "
+                "Wayland session detected but neither portal capture nor kmsgrab is available. "
                 "Native Wayland windows cannot be captured with x11grab; "
-                "install an FFmpeg build with kmsgrab or run the host under X11."
+                "install gst-launch-1.0 with the pipewiresrc plugin (gst-plugin-pipewire) "
+                "and jeepney, or run the host under X11."
             )
         else:
             logging.warning(
@@ -1677,12 +1780,27 @@ def start_streams_for_current_client(args):
         host_state.starting_streams = True
         try:
             host_state.video_threads = {}
+            portal = None
+            if getattr(host_state, "capture_mode", "x11grab") == "portal":
+                portal = getattr(host_state, "portal", None)
+                if portal is None:
+                    portal = portal_capture.PortalCapture()
+                    host_state.portal = portal
+                try:
+                    portal.ensure(multiple=True)
+                except Exception as e:
+                    logging.error("Portal screen capture could not start: %s", e)
+                    set_status("Portal capture failed or declined")
+                    return
             for i, mon in enumerate(host_state.monitors):
-                cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i)
+                ps = portal.match_stream(i, mon) if portal else None
+                cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
+                                      portal_stream=ps)
                 if not cmd:
                     logging.error(f"Failed to build video cmd for monitor {i}; skipping.")
                     continue
-                t = StreamThread(cmd, f"Video {i}")
+                feeder = portal_capture.build_feeder_cmd(ps) if (portal and ps) else None
+                t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder)
                 t.start()
                 host_state.video_threads[i] = t
 
@@ -2369,6 +2487,8 @@ def core_main(args, use_signals=True) -> int:
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920,1080,0,0)]
     logging.info("Session type: %s; monitors: %s", _session_type(), host_state.monitors)
+    host_state.capture_mode = _resolve_capture_mode()
+    logging.info("Capture mode: %s", host_state.capture_mode)
 
     global HOST_ARGS
     HOST_ARGS = args

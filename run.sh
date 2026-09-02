@@ -36,8 +36,7 @@ Behavior:
   - Installs only missing system deps (where supported)
   - Installs only missing Python deps into .venv
 
-Python deps (inside .venv):
-  PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography
+  PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography jeepney
   (pynput/evdev are skipped on macOS — client-only platform)
 EOF
 }
@@ -270,6 +269,15 @@ check_system_deps() {
     fi
   done
 
+  if [ "$(uname -s)" != "Darwin" ] && [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+    if need_cmd gst-launch-1.0 && gst-inspect-1.0 pipewiresrc >/dev/null 2>&1; then
+      msg "Wayland portal capture available (pipewiresrc + GStreamer)."
+    else
+      warn "Wayland session: GStreamer pipewiresrc not found (install gst-plugin-pipewire + gstreamer)."
+      warn "  -> Required for screen capture on KDE/GNOME Wayland (portal capture)."
+    fi
+  fi
+
   if need_cmd glxinfo; then
     printf "OK:    OpenGL probe (glxinfo)\n"
   else
@@ -334,6 +342,7 @@ MODS = {
     "PyOpenGL_accelerate":  "PyOpenGL_accelerate",
     "av":                   "av",
     "numpy":                "numpy",
+    "jeepney":              "jeepney",
     "pyperclip":            "pyperclip",
     "psutil":               "psutil",
     "cryptography":         "cryptography",

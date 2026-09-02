@@ -73,7 +73,8 @@ Thanks for believing in something made by one person, from scratch, with actual 
 - **Granular Encoder Control**
   - Direct control over FFmpeg parameters: **GOP, QP/CRF, Preset, Tune, and Pixel Format (`yuv420p`, `yuv444p`)** are fully exposed via command line arguments.
 - **Advanced Capture Methods**
-  - Host supports both **kmsgrab** (lowest latency/overhead, works on X11 **and** Wayland, requires setcap) and **x11grab** (X11-only fallback).
+  - On Wayland (KDE/GNOME/wlroots): capture via the **xdg-desktop-portal ScreenCast API (PipeWire)** — permission dialog on first connect, persistable; cursor drawn into the stream.
+  - On X11: **x11grab**; **kmsgrab** (lowest latency, requires setcap) as the compositor-agnostic fallback on GNOME/wlroots Wayland.
 - **Secure Handshake Layer**
   - Rotating 6-digit PIN, refreshes every 30 seconds.
   - PIN rotation pauses while a session is active.
@@ -198,7 +199,7 @@ source .venv/bin/activate
 
 ```bash
 python3 -m pip install -U pip wheel setuptools
-python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography
+python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography jeepney
 ```
 
 `evdev` is required on Linux clients for controller capture.
@@ -212,7 +213,7 @@ brew install ffmpeg python
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -U pip wheel setuptools
-python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pyperclip psutil cryptography
+python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pyperclip psutil cryptography jeepney
 
 # Exactly like on Linux:
 python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio enable
@@ -304,9 +305,16 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
 
 LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`):
 
-- **Capture**: kmsgrab is compositor-agnostic (kernel/DRM level) and is the only correct capture
-  method on Wayland — `x11grab` only sees XWayland windows and is refused under Wayland unless
-  explicitly forced with `LINUXPLAY_CAPTURE=x11grab`.
+- **Capture**: on Wayland, LinuxPlay uses the **xdg-desktop-portal ScreenCast API (PipeWire)**
+  — the same mechanism as OBS. Works on KDE Plasma, GNOME and wlroots compositors.
+  The desktop shows a screen-share permission dialog on first connect (select your monitors;
+  approval can be remembered via the portal's restore token). The cursor is drawn into the
+  stream. Requires `gst-launch-1.0` with the `pipewiresrc` plugin (e.g. `gst-plugin-pipewire`
+  on Arch, `gstreamer1.0-pipewire` on Debian/Ubuntu) and the pure-Python `jeepney` package.
+  Fallback: `kmsgrab` (kernel/DRM level — works on GNOME/wlroots with
+  `setcap cap_sys_admin+ep`, but **not** on KDE Plasma + amdgpu, where KWin allocates
+  10-bit AR30 framebuffers that FFmpeg cannot read). `LINUXPLAY_CAPTURE=portal|kmsgrab|x11grab`
+  overrides the automatic choice.
 - **Monitors**: layout (including rotated/portrait displays and offsets) is auto-detected via
   `hyprctl` (Hyprland), `kscreen-doctor` (KDE Plasma) or `wlr-randr` (sway/wlroots), with
   `xrandr` under XWayland as a last resort.
@@ -317,8 +325,8 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
   this to the active seat user). The gamepad server uses the same mechanism.
 - **Audio / clipboard**: unchanged — PipeWire exposes PulseAudio compatibility on Wayland
   desktops, so `pactl` / `-f pulse` keep working.
-- **Limitations**: no cursor is composited into the stream (same as X11 kmsgrab);
-  NVIDIA proprietary users may need `nvidia-drm.modeset=1`.
+- **Limitations**: each monitor must be selected in the portal dialog for multi-monitor
+  streaming; NVIDIA kmsgrab users may need `nvidia-drm.modeset=1`.
 
 
 ---
