@@ -86,6 +86,9 @@ ok("TS pkt_size fits path MTU (no IP fragmentation over tunnels)")
 assert cmd_tun[cmd_tun.index("-g") + 1] == "15", cmd_tun
 ok("VAAPI encoder honors --gop")
 
+assert cmd_tun[cmd_tun.index("-slices") + 1] == "4", cmd_tun
+ok("VAAPI encoder uses 4 slices (loss confined to one band)")
+
 host.host_state.client_ip = "127.0.0.1"
 
 # ── 4. uinput injector: kernel registration + injection calls ────────

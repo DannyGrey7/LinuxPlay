@@ -985,6 +985,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
                 "-bf", "0",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
+                "-slices", "4",
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "h264_mp4toannexb"
             ]
@@ -1031,6 +1032,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
                 "-bf", "0",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
+                "-slices", "4",
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "hevc_mp4toannexb"
             ]
