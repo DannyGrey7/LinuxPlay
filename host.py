@@ -942,6 +942,62 @@ def _safe_nvenc_preset(preset: str) -> str:
     mapped = alias_map.get(preset, preset)
     return mapped if mapped in allowed else "p4"
 
+_CPU_PRESET_ALIAS = {
+    "p1": "ultrafast", "p2": "superfast", "p3": "veryfast", "p4": "fast",
+    "p5": "medium", "p6": "slow", "p7": "veryslow",
+    "ll": "ultrafast", "llhq": "ultrafast", "llhp": "ultrafast",
+    "hq": "veryfast", "hp": "veryfast", "bd": "slow",
+    "speed": "ultrafast", "balanced": "medium", "quality": "slow",
+    "lossless": "veryslow", "default": "",
+}
+_X264_PRESETS = {
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium", "slow", "slower", "veryslow", "placebo",
+}
+
+def _safe_x264_preset(preset: str) -> str:
+    """Map NVENC/QSV-style preset names onto libx264/libx265 presets.
+
+    The GUI offers presets from several backends in one list; passing e.g.
+    'llhp' or 'p4' straight to libx264 makes ffmpeg abort at startup.
+    """
+    p = (preset or "").strip().lower()
+    if not p:
+        return ""
+    mapped = _CPU_PRESET_ALIAS.get(p, p)
+    if mapped == "":
+        return ""
+    if mapped not in _X264_PRESETS:
+        logging.warning("Preset '%s' is not a libx264/libx265 preset — using 'ultrafast'.", preset)
+        return "ultrafast"
+    return mapped
+
+_X264_TUNES = {"film", "animation", "grain", "stillimage", "psnr", "ssim", "fastdecode", "zerolatency"}
+_X265_TUNES = {"psnr", "ssim", "grain", "fastdecode", "zerolatency", "animation"}
+_CPU_TUNE_ALIAS = {
+    "zerolatency": "zerolatency", "ull": "zerolatency",
+    "ultra-low-latency": "zerolatency", "ultra_low_latency": "zerolatency",
+    "low-latency": "zerolatency", "low_latency": "zerolatency",
+    "ll": "zerolatency", "realtime": "zerolatency",
+    "performance": "zerolatency", "high-performance": "zerolatency",
+    "hq": "", "high-quality": "", "quality": "", "auto": "", "default": "",
+    "none": "", "lossless": "", "lossless-highperf": "", "blu-ray": "", "bluray": "",
+}
+
+def _safe_cpu_tune(codec: str, tune: str) -> str:
+    """Map backend-specific tune names onto valid x264/x265 tunes ('' = default)."""
+    t = (tune or "").strip().lower()
+    if not t:
+        return ""
+    mapped = _CPU_TUNE_ALIAS.get(t, t)
+    if mapped == "":
+        return ""
+    valid = _X265_TUNES if codec in ("h.265", "hevc") else _X264_TUNES
+    if mapped not in valid:
+        logging.warning("Tune '%s' not valid for %s CPU encode — using 'zerolatency'.", tune, codec)
+        return "zerolatency"
+    return mapped
+
 def _norm_qp(qp):
     try:
         q = int(qp)
@@ -1111,8 +1167,8 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
         else:
             enc = [
                 "-c:v", "libx264",
-                "-preset", preset_l or "ultrafast",
-                "-tune", tune_l or "zerolatency",
+                "-preset", _safe_x264_preset(preset_l) or "ultrafast",
+                "-tune", _safe_cpu_tune(codec, tune_l) or "zerolatency",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
                 "-pix_fmt", pix_fmt,
@@ -1158,8 +1214,8 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
         else:
             enc = [
                 "-c:v", "libx265",
-                "-preset", preset_l or "ultrafast",
-                "-tune", tune_l or "zerolatency",
+                "-preset", _safe_x264_preset(preset_l) or "ultrafast",
+                "-tune", _safe_cpu_tune(codec, tune_l) or "zerolatency",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
                 "-pix_fmt", pix_fmt,

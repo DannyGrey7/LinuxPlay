@@ -82,4 +82,21 @@ finally:
 
 assert host._session_type() == "wayland"   # env restored
 
+# CPU preset/tune sanitization (GUI offers mixed-backend names)
+assert host._safe_x264_preset("llhp") == "ultrafast"
+assert host._safe_x264_preset("p7") == "veryslow"
+assert host._safe_x264_preset("balanced") == "medium"
+assert host._safe_x264_preset("Default") == ""
+assert host._safe_x264_preset("bogus") == "ultrafast"
+assert host._safe_x264_preset("veryfast") == "veryfast"
+ok("libx264 preset sanitizer: NVENC/QSP-style names mapped, junk -> ultrafast")
+
+assert host._safe_cpu_tune("h.264", "") == ""
+assert host._safe_cpu_tune("h.264", "high-quality") == ""
+assert host._safe_cpu_tune("h.264", "low-latency") == "zerolatency"
+assert host._safe_cpu_tune("h.264", "film") == "film"
+assert host._safe_cpu_tune("h.265", "film") == "zerolatency"   # x265 has no film tune
+assert host._safe_cpu_tune("h.265", "zerolatency") == "zerolatency"
+ok("CPU tune sanitizer: aliases mapped, invalid per-codec -> zerolatency")
+
 print(f"\nALL {len(PASS)} PARSER TESTS PASSED")

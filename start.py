@@ -28,6 +28,7 @@ except Exception:
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+IS_MAC = platform.system() == "Darwin"
 CFG_PATH = os.path.join(os.path.expanduser("~"), ".linuxplay_start_cfg.json")
 LINUXPLAY_MARKER = "LinuxPlayHost"
 
@@ -389,9 +390,14 @@ class HostTab(QWidget):
         self.debugCheck = QCheckBox("Enable Debug")
         self.captureHint = QLabel("")
         if ffmpeg_has_device("kmsgrab"):
-            self.captureHint.setText("Capture: kmsgrab available (requires CAP_SYS_ADMIN; cursor not shown). Fallback: x11grab.")
+            self.captureHint.setText(
+                "Capture (Wayland auto): portal/PipeWire first, then kmsgrab "
+                "(needs setcap; no cursor). X11 sessions: x11grab."
+            )
         else:
-            self.captureHint.setText("Capture: x11grab (kmsgrab not detected).")
+            self.captureHint.setText(
+                "Capture (Wayland auto): portal/PipeWire first. X11 sessions: x11grab."
+            )
         form_layout.addRow("Encoder (codec):", self.encoderCombo)
         form_layout.addRow("Encoder Backend:", self.hwencCombo)
         form_layout.addRow("Framerate:", self.framerateCombo)
@@ -401,6 +407,7 @@ class HostTab(QWidget):
         form_layout.addRow("Adaptive:", self.adaptiveCheck)
         self.linuxCaptureCombo = QComboBox()
         self.linuxCaptureCombo.addItem("auto", userData="auto")
+        self.linuxCaptureCombo.addItem("portal (PipeWire)", userData="portal")
         self.linuxCaptureCombo.addItem("kmsgrab", userData="kmsgrab")
         self.linuxCaptureCombo.addItem("x11grab", userData="x11grab")
         form_layout.addRow("Linux Capture:", self.linuxCaptureCombo)
@@ -769,16 +776,13 @@ class ClientTab(QWidget):
             self.decoderCombo.addItem("h.265")
 
         self.hwaccelCombo = QComboBox()
-        self.hwaccelCombo.addItems(["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi"])
         if IS_WINDOWS:
-            idx = self.hwaccelCombo.findText("vaapi")
-            if idx != -1:
-                self.hwaccelCombo.removeItem(idx)
+            hwaccel_items = ["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2"]
+        elif IS_MAC:
+            hwaccel_items = ["auto", "cpu", "videotoolbox"]
         else:
-            for item in ["d3d11va", "dxva2"]:
-                idx = self.hwaccelCombo.findText(item)
-                if idx != -1:
-                    self.hwaccelCombo.removeItem(idx)
+            hwaccel_items = ["auto", "cpu", "cuda", "qsv", "vaapi"]
+        self.hwaccelCombo.addItems(hwaccel_items)
 
         self.hostIPEdit = QComboBox()
         self.hostIPEdit.setEditable(True)
@@ -960,40 +964,47 @@ class HelpTab(QWidget):
         help_text = (
             "<h1>LinuxPlay Help</h1>"
             "<p><b>LinuxPlay</b> provides ultra-low-latency desktop streaming using FFmpeg over UDP, "
-            "with TCP used for session handshakes and UDP channels for input, clipboard, and optional audio.</p>"
+            "with TCP used for the session handshake and UDP channels for video, audio, input, "
+            "clipboard and stats.</p>"
 
             "<h2>Security</h2>"
-            "<p>For internet (WAN) streaming, it is strongly recommended to tunnel all traffic through "
-            "<b>WireGuard</b> on the host system. Clients should connect using the tunnel’s internal IP. "
-            "On trusted local networks (LAN), this step can be safely skipped.</p>"
+            "<p>For internet (WAN) streaming, tunnel all traffic through <b>WireGuard</b> or "
+            "<b>Tailscale</b> and point the client at the tunnel IP. On trusted local networks (LAN) "
+            "this step can be skipped.</p>"
+            "<p>The first connection uses the rotating 6-digit PIN shown in the host window. "
+            "Afterwards the host issues a per-device certificate and future connections "
+            "authenticate automatically — the client must prove it holds the certificate's "
+            "private key, and every session is gated by a per-connection token.</p>"
 
-            "<h2>Capture Backends</h2>"
+            "<h2>Capture Backends (host)</h2>"
             "<ul>"
-            "<li><b>kmsgrab</b> (KMS/DRM): Provides the lowest capture latency but requires elevated privileges. "
-            "Grant permission with:<br><code>sudo setcap cap_sys_admin+ep $(which ffmpeg)</code>."
-            "Note that the hardware cursor is not drawn by kmsgrab.</li>"
-            "<li><b>x11grab</b>: Compatible with most X11 sessions; easier to set up but slightly higher latency.</li>"
+            "<li><b>portal / PipeWire</b> (default on Wayland): native capture via "
+            "xdg-desktop-portal. A permission dialog appears on first use and can be remembered; "
+            "the cursor is drawn into the stream.</li>"
+            "<li><b>kmsgrab</b>: lowest latency and compositor-agnostic, but requires "
+            "<code>sudo setcap cap_sys_admin+ep $(which ffmpeg)</code> and does not show the cursor.</li>"
+            "<li><b>x11grab</b>: X11 sessions; on Wayland it only sees XWayland windows.</li>"
             "</ul>"
 
             "<h2>Platform Support</h2>"
-            "<p>The <b>Host</b> is supported on Linux only. Clients are available for Linux and Windows. "
-            "macOS clients may function via compatibility layers but are not officially supported.</p>"
+            "<p>The <b>Host</b> runs on Linux (X11 and Wayland). Clients run on Linux, Windows "
+            "and macOS (controller forwarding is currently Linux-client only).</p>"
 
             "<h2>Performance Tips</h2>"
             "<ul>"
             "<li>Enable <b>Ultra Mode</b> for LAN use only; it disables internal buffering for minimum delay.</li>"
-            "<li>Recommended baseline for smooth playback: "
-            "<code>H.264</code> codec, preset <code>llhq</code> or <code>ultrafast</code>, GOP <code>10</code>, "
-            "audio disabled (optional), and moderate bitrates (e.g. 8–12&nbsp;Mbps for 1080p).</li>"
-            "<li>Select your encoder backend explicitly — NVENC, QSV, AMF, VAAPI, or CPU — "
-            "to ensure consistent performance across sessions.</li>"
+            "<li>Recommended baseline for smooth playback: <code>H.264</code>, preset <code>llhq</code> "
+            "(NVENC) or <code>ultrafast</code> (CPU), GOP <code>10</code>, moderate bitrates "
+            "(8–12&nbsp;Mbps for 1080p).</li>"
+            "<li>Short GOP values (2–5) make packet-loss artifacts heal faster; "
+            "<b>Bitrate 0</b> selects constant-quality (CQP) mode instead of a rate cap.</li>"
+            "<li>Multi-monitor: enter a monitor index or <b>all</b> in the client's Monitor field.</li>"
             "</ul>"
 
             "<h2>General Notes</h2>"
             "<ul>"
-            "<li>Multi-monitor streaming is supported. Choose a specific monitor index or <b>all</b> to capture every display.</li>"
             "<li>The host window includes a Stop button; closing it also terminates the active session safely.</li>"
-            "<li>Clipboard sync and drag-and-drop are available in compatible clients.</li>"
+            "<li>Clipboard sync and drag-and-drop file upload are available in compatible clients.</li>"
             "</ul>"
         )
 
