@@ -15,6 +15,9 @@ import struct
 import datetime
 import platform as py_platform
 import re
+import secrets
+import base64
+import hmac
 
 from shutil import which
 
@@ -37,7 +40,6 @@ ACTIVE_CLIENT = None
 ACTIVE_CLIENT_LOCK = threading.Lock()
 PIN_LENGTH = 6
 PIN_ROTATE_SECS = 30
-ALLOW_SAME_IP_RECONNECT = True
 
 DEFAULT_FPS = "30"
 LEGACY_BITRATE = "8M"
@@ -62,6 +64,27 @@ except Exception:
 CA_CERT = "host_ca.pem"
 CA_KEY  = "host_ca.key"
 TRUSTED_DB = "trusted_clients.json"
+
+def _chmod_600(path):
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+def _harden_secret_files():
+    """Best-effort 0600 on key material created by older versions."""
+    for path in (CA_KEY, CA_CERT, TRUSTED_DB):
+        if os.path.exists(path):
+            _chmod_600(path)
+    try:
+        if os.path.isdir("issued_clients"):
+            for entry in os.listdir("issued_clients"):
+                d = os.path.join("issued_clients", entry)
+                if os.path.isdir(d):
+                    for f in os.listdir(d):
+                        _chmod_600(os.path.join(d, f))
+    except Exception:
+        pass
 
 def _ensure_ca():
     if not HAVE_CRYPTO:
@@ -89,8 +112,10 @@ def _ensure_ca():
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption(),
             ))
+        os.chmod(CA_KEY, 0o600)
         with open(CA_CERT, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
+        os.chmod(CA_CERT, 0o600)
         logging.info("[AUTH] Created new host CA (host_ca.pem / host_ca.key)")
         return True
     except Exception as e:
@@ -111,6 +136,7 @@ def _save_trust_db(db):
     try:
         with open(TRUSTED_DB, "w", encoding="utf-8") as f:
             json.dump(db, f, indent=2)
+        _chmod_600(TRUSTED_DB)
         return True
     except Exception as e:
         logging.error("[AUTH] Failed to write %s: %s", TRUSTED_DB, e)
@@ -177,6 +203,8 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         os.makedirs(export_dir, exist_ok=True)
         with open(os.path.join(export_dir, "client_cert.pem"), "wb") as f: f.write(cert_pem)
         with open(os.path.join(export_dir, "client_key.pem"), "wb") as f: f.write(key_pem)
+        _chmod_600(os.path.join(export_dir, "client_cert.pem"))
+        _chmod_600(os.path.join(export_dir, "client_key.pem"))
         try:
             with open(CA_CERT, "rb") as f: ca_pem = f.read()
             with open(os.path.join(export_dir, "host_ca.pem"), "wb") as f: f.write(ca_pem)
@@ -189,6 +217,59 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
     except Exception as e:
         logging.error("[AUTH] Issue client cert failed: %s", e)
         return None
+
+_PSS_PADDING = None
+if HAVE_CRYPTO:
+    from cryptography.hazmat.primitives.asymmetric import padding as _x509_padding
+    _PSS_PADDING = _x509_padding.PSS(
+        mgf=_x509_padding.MGF1(hashes.SHA256()),
+        salt_length=_x509_padding.PSS.MAX_LENGTH,
+    )
+
+def _verify_client_proof(fp_hex, cert_b64, sig_b64, nonce):
+    """Verify the client owns the private key of a trusted certificate.
+
+    Checks, in order: the offered cert's SHA-256 fingerprint matches the
+    trusted fingerprint, the cert was signed by this host's CA, and the
+    signature over the fresh nonce verifies with the cert's public key.
+    """
+    if not HAVE_CRYPTO or not nonce:
+        return False
+    try:
+        cert = x509.load_pem_x509_certificate(base64.b64decode(cert_b64), default_backend())
+        if cert.fingerprint(hashes.SHA256()).hex().upper() != fp_hex:
+            return False
+        with open(CA_CERT, "rb") as f:
+            ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+        ca_cert.public_key().verify(
+            cert.signature, cert.tbs_certificate_bytes,
+            _x509_padding.PKCS1v15(), cert.signature_hash_algorithm,
+        )
+        cert.public_key().verify(base64.b64decode(sig_b64), nonce, _PSS_PADDING, hashes.SHA256())
+        return True
+    except Exception:
+        return False
+
+def _token_ok(token) -> bool:
+    cur = host_state.session_token
+    if not cur or not token:
+        return False
+    return hmac.compare_digest(str(token), cur)
+
+def _extract_authed_cmd(msg: str):
+    """Strip the 'AUTH <token>' prefix from a control-plane packet.
+
+    Returns the remaining command text, or None when the packet is missing
+    the prefix or carries the wrong token.
+    """
+    if not msg.startswith("AUTH "):
+        return None
+    parts = msg.split(None, 2)
+    if len(parts) < 3:
+        return None
+    if not _token_ok(parts[1]):
+        return None
+    return parts[2]
 
 def _marker_value() -> str:
     marker = os.environ.get("LINUXPLAY_MARKER", "LinuxPlayHost")
@@ -276,6 +357,7 @@ class HostState:
         self.net_mode = "lan"
         self.starting_streams = False
         self.gamepad_thread = None
+        self.session_token = None
 
 host_state = HostState()
 HOST_ARGS = None
@@ -459,6 +541,10 @@ def pin_rotate_if_needed(force=False):
             logging.info("[AUTH] New PIN: %s (valid %ds)", host_state.pin_code, PIN_ROTATE_SECS)
             try:
                 set_status(f"Waiting for PIN: {host_state.pin_code}")
+            except Exception:
+                pass
+            try:
+                set_pin_display(f"PIN:  {host_state.pin_code}")
             except Exception:
                 pass
 
@@ -863,6 +949,33 @@ def _norm_qp(qp):
     except Exception:
         return ""
 
+def _slices_count() -> int:
+    """Slices per frame for VAAPI encodes (1 = whole frame; >1 confines loss to one band).
+
+    LINUXPLAY_SLICES env var overrides the --slices flag for quick testing.
+    """
+    val = None
+    env = os.environ.get("LINUXPLAY_SLICES")
+    if env:
+        try:
+            val = int(env)
+        except Exception:
+            pass
+    if val is None:
+        try:
+            val = int(getattr(HOST_ARGS, "slices", 4))
+        except Exception:
+            val = 4
+    return max(1, min(16, val))
+
+def _udp_buffer_sizes(pkt_size):
+    """(fifo_size, buffer_size) for UDP outputs. Tunnels (sub-1500 path MTU)
+    and Wi-Fi get the larger burst buffers — undersized buffers drop TS
+    packets, which shows up as slice/macroblock artifacts on the client."""
+    if host_state.net_mode == "wifi" or pkt_size < 1316:
+        return 131072, 262144
+    return 65536, 262144
+
 def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
                        tune: str, bitrate: str, pix_fmt: str):
     codec = (codec or "h.264").lower()
@@ -990,7 +1103,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
                 "-bf", "0",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
-                "-slices", "4",
+                "-slices", str(_slices_count()),
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "h264_mp4toannexb"
             ]
@@ -1037,7 +1150,7 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str,
                 "-bf", "0",
                 *(["-g", str(gop_val)] if use_gop else []),
                 *dynamic_flags,
-                "-slices", "4",
+                "-slices", str(_slices_count()),
                 "-pix_fmt", pix_fmt,
                 "-bsf:v", "hevc_mp4toannexb"
             ]
@@ -1144,11 +1257,9 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
             extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
         output_side = _output_sync_flags()
         pkt_size = _udp_ts_pkt_size(ip)
-        fifo_size = 32768
-        buffer_size = 65536
-        if getattr(host_state, "net_mode", "lan") == "wifi":
-            fifo_size = 131072
-            buffer_size = 262144
+        if pkt_size < 1316 and getattr(host_state, "net_mode", "lan") == "lan":
+            logging.info("Tunneled path detected (pkt_size %d) — using larger UDP buffers.", pkt_size)
+        fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
         out = [
             *(_mpegts_ll_mux_flags()),
             "-flags", "+low_delay",
@@ -1230,11 +1341,9 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
 
     output_side = _output_sync_flags()
     pkt_size = _udp_ts_pkt_size(ip)
-    fifo_size = 32768
-    buffer_size = 65536
-    if getattr(host_state, "net_mode", "lan") == "wifi":
-        fifo_size = 131072
-        buffer_size = 262144
+    if pkt_size < 1316 and getattr(host_state, "net_mode", "lan") == "lan":
+        logging.info("Tunneled path detected (pkt_size %d) — using larger UDP buffers.", pkt_size)
+    fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
 
     out = [
         *(_mpegts_ll_mux_flags()),
@@ -1259,8 +1368,10 @@ def build_audio_cmd():
     opus_fd  = os.environ.get("LP_OPUS_FD", "10")
 
     net_mode = getattr(host_state, "net_mode", "lan")
-    aud_buf = "4194304" if net_mode == "wifi" else "512"
-    aud_delay = "150000" if net_mode == "wifi" else "0"
+    aud_pkt = _udp_ts_pkt_size(str(host_state.client_ip))
+    tunneled = aud_pkt < 1316
+    aud_buf = "4194304" if (net_mode == "wifi" or tunneled) else "1048576"
+    aud_delay = "150000" if (net_mode == "wifi" or tunneled) else "0"
 
     mon = os.environ.get("PULSE_MONITOR", "")
     if not mon and which("pactl"):
@@ -1296,12 +1407,14 @@ def build_audio_cmd():
     channels = 2
     if which("pactl"):
         try:
-            probe = subprocess.check_output(
-                ["bash", "-c", f"pactl list sources | grep -A2 '{mon}' | grep 'Channels' | head -n1 | awk '{{print $2}}'"],
-                text=True
-            ).strip()
-            if probe.isdigit():
-                channels = int(probe)
+            src_info = subprocess.check_output(
+                ["pactl", "list", "sources"], text=True, stderr=subprocess.DEVNULL
+            )
+            name_idx = src_info.find(f"Name: {mon}")
+            if name_idx != -1:
+                m = re.search(r"\s(\d+)ch\s", src_info[name_idx:name_idx + 2000])
+                if m:
+                    channels = int(m.group(1))
         except Exception as e:
             logging.warning("Audio channel detection failed: %s", e)
     if channels not in [1, 2, 6, 8]:
@@ -1326,7 +1439,6 @@ def build_audio_cmd():
         "-frame_duration", opus_fd,
     ]
 
-    aud_pkt = _udp_ts_pkt_size(str(host_state.client_ip))
     out = [
         *(_mpegts_ll_mux_flags()),
         *_marker_opt(),
@@ -1376,6 +1488,7 @@ class _UInputInjector:
             "Alt_L": ec.KEY_LEFTALT, "Alt_R": ec.KEY_RIGHTALT,
             "Caps_Lock": ec.KEY_CAPSLOCK, "Num_Lock": ec.KEY_NUMLOCK,
             "Scroll_Lock": ec.KEY_SCROLLLOCK, "space": ec.KEY_SPACE,
+            **{f"F{i}": getattr(ec, f"KEY_F{i}") for i in range(1, 13)},
         }
         base_chars = {
             "-": ec.KEY_MINUS, "=": ec.KEY_EQUAL, "[": ec.KEY_LEFTBRACE,
@@ -1655,148 +1768,151 @@ def _inject_key(action, name):
         except Exception as e:
             logging.debug("xdotool key %s failed for %r: %s", action, name, e)
 
+def _send_and_close(conn, payload: bytes):
+    try:
+        conn.sendall(payload)
+        conn.shutdown(socket.SHUT_WR)
+        time.sleep(0.05)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _monitors_payload():
+    return ";".join(
+        f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors
+    ) if host_state.monitors else DEFAULT_RES
+
+def _begin_session_locked(peer_ip, encoder_str):
+    """Mark the session active and mint a fresh session token.
+
+    Caller must hold host_state.pin_lock. Returns the response text to send.
+    """
+    token = secrets.token_hex(16)
+    host_state.session_active = True
+    host_state.authed_client_ip = peer_ip
+    host_state.pin_expiry = 0
+    host_state.last_pong_ts = time.time()
+    host_state.session_token = token
+    host_state.client_ip = peer_ip
+    return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}"
+
+def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
+    if host_state.session_active:
+        logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session already running.")
+        _send_and_close(conn, b"BUSY:ACTIVESESSION")
+        return
+    if not fp_hex or not _verify_fingerprint_trusted(fp_hex):
+        logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted.")
+        _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
+        return
+    if not HAVE_CRYPTO:
+        logging.warning("[AUTH] cryptography unavailable — cannot verify cert proof; use PIN.")
+        _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
+        return
+
+    nonce = secrets.token_bytes(32)
+    try:
+        conn.sendall(b"CHALLENGE " + nonce.hex().encode("utf-8"))
+        resp = conn.recv(8192).decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        logging.warning(f"[AUTH] Challenge exchange with {peer_ip} failed: {e}")
+        _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
+        return
+
+    parts = resp.split()
+    if (len(parts) == 4 and parts[0] == "CERT" and parts[2] == "SIG"
+            and _verify_client_proof(fp_hex, parts[1], parts[3], nonce)):
+        with host_state.pin_lock:
+            if host_state.session_active:
+                _send_and_close(conn, b"BUSY:ACTIVESESSION")
+                return
+            reply = _begin_session_locked(peer_ip, encoder_str)
+        _send_and_close(conn, reply.encode("utf-8"))
+        set_status(f"Client (cert): {host_state.client_ip}")
+        set_pin_display(f"Session live: {peer_ip} — PIN paused")
+        logging.info(f"[AUTH] Client {peer_ip} authenticated via certificate proof.")
+    else:
+        logging.warning(f"[AUTH] Certificate proof from {peer_ip} failed verification.")
+        _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
+
+def _handle_pin_handshake(conn, parts, peer_ip, encoder_str):
+    provided_pin = parts[1] if len(parts) >= 2 else ""
+    reply = None
+    with host_state.pin_lock:
+        if (not host_state.session_active
+                and provided_pin == str(host_state.pin_code)
+                and time.time() < host_state.pin_expiry):
+            reply = _begin_session_locked(peer_ip, encoder_str).encode("utf-8")
+
+    if reply is not None:
+        logging.info(f"[AUTH] Client {peer_ip} authenticated — PIN invalidated and rotation paused.")
+        _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
+        threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
+        _send_and_close(conn, reply)
+        set_status(f"Client: {host_state.client_ip}")
+        set_pin_display(f"Session live: {peer_ip} — PIN paused")
+        logging.info(f"Client {peer_ip} handshake complete (PIN locked).")
+    else:
+        if host_state.session_active:
+            logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active).")
+            _send_and_close(conn, b"BUSY:ACTIVESESSION")
+        else:
+            logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN.")
+            _send_and_close(conn, b"FAIL:BADPIN")
+            pin_rotate_if_needed(force=True)
+
+def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
+    conn.settimeout(5.0)
+    try:
+        try:
+            raw = conn.recv(4096).decode("utf-8", errors="replace").strip()
+        except (socket.timeout, OSError):
+            return
+        parts = (raw or "").split()
+        cmd = parts[0] if parts else ""
+
+        if host_state.session_active and host_state.authed_client_ip and peer_ip != host_state.authed_client_ip:
+            logging.warning(f"Rejected handshake from {peer_ip}: active session with {host_state.authed_client_ip}")
+            _send_and_close(conn, b"BUSY:ACTIVESESSION")
+            return
+
+        if cmd == "HELLO" and len(parts) >= 2 and parts[1].startswith("CERTFP:"):
+            fp_hex = parts[1][len("CERTFP:"):].strip().upper()
+            _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str)
+            return
+
+        if cmd == "HELLO":
+            _handle_pin_handshake(conn, parts, peer_ip, encoder_str)
+            return
+
+        _send_and_close(conn, b"FAIL")
+    except Exception as e:
+        trigger_shutdown(f"Handshake server error: {e}")
+
 def tcp_handshake_server(sock, encoder_str, args):
     logging.info("TCP handshake server on %d", TCP_HANDSHAKE_PORT)
     set_status("Waiting for client handshake…")
 
     _ensure_ca()
+    _harden_secret_files()
 
     while not host_state.should_terminate:
         try:
             conn, addr = sock.accept()
-            peer_ip = addr[0]
-            logging.info(f"Handshake from {peer_ip}")
-
-            raw = conn.recv(1024).decode("utf-8", errors="replace").strip()
-            parts = (raw or "").split()
-            cmd = parts[0] if parts else ""
-
-            if host_state.session_active and host_state.authed_client_ip:
-                if peer_ip != host_state.authed_client_ip:
-                    logging.warning(f"Rejected handshake from {peer_ip}: active session with {host_state.authed_client_ip}")
-                    try:
-                        conn.sendall(b"BUSY:ACTIVESESSION")
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-                    continue
-
-            if cmd == "HELLO" and len(parts) >= 2 and parts[1].startswith("CERTFP:"):
-                fp_hex = parts[1][len("CERTFP:"):].strip().upper()
-
-                if host_state.session_active:
-                    try:
-                        conn.sendall(b"BUSY:ACTIVESESSION")
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-                    logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session already running.")
-                    continue
-
-                if fp_hex and _verify_fingerprint_trusted(fp_hex):
-                    host_state.session_active = True
-                    host_state.authed_client_ip = peer_ip
-                    host_state.pin_expiry = 0
-                    host_state.pin_paused = True
-                    host_state.last_pong_ts = time.time()
-                    host_state.client_ip = peer_ip
-
-                    monitors_str = ";".join(
-                        f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors
-                    ) if host_state.monitors else DEFAULT_RES
-                    resp = f"OK:{encoder_str}:{monitors_str}"
-                    try:
-                        conn.sendall(resp.encode("utf-8"))
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    finally:
-                        conn.close()
-
-                    set_status(f"Client (cert): {host_state.client_ip}")
-                    logging.info(f"[AUTH] Client {peer_ip} authenticated via CERTFP.")
-                    continue
-                else:
-                    try:
-                        conn.sendall(b"FAIL:UNTRUSTEDCERT")
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-                    logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted.")
-                    continue
-
-            if cmd == "HELLO":
-                provided_pin = parts[1] if len(parts) >= 2 else ""
-                ok = False
-
-                with host_state.pin_lock:
-                    if not host_state.session_active:
-                        if (provided_pin == str(host_state.pin_code)) and (time.time() < host_state.pin_expiry):
-                            ok = True
-
-                if ok:
-                    with host_state.pin_lock:
-                        host_state.session_active = True
-                        host_state.authed_client_ip = peer_ip
-                        host_state.pin_expiry = 0
-                        host_state.pin_paused = True
-                        host_state.last_pong_ts = time.time()
-                        logging.info(f"[AUTH] Client {peer_ip} authenticated — PIN invalidated and rotation paused.")
-
-                    _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
-                    threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
-
-                    host_state.client_ip = peer_ip
-                    monitors_str = ";".join(
-                        f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors
-                    ) if host_state.monitors else DEFAULT_RES
-
-                    resp = f"OK:{encoder_str}:{monitors_str}"
-                    try:
-                        conn.sendall(resp.encode("utf-8"))
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    finally:
-                        conn.close()
-
-                    set_status(f"Client: {host_state.client_ip}")
-                    logging.info(f"Client {peer_ip} handshake complete (PIN locked).")
-
-                else:
-                    if host_state.session_active:
-                        logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active).")
-                        reply = b"BUSY:ACTIVESESSION"
-                    else:
-                        logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN.")
-                        reply = b"FAIL:BADPIN"
-                        pin_rotate_if_needed(force=True)
-                    try:
-                        conn.sendall(reply)
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-
-            else:
-                try:
-                    conn.sendall(b"FAIL")
-                    conn.shutdown(socket.SHUT_WR)
-                    time.sleep(0.05)
-                except Exception:
-                    pass
-                conn.close()
-
         except OSError:
             break
-        except Exception as e:
-            trigger_shutdown(f"Handshake server error: {e}")
-            break
+        peer_ip = addr[0]
+        logging.info(f"Handshake from {peer_ip}")
+        # Each connection gets its own thread + timeout, so one stalled
+        # client can never block the listener for everyone else.
+        threading.Thread(
+            target=_handle_handshake_conn, args=(conn, peer_ip, encoder_str, args),
+            daemon=True, name=f"Handshake-{peer_ip}",
+        ).start()
 
 def start_streams_for_current_client(args):
     ip = getattr(host_state, "client_ip", None)
@@ -1878,7 +1994,12 @@ def control_listener(sock):
             if not msg:
                 continue
 
-            tokens = msg.split()
+            authed = _extract_authed_cmd(msg)
+            if authed is None:
+                logging.debug(f"Dropped control packet from {peer_ip} (bad/missing AUTH token)")
+                continue
+
+            tokens = authed.split()
             cmd = tokens[0].upper() if tokens else ""
 
             if cmd == "NET" and len(tokens) >= 2:
@@ -1904,6 +2025,7 @@ def control_listener(sock):
                     host_state.starting_streams = False
                     host_state.session_active = False
                     host_state.authed_client_ip = None
+                    host_state.session_token = None
                     set_status("Client disconnected — waiting for connection…")
                     logging.debug("All streams stopped after GOODBYE.")
 
@@ -1914,10 +2036,9 @@ def control_listener(sock):
                 except Exception as e:
                     logging.error(f"Error handling GOODBYE cleanup: {e}")
                 continue
-            elif cmd.startswith("WINDOW_CLOSE"):
+            elif cmd == "WINDOW_CLOSE":
                 try:
-                    parts = cmd.split()
-                    idx = int(parts[1]) if len(parts) >= 2 else -1
+                    idx = int(tokens[1]) if len(tokens) >= 2 else -1
                 except Exception:
                     idx = -1
                 if isinstance(host_state.video_threads, dict) and idx in host_state.video_threads:
@@ -1979,7 +2100,7 @@ def clipboard_monitor_host():
         with host_state.clipboard_lock:
             if (not host_state.ignore_clipboard_update and current and current != host_state.last_clipboard_content and host_state.client_ip):
                 host_state.last_clipboard_content = current
-                msg = f"CLIPBOARD_UPDATE HOST {current}".encode("utf-8")
+                msg = f"AUTH {host_state.session_token} CLIPBOARD_UPDATE HOST {current}".encode("utf-8")
                 try:
                     sock.sendto(msg, (host_state.client_ip, UDP_CLIPBOARD_PORT))
                 except Exception as e:
@@ -1994,8 +2115,14 @@ def clipboard_listener_host(sock):
     while not host_state.should_terminate:
         try:
             data, addr = sock.recvfrom(65535)
+            if not host_state.session_active or addr[0] != host_state.authed_client_ip:
+                continue
             msg = data.decode("utf-8", errors="ignore")
-            tokens = msg.split(maxsplit=2)
+            payload = _extract_authed_cmd(msg)
+            if payload is None:
+                logging.debug(f"Dropped clipboard packet from {addr[0]} (bad/missing AUTH token)")
+                continue
+            tokens = payload.split(maxsplit=2)
             if len(tokens) >= 3 and tokens[0] == "CLIPBOARD_UPDATE" and tokens[1] == "CLIENT":
                 new_content = tokens[2]
                 with host_state.clipboard_lock:
@@ -2203,7 +2330,9 @@ def heartbeat_manager(args):
             try:
                 data, addr = s.recvfrom(1024)
                 msg = data.decode("utf-8", errors="ignore").strip()
-                if msg.startswith("PONG") and addr[0] == host_state.client_ip:
+                pong_parts = msg.split()
+                if (msg.startswith("PONG") and addr[0] == host_state.client_ip
+                        and len(pong_parts) == 2 and _token_ok(pong_parts[1])):
                     host_state.last_pong_ts = now
             except socket.timeout:
                 pass
@@ -2226,6 +2355,7 @@ def heartbeat_manager(args):
                     set_status("Client disconnected — waiting for connection…")
                     host_state.session_active = False
                     host_state.authed_client_ip = None
+                    host_state.session_token = None
                     pin_rotate_if_needed(force=True)
 
                     time.sleep(RECONNECT_COOLDOWN)
@@ -2347,6 +2477,7 @@ class GamepadServer(threading.Thread):
         self._running = True
         self.sock = None
         self.ui = None
+        self._authed_addr = None
         self._dpad = {"left": False, "right": False, "up": False, "down": False}
         self._hatx = 0
         self._haty = 0
@@ -2419,13 +2550,30 @@ class GamepadServer(threading.Thread):
 
         while self._running and not host_state.should_terminate:
             try:
-                n, _ = self.sock.recvfrom_into(buf)
+                n, addr = self.sock.recvfrom_into(buf)
             except BlockingIOError:
                 time.sleep(0.0005)
                 continue
             except OSError:
                 break
             if n < 5:
+                continue
+
+            if not host_state.session_active:
+                self._authed_addr = None
+                continue
+            if buf[:5] == b"GAUTH":
+                try:
+                    tok = bytes(buf[:n]).decode("utf-8", "ignore").split(None, 1)[1].strip()
+                except Exception:
+                    tok = ""
+                if _token_ok(tok):
+                    self._authed_addr = addr
+                    logging.info("Gamepad channel authorized for %s.", addr[0])
+                else:
+                    logging.debug("Gamepad GAUTH from %s rejected (bad token).", addr[0])
+                continue
+            if not (self._authed_addr and addr == self._authed_addr):
                 continue
 
             try:
@@ -2597,8 +2745,15 @@ def core_main(args, use_signals=True) -> int:
 class LogEmitter(QObject):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
+    pin = pyqtSignal(str)
 
 log_emitter = LogEmitter()
+
+def set_pin_display(text: str):
+    try:
+        log_emitter.pin.emit(text)
+    except Exception:
+        pass
 
 def set_status(text: str):
     try:
@@ -2651,6 +2806,19 @@ class HostWindow(QWidget):
         self.statusLabel = QLabel("Idle")
         self.statusLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+        self.pinLabel = QLabel("PIN:  ––––––")
+        pin_font = QFont("monospace")
+        pin_font.setStyleHint(QFont.TypeWriter)
+        pin_font.setPointSize(30)
+        pin_font.setBold(True)
+        self.pinLabel.setFont(pin_font)
+        self.pinLabel.setAlignment(Qt.AlignCenter)
+        self.pinLabel.setStyleSheet(
+            "color:#7CFC00; background:#0d0d0d; border:2px solid #2e7d32;"
+            "border-radius:8px; padding:8px;"
+        )
+        log_emitter.pin.connect(self.pinLabel.setText)
+
         self.logView = QTextEdit()
         self.logView.setReadOnly(True)
         font = QFont("monospace"); font.setStyleHint(QFont.TypeWriter)
@@ -2672,6 +2840,7 @@ class HostWindow(QWidget):
         buttons.addWidget(self.stopBtn)
 
         layout.addWidget(self.statusLabel)
+        layout.addWidget(self.pinLabel)
         layout.addWidget(self.logView)
         layout.addLayout(buttons)
 
@@ -2742,6 +2911,8 @@ def parse_args():
     p.add_argument("--qp", default="")
     p.add_argument("--tune", default="")
     p.add_argument("--pix_fmt", default="yuv420p")
+    p.add_argument("--slices", type=int, default=4,
+                   help="Slices per frame for VAAPI encodes (1 disables; 4 confines loss to a band).")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
     return args

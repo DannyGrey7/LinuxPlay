@@ -28,7 +28,6 @@ except Exception:
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
-WG_INFO_PATH = "/tmp/linuxplay_wg_info.json"
 CFG_PATH = os.path.join(os.path.expanduser("~"), ".linuxplay_start_cfg.json")
 LINUXPLAY_MARKER = "LinuxPlayHost"
 
@@ -480,7 +479,7 @@ class HostTab(QWidget):
             self.displayCombo.setCurrentText(":0")
             self.presetCombo.setCurrentText("llhp" if self.presetCombo.findText("llhp") != -1 else "zerolatency")
             self.gopCombo.setCurrentText("1")
-            self.qpCombo.setCurrentText("23")
+            self.qpCombo.setCurrentText("22")
             self.tuneCombo.setCurrentText("ultra-low-latency")
             self.pixFmtCombo.setCurrentText("yuv420p")
             self._refresh_backend_choices(preselect="auto")
@@ -494,13 +493,13 @@ class HostTab(QWidget):
             self.presetCombo.setCurrentText("fast")
             self.gopCombo.setCurrentText("15")
             self.qpCombo.setCurrentText("None")
-            self.tuneCombo.setCurrentText("film")
+            self.tuneCombo.setCurrentText("None")
             self.pixFmtCombo.setCurrentText("yuv420p")
             self._refresh_backend_choices(preselect="auto")
         elif profile == "High Quality":
             self.encoderCombo.setCurrentText("h.265" if self.encoderCombo.findText("h.265") != -1 else "h.264")
             self.framerateCombo.setCurrentText("30")
-            self.bitrateCombo.setCurrentText("16M")
+            self.bitrateCombo.setCurrentText("15M")
             self.audioCombo.setCurrentText("enable")
             self.adaptiveCheck.setChecked(False)
             self.displayCombo.setCurrentText(":0")
@@ -783,17 +782,7 @@ class ClientTab(QWidget):
 
         self.hostIPEdit = QComboBox()
         self.hostIPEdit.setEditable(True)
-        self.hostIPEdit.setToolTip("Host IP (LAN) or WireGuard tunnel IP (e.g., 10.13.13.1)")
-
-        if IS_LINUX and os.path.exists(WG_INFO_PATH):
-            try:
-                with open(WG_INFO_PATH, "r") as f:
-                    info = json.load(f)
-                t_ip = info.get("host_tunnel_ip", "")
-                if t_ip:
-                    self.hostIPEdit.addItem(t_ip)
-            except Exception:
-                pass
+        self.hostIPEdit.setToolTip("Host IP (LAN) or WireGuard/Tailscale tunnel IP (e.g., 10.13.13.1 or 100.x.y.z)")
 
         last = load_cfg().get("client", {})
         for ip in last.get("recent_ips", []):
@@ -934,7 +923,6 @@ class ClientTab(QWidget):
             "ultra": bool(ultra),
             "gamepad": gamepad,
             "gamepad_dev": gamepad_dev,
-            "pin": pin
         })
         cfg["client"] = client_cfg
         save_cfg(cfg)

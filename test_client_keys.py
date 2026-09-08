@@ -46,7 +46,11 @@ expect(" ", Qt.Key_Space, "space")
 expect("5", Qt.Key_5, "5")
 ok("printable text still maps by character (case and digits preserved)")
 
-expect(None, Qt.Key_F5, None)
+expect("", Qt.Key_F5, "F5")
+expect("", Qt.Key_F12, "F12")
+ok("function keys F1–F12 map by key code (previously dropped)")
+
+expect(None, Qt.Key_MediaPlay, None)
 ok("unmapped keys yield None (no packet sent)")
 
 print(f"\nALL {len(PASS)} CLIENT KEY TESTS PASSED")

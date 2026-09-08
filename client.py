@@ -5,6 +5,7 @@ import mmap
 import ctypes
 import struct
 import socket
+import base64
 import psutil
 import time
 import json
@@ -67,7 +68,9 @@ CLIENT_STATE = {
     "connected": False,
     "last_heartbeat": 0.0,
     "net_mode": "lan",
-    "reconnecting": False
+    "reconnecting": False,
+    "token": None,
+    "last_reauth_attempt": 0.0,
 }
 
 try:
@@ -202,11 +205,47 @@ def _read_pem_cert_fingerprint(pem_path: str) -> str:
     except Exception:
         return ""
 
-def tcp_handshake_client(host_ip, pin=None):
+def _build_client_proof(cert_path, key_path, nonce_hex):
+    """Sign the host's challenge nonce with the client key.
+
+    Returns 'CERT <b64> SIG <b64>' for the host to verify, or None when the
+    cryptography package is missing / signing fails (caller falls back to PIN).
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        with open(key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        with open(cert_path, "rb") as f:
+            cert_b64 = base64.b64encode(f.read()).decode("ascii")
+        nonce = bytes.fromhex(nonce_hex)
+        sig = key.sign(
+            nonce,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256(),
+        )
+        return f"CERT {cert_b64} SIG {base64.b64encode(sig).decode('ascii')}"
+    except Exception as e:
+        logging.debug("Could not build certificate proof: %s", e)
+        return None
+
+def _parse_ok_response(resp):
+    """'OK:<encoder>:<monitors>\\nTOKEN <hex>' -> ((encoder, monitors), token)."""
+    lines = [l.strip() for l in resp.splitlines() if l.strip()]
+    parts = lines[0].split(":", 2)
+    host_encoder = parts[1].strip() if len(parts) > 1 else "none"
+    monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+    token = ""
+    for ln in lines[1:]:
+        if ln.startswith("TOKEN "):
+            token = ln.split(None, 1)[1].strip()
+    return (host_encoder, monitor_info), token
+
+def tcp_handshake_client(host_ip, pin=None, interactive=True):
     from PyQt5.QtWidgets import QLineEdit
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock.settimeout(8)
     try:
         logging.info("Handshake to %s:%s", host_ip, TCP_HANDSHAKE_PORT)
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
@@ -221,17 +260,25 @@ def tcp_handshake_client(host_ip, pin=None):
             if fp_hex:
                 try:
                     sock.sendall(f'HELLO CERTFP:{fp_hex}'.encode('utf-8'))
-                    resp = sock.recv(1024).decode('utf-8', errors='replace').strip()
-                    logging.debug('Cert handshake response: %s', resp)
+                    resp = sock.recv(4096).decode('utf-8', errors='replace').strip()
+                    if resp.startswith('CHALLENGE '):
+                        nonce_hex = resp.split(None, 1)[1].strip()
+                        proof = _build_client_proof(cert_path, key_path, nonce_hex)
+                        if proof is None:
+                            logging.warning('Host requires certificate proof but signing failed — falling back to PIN.')
+                        else:
+                            sock.sendall(proof.encode('utf-8'))
+                            resp = sock.recv(8192).decode('utf-8', errors='replace').strip()
+                    logging.debug('Cert handshake response: %s', resp.splitlines()[0] if resp else '(empty)')
                     if resp.startswith('OK:'):
-                        parts = resp.split(':', 2)
-                        host_encoder = parts[1].strip()
-                        monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+                        info, token = _parse_ok_response(resp)
+                        if token:
+                            CLIENT_STATE['token'] = token
                         sock.close()
                         CLIENT_STATE['connected'] = True
                         CLIENT_STATE['last_heartbeat'] = time.time()
                         logging.info('Authenticated via client certificate (FP %s…) — PIN skipped', fp_hex[:12])
-                        return (True, (host_encoder, monitor_info))
+                        return (True, info)
                     elif resp.startswith('FAIL:UNTRUSTEDCERT'):
                         logging.warning('Client cert not yet trusted by host — falling back to PIN.')
                     else:
@@ -241,6 +288,10 @@ def tcp_handshake_client(host_ip, pin=None):
 
         code = (pin or "").strip()
         if not code or len(code) != 6 or not code.isdigit():
+            if not interactive:
+                sock.close()
+                logging.info("No usable PIN for non-interactive handshake.")
+                return (False, None)
             dlg = QInputDialog()
             dlg.setWindowTitle("Enter Host PIN")
             dlg.setLabelText("6-digit PIN (rotates every 30s):")
@@ -261,48 +312,89 @@ def tcp_handshake_client(host_ip, pin=None):
             if not ok or not code or not code.isdigit() or len(code) != 6:
                 sock.close()
                 logging.error("PIN entry cancelled or invalid.")
-                QMessageBox.critical(None, "Invalid PIN", "PIN entry was cancelled or invalid.")
+                if interactive:
+                    QMessageBox.critical(None, "Invalid PIN", "PIN entry was cancelled or invalid.")
                 return (False, None)
 
         sock.sendall(f"HELLO {code}".encode("utf-8"))
-        resp = sock.recv(1024).decode("utf-8", errors="replace").strip()
-        logging.debug("Handshake response: %s", resp)
+        resp = sock.recv(4096).decode("utf-8", errors="replace").strip()
+        logging.debug("Handshake response: %s", resp.splitlines()[0] if resp else '(empty)')
 
         if resp.startswith("OK:"):
-            parts = resp.split(":", 2)
-            host_encoder = parts[1].strip()
-            monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+            info, token = _parse_ok_response(resp)
+            if token:
+                CLIENT_STATE["token"] = token
             sock.close()
             CLIENT_STATE["connected"] = True
             CLIENT_STATE["last_heartbeat"] = time.time()
-            return (True, (host_encoder, monitor_info))
+            return (True, info)
 
         elif resp.startswith("BUSY"):
             logging.error("Host is already in a session with another client.")
-            QMessageBox.critical(None, "Host Busy", "The host is already connected to another client.")
+            if interactive:
+                QMessageBox.critical(None, "Host Busy", "The host is already connected to another client.")
             sock.close()
             return (False, None)
 
         elif resp.startswith("FAIL:BADPIN"):
             logging.error("Incorrect or expired PIN.")
-            QMessageBox.critical(None, "Authentication Failed", "The PIN is incorrect or expired. Please try again.")
+            if interactive:
+                QMessageBox.critical(None, "Authentication Failed", "The PIN is incorrect or expired. Please try again.")
             sock.close()
             return (False, None)
 
         else:
             logging.error("Unexpected handshake response: %s", resp)
-            QMessageBox.critical(None, "Handshake Error", f"Unexpected response from host:\n{resp}")
+            if interactive:
+                QMessageBox.critical(None, "Handshake Error", f"Unexpected response from host:\n{resp}")
             sock.close()
             return (False, None)
 
     except Exception as e:
         logging.error("Handshake failed: %s", e)
-        QMessageBox.critical(None, "Connection Error", f"Handshake failed:\n{e}")
+        if interactive:
+            QMessageBox.critical(None, "Connection Error", f"Handshake failed:\n{e}")
         try:
             sock.close()
         except Exception:
             pass
         return (False, None)
+
+_rehandshake_lock = threading.Lock()
+_reauth_no_credentials_warned = False
+
+def attempt_rehandshake(host_ip, pin=None):
+    """Re-run the TCP handshake after a session drop (cert bundle or saved PIN)."""
+    global _reauth_no_credentials_warned
+    if not _rehandshake_lock.acquire(blocking=False):
+        return
+    try:
+        if CLIENT_STATE.get("connected"):
+            return
+        here = os.path.dirname(os.path.abspath(__file__))
+        has_cert = (os.path.exists(os.path.join(here, "client_cert.pem"))
+                    and os.path.exists(os.path.join(here, "client_key.pem")))
+        code = (pin or "").strip()
+        usable_pin = code if (len(code) == 6 and code.isdigit()) else None
+        if not has_cert and not usable_pin:
+            if not _reauth_no_credentials_warned:
+                _reauth_no_credentials_warned = True
+                logging.warning(
+                    "Session lost — no certificate bundle or saved PIN for automatic "
+                    "re-auth; restart the client to reconnect."
+                )
+            return
+        logging.info("Session lost — re-authenticating with host…")
+        ok, _info = tcp_handshake_client(host_ip, usable_pin, interactive=False)
+        if ok:
+            CLIENT_STATE["connected"] = True
+            CLIENT_STATE["reconnecting"] = False
+            CLIENT_STATE["last_heartbeat"] = time.time()
+            logging.info("Re-authenticated — stream should resume shortly.")
+        else:
+            logging.debug("Re-authentication failed — will retry.")
+    finally:
+        _rehandshake_lock.release()
 
 def heartbeat_responder(host_ip):
     def loop():
@@ -315,16 +407,18 @@ def heartbeat_responder(host_ip):
                 return
             sock.settimeout(2)
             logging.info("Heartbeat responder active on UDP %s", UDP_HEARTBEAT_PORT)
-            while CLIENT_STATE["connected"]:
+            while True:
                 try:
                     data, addr = sock.recvfrom(256)
                     if data == b"PING":
-                        sock.sendto(b"PONG", addr)
+                        token = CLIENT_STATE.get("token") or ""
+                        sock.sendto(f"PONG {token}".encode("utf-8"), addr)
                         CLIENT_STATE["last_heartbeat"] = time.time()
+                        if not CLIENT_STATE["connected"]:
+                            CLIENT_STATE["connected"] = True
+                            CLIENT_STATE["reconnecting"] = False
                 except socket.timeout:
-                    if time.time() - CLIENT_STATE["last_heartbeat"] > 10:
-                        CLIENT_STATE["connected"] = False
-                        CLIENT_STATE["reconnecting"] = True
+                    pass
                 except Exception:
                     time.sleep(0.2)
     t = threading.Thread(target=loop, daemon=True)
@@ -341,10 +435,15 @@ def clipboard_listener(app_clipboard):
                 logging.error(f"Clipboard listener bind failed: {e}")
                 return
             logging.info("Listening for clipboard updates on UDP %s", UDP_CLIPBOARD_PORT)
-            while CLIENT_STATE["connected"]:
+            while True:
                 try:
                     data, _ = sock.recvfrom(65535)
                     msg = data.decode("utf-8", errors="replace").strip()
+                    tok = CLIENT_STATE.get("token") or ""
+                    prefix = f"AUTH {tok} "
+                    if not tok or not msg.startswith(prefix):
+                        continue
+                    msg = msg[len(prefix):]
                     if msg.startswith("CLIPBOARD_UPDATE HOST"):
                         text = msg.split("HOST", 1)[1].strip()
                         if text:
@@ -388,7 +487,7 @@ def audio_listener(host_ip):
             "-flags", "low_delay",
             "-af", afilter,
             "-f", "mpegts",
-            f"udp://{host_ip}:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=32768",
+            f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576",
         ]
 
         logging.info("Audio listener command: %s", " ".join(cmd))
@@ -874,7 +973,8 @@ class VideoWidgetGL(QOpenGLWidget):
         if self.ignore_clipboard or not new_text or new_text == self.last_clipboard:
             return
         self.last_clipboard = new_text
-        msg = f"CLIPBOARD_UPDATE CLIENT {new_text}".encode("utf-8")
+        token = CLIENT_STATE.get("token") or ""
+        msg = f"AUTH {token} CLIPBOARD_UPDATE CLIENT {new_text}".encode("utf-8")
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.sendto(msg, (self.host_ip, UDP_CLIPBOARD_PORT))
@@ -982,11 +1082,6 @@ class VideoWidgetGL(QOpenGLWidget):
             diffs = [t2 - t1 for t1, t2 in zip(self._frame_times, self._frame_times[1:])]
             mean_diff = statistics.mean(diffs)
             self._fps = 1.0 / mean_diff if mean_diff > 0 else 0.0
-
-        try:
-            self.renderer.render_frame(frame_tuple)
-        except Exception as e:
-            logging.debug(f"Renderer {self.renderer.name()} failed: {e}")
 
         if self.isVisible():
             t = time.time()
@@ -1111,6 +1206,7 @@ class VideoWidgetGL(QOpenGLWidget):
             Qt.Key_Meta: "Super_L", Qt.Key_Alt: "Alt_L", Qt.Key_AltGr: "Alt_R",
             Qt.Key_CapsLock: "Caps_Lock", Qt.Key_NumLock: "Num_Lock",
             Qt.Key_ScrollLock: "Scroll_Lock",
+            **{getattr(Qt, f"Key_F{i}"): f"F{i}" for i in range(1, 13)},
         }
         if key in key_map:
             return key_map[key]
@@ -1194,6 +1290,12 @@ class GamepadThread(threading.Thread):
         sendto = self.sock.sendto
         addr = (self.host_ip, self.port)
 
+        token = CLIENT_STATE.get("token") or ""
+        try:
+            sendto(f"GAUTH {token}".encode("utf-8"), addr)
+        except Exception:
+            pass
+
         try:
             for event in dev.read_loop():
                 if not self._running:
@@ -1224,10 +1326,12 @@ class GamepadThread(threading.Thread):
 class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
-                 gamepad="disable", gamepad_dev=None):
+                 gamepad="disable", gamepad_dev=None, pin=None):
         super().__init__(parent)
-        
+
         self.window_id = SESSION.register()
+        self.monitor_index = udp_port - DEFAULT_UDP_PORT
+        self._pin = pin
         self.setWindowTitle("LinuxPlay")
         self.texture_width, self.texture_height = rwidth, rheight
         self.offset_x, self.offset_y = offset_x, offset_y
@@ -1241,10 +1345,7 @@ class MainWindow(QMainWindow):
         self.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.control_sock.setblocking(False)
 
-        try:
-            self.control_sock.sendto(f"NET {net_mode}".encode("utf-8"), self.control_addr)
-        except Exception as e:
-            logging.debug(f"NET announce failed: {e}")
+        self.send_control(f"NET {net_mode}")
 
         self.video_widget = VideoWidgetGL(self.send_control, rwidth, rheight,
                                           offset_x, offset_y, host_ip)
@@ -1257,7 +1358,7 @@ class MainWindow(QMainWindow):
         self.video_url = (
             f"udp://@0.0.0.0:{udp_port}"
             f"?pkt_size={pkt}"
-            f"&reuse=1&buffer_size=65536&fifo_size=32768"
+            f"&reuse=1&buffer_size=4194304&fifo_size=131072"
             f"&overrun_nonfatal=1&max_delay=0"
         )
 
@@ -1342,6 +1443,12 @@ class MainWindow(QMainWindow):
         if age > 6 and CLIENT_STATE["connected"]:
             CLIENT_STATE["connected"], CLIENT_STATE["reconnecting"] = False, True
             logging.warning("Lost heartbeat from host")
+            CLIENT_STATE["last_reauth_attempt"] = now
+            threading.Thread(target=attempt_rehandshake, args=(self.host_ip, self._pin), daemon=True).start()
+        elif age > 6 and CLIENT_STATE["reconnecting"]:
+            if now - CLIENT_STATE.get("last_reauth_attempt", 0.0) > 5:
+                CLIENT_STATE["last_reauth_attempt"] = now
+                threading.Thread(target=attempt_rehandshake, args=(self.host_ip, self._pin), daemon=True).start()
         elif age <= 6 and CLIENT_STATE["reconnecting"]:
             CLIENT_STATE["connected"], CLIENT_STATE["reconnecting"] = True, False
             logging.info("Heartbeat restored")
@@ -1463,8 +1570,10 @@ class MainWindow(QMainWindow):
             logging.error(f"Upload error for {file_path}: {e}")
 
     def send_control(self, msg):
+        token = CLIENT_STATE.get("token")
+        payload = f"AUTH {token} {msg}" if token else msg
         try:
-            self.control_sock.sendto(msg.encode("utf-8"), self.control_addr)
+            self.control_sock.sendto(payload.encode("utf-8"), self.control_addr)
         except Exception as e:
             logging.error(f"Control send error: {e}")
 
@@ -1472,15 +1581,14 @@ class MainWindow(QMainWindow):
         self._running = False
         logging.info("Closing client window…")
         try:
-            msg = f"WINDOW_CLOSE {self.window_id}".encode("utf-8")
-            self.control_sock.sendto(msg, self.control_addr)
+            self.send_control(f"WINDOW_CLOSE {self.monitor_index}")
         except Exception as e:
             logging.debug(f"WINDOW_CLOSE send failed: {e}")
         remaining = SESSION.unregister()
         if remaining == 0:
             CLIENT_STATE["connected"] = False
             try:
-                self.control_sock.sendto(b"GOODBYE", self.control_addr)
+                self.send_control("GOODBYE")
                 logging.info("Sent GOODBYE to host (last window closed)")
             except Exception as e:
                 logging.debug(f"GOODBYE send failed: {e}")
@@ -1662,7 +1770,7 @@ def main():
         for i, (w, h, ox, oy) in enumerate(monitors):
             win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + i,
                              ox, oy, net_mode, ultra=ultra_active,
-                             gamepad=args.gamepad, gamepad_dev=args.gamepad_dev)
+                             gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin)
             win.setWindowTitle(f"LinuxPlay — Monitor {i}")
             win.show()
             windows.append(win)
@@ -1676,7 +1784,7 @@ def main():
         w, h, ox, oy = monitors[idx]
         win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + idx,
                          ox, oy, net_mode, ultra=ultra_active,
-                         gamepad=args.gamepad, gamepad_dev=args.gamepad_dev)
+                         gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin)
         win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
         win.show()
         windows.append(win)
