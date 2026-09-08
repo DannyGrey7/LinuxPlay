@@ -67,6 +67,14 @@ def _save_restore_token(token):
         logging.debug("Could not persist portal restore token: %s", e)
 
 
+def _clear_restore_token():
+    try:
+        if os.path.exists(RESTORE_PATH):
+            os.remove(RESTORE_PATH)
+    except Exception:
+        pass
+
+
 class PortalCapture:
     """One ScreenCast session, kept alive across client reconnects."""
 
@@ -116,18 +124,23 @@ class PortalCapture:
         self._add_match()
 
         sender = (self.conn.unique_name or ":0")[1:].replace(".", "_")
-        handle_token = "lp" + secrets.token_hex(4)
         session_token = "linuxplay" + secrets.token_hex(4)
-        request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
 
+        # The portal spec requires a unique handle_token per request;
+        # reusing one path across CreateSession/SelectSources/Start makes
+        # Response matching (and restore tokens) unreliable on some backends.
+        def request_path():
+            tok = "lp" + secrets.token_hex(4)
+            return tok, f"/org/freedesktop/portal/desktop/request/{sender}/{tok}"
+
+        # 1. CreateSession
+        tok, path = request_path()
         reply = self._call("CreateSession", "a{sv}", ({
-            "handle_token": ("s", handle_token),
+            "handle_token": ("s", tok),
             "session_handle_token": ("s", session_token),
         },), timeout=10)
         logging.debug("CreateSession -> %s", reply)
-
-        # NOTE: jeepney builds Variant from (signature, value) tuples automatically
-        code, results = self._wait_response(request_path, 15)
+        code, results = self._wait_response(path, 15)
         if code != 0:
             raise RuntimeError(f"CreateSession failed (code {code})")
         self.session = results.get("session_handle")
@@ -136,32 +149,56 @@ class PortalCapture:
         logging.info("Portal session: %s", self.session)
 
         # 2. SelectSources (monitors, cursor embedded, persist approval)
+        def _select_sources(use_restore):
+            tok, path = request_path()
+            options = {
+                "handle_token": ("s", tok),
+                "types": ("u", MONITOR),
+                "multiple": ("b", multiple),
+                "cursor_mode": ("u", CURSOR_EMBEDDED),
+                "persist_mode": ("u", PERSISTENT),
+            }
+            if use_restore:
+                options["restore_token"] = ("s", use_restore)
+            self._call("SelectSources", "oa{sv}", (self.session, options), timeout=15)
+            return self._wait_response(path, timeout_dialog)
+
         restore_token = _load_restore_token()
-        options = {
-            "handle_token": ("s", handle_token),
-            "types": ("u", MONITOR),
-            "multiple": ("b", multiple),
-            "cursor_mode": ("u", CURSOR_EMBEDDED),
-            "persist_mode": ("u", PERSISTENT),
-        }
         if restore_token:
-            options["restore_token"] = ("s", restore_token)
-        request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
-        self._call("SelectSources", "oa{sv}", (self.session, options), timeout=15)
-        code, results = self._wait_response(request_path, timeout_dialog)
+            logging.debug("Reusing portal restore token (should skip the share dialog).")
+            code, results = _select_sources(restore_token)
+            if code != 0:
+                logging.info("Portal restore token no longer valid (code %s) — asking again.", code)
+                _clear_restore_token()
+                code, results = _select_sources(None)
+        else:
+            code, results = _select_sources(None)
         if code != 0:
             raise RuntimeError(f"Screen selection declined (code {code})")
+
         new_token = results.get("restore_token")
         if new_token:
             _save_restore_token(new_token)
+            logging.info("Portal restore token saved — the share dialog should not appear again.")
+        else:
+            logging.info(
+                "Portal did not issue a restore token; if the share dialog has a "
+                "'remember' option, enable it to avoid future prompts."
+            )
 
         # 3. Start
-        request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
-        self._call("Start", "osa{sv}", (self.session, "", {"handle_token": ("s", handle_token)}),
+        tok, path = request_path()
+        self._call("Start", "osa{sv}", (self.session, "", {"handle_token": ("s", tok)}),
                    timeout=15)
-        code, results = self._wait_response(request_path, timeout_dialog)
+        code, results = self._wait_response(path, timeout_dialog)
         if code != 0:
             raise RuntimeError(f"ScreenCast start declined (code {code})")
+
+        # Some backends only hand out the restore token with the Start response.
+        late_token = results.get("restore_token")
+        if late_token and not new_token:
+            _save_restore_token(late_token)
+            logging.info("Portal restore token saved — the share dialog should not appear again.")
 
         # 4. Parse streams
         streams = results.get("streams") or []

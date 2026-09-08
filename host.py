@@ -153,7 +153,13 @@ def _verify_fingerprint_trusted(fp_hex):
     rec = _trust_record_for(fp_hex, db)
     return (rec is not None) and (rec.get("status") == "trusted")
 
-def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
+def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", public_key_pem=None):
+    """Issue a client certificate.
+
+    With public_key_pem (KEYREQ flow) the client generated its own keypair
+    and only the certificate needs to cross the network; without it the host
+    generates a key and exports the full bundle to issued_clients/.
+    """
     if not _ensure_ca():
         return None
 
@@ -163,13 +169,26 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         with open(CA_CERT, "rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
 
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key_pem = None
+        if public_key_pem:
+            client_public_key = serialization.load_pem_public_key(
+                base64.b64decode(public_key_pem), backend=default_backend()
+            )
+        else:
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            client_public_key = key.public_key()
+            key_pem = key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, client_name)])
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
             .issuer_name(ca_cert.subject)
-            .public_key(key.public_key())
+            .public_key(client_public_key)
             .serial_number(x509.random_serial_number())
             .not_valid_before(datetime.datetime.utcnow())
             .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1825))
@@ -177,11 +196,6 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         )
 
         cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-        key_pem = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
 
         fp_hex = cert.fingerprint(hashes.SHA256()).hex().upper()
 
@@ -202,9 +216,10 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         export_dir = os.path.join("issued_clients", f"{stamp}_{export_hint_ip or 'client'}")
         os.makedirs(export_dir, exist_ok=True)
         with open(os.path.join(export_dir, "client_cert.pem"), "wb") as f: f.write(cert_pem)
-        with open(os.path.join(export_dir, "client_key.pem"), "wb") as f: f.write(key_pem)
         _chmod_600(os.path.join(export_dir, "client_cert.pem"))
-        _chmod_600(os.path.join(export_dir, "client_key.pem"))
+        if key_pem is not None:
+            with open(os.path.join(export_dir, "client_key.pem"), "wb") as f: f.write(key_pem)
+            _chmod_600(os.path.join(export_dir, "client_key.pem"))
         try:
             with open(CA_CERT, "rb") as f: ca_pem = f.read()
             with open(os.path.join(export_dir, "host_ca.pem"), "wb") as f: f.write(ca_pem)
@@ -1895,20 +1910,36 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
         logging.warning(f"[AUTH] Certificate proof from {peer_ip} failed verification.")
         _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
 
-def _handle_pin_handshake(conn, parts, peer_ip, encoder_str):
+def _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=""):
     provided_pin = parts[1] if len(parts) >= 2 else ""
     reply = None
     with host_state.pin_lock:
         if (not host_state.session_active
                 and provided_pin == str(host_state.pin_code)
                 and time.time() < host_state.pin_expiry):
-            reply = _begin_session_locked(peer_ip, encoder_str).encode("utf-8")
+            reply = _begin_session_locked(peer_ip, encoder_str)
 
     if reply is not None:
         logging.info(f"[AUTH] Client {peer_ip} authenticated — PIN invalidated and rotation paused.")
-        _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
+        cert_line = ""
+        keyreq_b64 = ""
+        for line in (raw or "").splitlines()[1:]:
+            if line.startswith("KEYREQ "):
+                keyreq_b64 = line.split(None, 1)[1].strip()
+                break
+        if keyreq_b64:
+            issued = _issue_client_cert(client_name="linuxplay-client",
+                                        export_hint_ip=peer_ip, public_key_pem=keyreq_b64)
+            if issued:
+                cert_line = "\nCERT " + base64.b64encode(issued["cert_pem"]).decode("ascii")
+                logging.info(f"[AUTH] Issued in-place certificate to {peer_ip} (client-held key).")
+            else:
+                logging.warning(f"[AUTH] KEYREQ issuance failed for {peer_ip}; exporting bundle instead.")
+                _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
+        else:
+            _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
         threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
-        _send_and_close(conn, reply)
+        _send_and_close(conn, (reply + cert_line).encode("utf-8"))
         set_status(f"Client: {host_state.client_ip}")
         set_pin_display(f"Session live: {peer_ip} — PIN paused")
         logging.info(f"Client {peer_ip} handshake complete (PIN locked).")
@@ -1942,7 +1973,7 @@ def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
             return
 
         if cmd == "HELLO":
-            _handle_pin_handshake(conn, parts, peer_ip, encoder_str)
+            _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=raw)
             return
 
         _send_and_close(conn, b"FAIL")

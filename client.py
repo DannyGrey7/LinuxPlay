@@ -230,16 +230,56 @@ def _build_client_proof(cert_path, key_path, nonce_hex):
         return None
 
 def _parse_ok_response(resp):
-    """'OK:<encoder>:<monitors>\\nTOKEN <hex>' -> ((encoder, monitors), token)."""
+    """Parse 'OK:<encoder>:<monitors>\\nTOKEN <hex>[\\nCERT <b64>]' responses.
+
+    Returns ((encoder, monitors), token, cert_b64).
+    """
     lines = [l.strip() for l in resp.splitlines() if l.strip()]
     parts = lines[0].split(":", 2)
     host_encoder = parts[1].strip() if len(parts) > 1 else "none"
     monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-    token = ""
+    token, cert_b64 = "", ""
     for ln in lines[1:]:
         if ln.startswith("TOKEN "):
             token = ln.split(None, 1)[1].strip()
-    return (host_encoder, monitor_info), token
+        elif ln.startswith("CERT "):
+            cert_b64 = ln.split(None, 1)[1].strip()
+    return (host_encoder, monitor_info), token, cert_b64
+
+def _install_issued_cert(cert_b64, private_key):
+    """Save a host-issued certificate (from a KEYREQ handshake) next to this script."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        here = os.path.dirname(os.path.abspath(__file__))
+        cert_path = os.path.join(here, "client_cert.pem")
+        key_path = os.path.join(here, "client_key.pem")
+        with open(cert_path, "wb") as f:
+            f.write(base64.b64decode(cert_b64))
+        with open(key_path, "wb") as f:
+            f.write(private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            ))
+        os.chmod(cert_path, 0o600)
+        os.chmod(key_path, 0o600)
+        logging.info("Host issued a client certificate — future connections will skip the PIN.")
+    except Exception as e:
+        logging.warning("Could not save issued certificate: %s", e)
+
+def _make_keyreq():
+    """Generate a fresh client keypair; returns (keyreq_b64, private_key) or (None, None)."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        spki = key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return base64.b64encode(spki).decode("ascii"), key
+    except Exception as e:
+        logging.debug("KEYREQ not available: %s", e)
+        return None, None
 
 def tcp_handshake_client(host_ip, pin=None, interactive=True):
     from PyQt5.QtWidgets import QLineEdit
@@ -271,7 +311,7 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
                             resp = sock.recv(8192).decode('utf-8', errors='replace').strip()
                     logging.debug('Cert handshake response: %s', resp.splitlines()[0] if resp else '(empty)')
                     if resp.startswith('OK:'):
-                        info, token = _parse_ok_response(resp)
+                        info, token, _cert = _parse_ok_response(resp)
                         if token:
                             CLIENT_STATE['token'] = token
                         sock.close()
@@ -316,17 +356,28 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
                     QMessageBox.critical(None, "Invalid PIN", "PIN entry was cancelled or invalid.")
                 return (False, None)
 
-        sock.sendall(f"HELLO {code}".encode("utf-8"))
-        resp = sock.recv(4096).decode("utf-8", errors="replace").strip()
+        # First-time pairing: offer the host our public key so it can issue a
+        # certificate we store locally — the private key never leaves this machine.
+        generated_key = None
+        keyreq_line = ""
+        if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+            keyreq_b64, generated_key = _make_keyreq()
+            if keyreq_b64:
+                keyreq_line = "\nKEYREQ " + keyreq_b64
+
+        sock.sendall(f"HELLO {code}{keyreq_line}".encode("utf-8"))
+        resp = sock.recv(8192).decode("utf-8", errors="replace").strip()
         logging.debug("Handshake response: %s", resp.splitlines()[0] if resp else '(empty)')
 
         if resp.startswith("OK:"):
-            info, token = _parse_ok_response(resp)
+            info, token, cert_b64 = _parse_ok_response(resp)
             if token:
                 CLIENT_STATE["token"] = token
             sock.close()
             CLIENT_STATE["connected"] = True
             CLIENT_STATE["last_heartbeat"] = time.time()
+            if cert_b64 and generated_key is not None:
+                _install_issued_cert(cert_b64, generated_key)
             return (True, info)
 
         elif resp.startswith("BUSY"):
@@ -456,54 +507,80 @@ def clipboard_listener(app_clipboard):
     t.start()
     return t
 
-def audio_listener(host_ip):
+audio_stop = threading.Event()
+_audio_listener_started = False
+
+def audio_listener(host_ip, enabled=True):
+    """Decode the host's Opus stream with ffplay, restarting it whenever it dies.
+
+    After heavy packet loss the mpegts demuxer can lose sync and stay silent
+    for the rest of the session; rw_timeout makes ffplay give up after 5 s
+    without data so the restart loop swaps in a fresh demuxer.
+    """
+    global _audio_listener_started
+    if not enabled:
+        logging.info("Audio disabled — ffplay listener not started.")
+        return None
+    if _audio_listener_started:
+        return None   # one listener process for all windows (port 6001)
+    _audio_listener_started = True
+
+    max_channels = 2
+    try:
+        info = subprocess.check_output(
+            ["pactl", "list", "sinks"], text=True, stderr=subprocess.DEVNULL
+        )
+        if "channels: 8" in info or "channel_map: front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right" in info:
+            max_channels = 8
+        elif "channels: 6" in info or "channel_map: front-left,front-right,rear-left,rear-right,front-center,lfe" in info:
+            max_channels = 6
+    except Exception:
+        pass
+
+    if max_channels > 2:
+        afilter = f"aresample=matrix_encoding=none,aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'}"
+        logging.info(f"Detected {max_channels}-channel output device — enabling surround audio.")
+    else:
+        afilter = "aresample=matrix_encoding=none,pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC"
+        logging.info("Stereo-only output detected — downmixing surround audio.")
+
     def loop():
         global audio_proc
-
-        max_channels = 2
-        try:
-            info = subprocess.check_output(
-                ["pactl", "list", "sinks"], text=True, stderr=subprocess.DEVNULL
-            )
-            if "channels: 8" in info or "channel_map: front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right" in info:
-                max_channels = 8
-            elif "channels: 6" in info or "channel_map: front-left,front-right,rear-left,rear-right,front-center,lfe" in info:
-                max_channels = 6
-        except Exception:
-            pass
-
-        if max_channels > 2:
-            afilter = f"aresample=matrix_encoding=none,aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'}"
-            logging.info(f"Detected {max_channels}-channel output device — enabling surround audio.")
-        else:
-            afilter = "aresample=matrix_encoding=none,pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC"
-            logging.info("Stereo-only output detected — downmixing surround audio.")
-
-        cmd = [
-            "ffplay",
-            "-hide_banner", "-loglevel", "info",
-            "-nodisp", "-autoexit",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-af", afilter,
-            "-f", "mpegts",
-            f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576",
-        ]
-
-        logging.info("Audio listener command: %s", " ".join(cmd))
-        try:
-            audio_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True
-            )
-            for line in audio_proc.stdout:
-                if "Audio" in line:
-                    logging.info(line.strip())
-            audio_proc.wait()
-        except Exception as e:
-            logging.error("Audio listener failed: %s", e)
+        url = f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576&rw_timeout=5000000"
+        restarts = 0
+        while not audio_stop.is_set():
+            cmd = [
+                "ffplay",
+                "-hide_banner", "-loglevel", "info",
+                "-nodisp", "-autoexit",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-af", afilter,
+                "-f", "mpegts",
+                url,
+            ]
+            try:
+                logging.debug("Audio listener command: %s", " ".join(cmd))
+                audio_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
+                for line in audio_proc.stdout:
+                    if "Audio" in line:
+                        logging.info(line.strip())
+                audio_proc.wait()
+            except Exception as e:
+                logging.error("Audio listener failed: %s", e)
+            finally:
+                audio_proc = None
+            if audio_stop.is_set():
+                break
+            restarts += 1
+            log = logging.warning if restarts <= 2 else logging.debug
+            log("Audio player exited — restarting in 1s (glitch recovery, restart #%d).", restarts)
+            audio_stop.wait(1.0)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -1326,12 +1403,13 @@ class GamepadThread(threading.Thread):
 class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
-                 gamepad="disable", gamepad_dev=None, pin=None):
+                 gamepad="disable", gamepad_dev=None, pin=None, audio=True):
         super().__init__(parent)
 
         self.window_id = SESSION.register()
         self.monitor_index = udp_port - DEFAULT_UDP_PORT
         self._pin = pin
+        self._audio_enabled = audio
         self.setWindowTitle("LinuxPlay")
         self.texture_width, self.texture_height = rwidth, rheight
         self.offset_x, self.offset_y = offset_x, offset_y
@@ -1392,7 +1470,7 @@ class MainWindow(QMainWindow):
             self._heartbeat_thread = None
 
         try:
-            self._audio_thread = audio_listener(self.host_ip)
+            self._audio_thread = audio_listener(self.host_ip, enabled=self._audio_enabled)
         except Exception as e:
             logging.error(f"Audio listener failed: {e}")
             self._audio_thread = None
@@ -1615,6 +1693,7 @@ class MainWindow(QMainWindow):
                 pass
 
         global audio_proc
+        audio_stop.set()
         if audio_proc:
             try:
                 audio_proc.terminate()
@@ -1770,7 +1849,8 @@ def main():
         for i, (w, h, ox, oy) in enumerate(monitors):
             win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + i,
                              ox, oy, net_mode, ultra=ultra_active,
-                             gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin)
+                             gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
+                             audio=(args.audio == "enable"))
             win.setWindowTitle(f"LinuxPlay — Monitor {i}")
             win.show()
             windows.append(win)
@@ -1784,13 +1864,15 @@ def main():
         w, h, ox, oy = monitors[idx]
         win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + idx,
                          ox, oy, net_mode, ultra=ultra_active,
-                         gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin)
+                         gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
+                         audio=(args.audio == "enable"))
         win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
         win.show()
         windows.append(win)
 
     ret = app.exec_()
 
+    audio_stop.set()
     try:
         if audio_proc:
             audio_proc.terminate()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Challenge-response certificate auth + session token tests (offline, tempdir)."""
+import base64
 import datetime
 import os
 import secrets
@@ -94,6 +95,30 @@ with tempfile.TemporaryDirectory() as tmp:
     assert not host._verify_client_proof(rogue_fp, rparts[1], rparts[3], nonce)
     ok("self-signed (non-CA) certificate is rejected")
 
+    # ── KEYREQ pairing: client-held key, host signs only the public key ──
+    ck = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    spki = ck.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        issued = host._issue_client_cert(
+            export_hint_ip="127.0.0.1",
+            public_key_pem=base64.b64encode(spki).decode("ascii"),
+        )
+    finally:
+        os.chdir(cwd)
+    assert issued and issued.get("cert_pem")
+    kcert = x509.load_pem_x509_certificate(issued["cert_pem"])
+    kfp = kcert.fingerprint(hashes.SHA256()).hex().upper()
+    assert host._verify_fingerprint_trusted(kfp)
+    kcert_p, kkey_p = write_pair(tmp, "keyreq", ck, kcert)
+    knonce = secrets.token_bytes(32)
+    kparts = client._build_client_proof(kcert_p, kkey_p, knonce.hex()).split()
+    assert host._verify_client_proof(kfp, kparts[1], kparts[3], knonce)
+    ok("KEYREQ-issued certificate authenticates via challenge-response")
+
 # ── session-token gate on the control plane ──
 host.host_state.session_token = "tok123"
 assert host._extract_authed_cmd("AUTH tok123 MOUSE_PKT 1 0 10 20") == "MOUSE_PKT 1 0 10 20"
@@ -103,12 +128,13 @@ assert host._extract_authed_cmd("AUTH tok123") is None
 ok("AUTH token prefix enforced on control packets")
 host.host_state.session_token = None
 
-# ── OK/TOKEN response parsing ──
-info, token = client._parse_ok_response("OK:h.264:1920x1080+0+0;2560x1440+1080+162\nTOKEN deadbeef01")
+# ── OK/TOKEN/CERT response parsing ──
+info, token, cert = client._parse_ok_response("OK:h.264:1920x1080+0+0;2560x1440+1080+162\nTOKEN deadbeef01")
 assert info == ("h.264", "1920x1080+0+0;2560x1440+1080+162"), info
 assert token == "deadbeef01", token
-info2, token2 = client._parse_ok_response("OK:h.265:1920x1080")
-assert token2 == "" and info2[0] == "h.265"
-ok("OK/TOKEN handshake response parsed correctly")
+assert cert == "", cert
+info2, token2, cert2 = client._parse_ok_response("OK:h.265:1920x1080\nTOKEN ab\nCERT Zm9v")
+assert token2 == "ab" and info2[0] == "h.265" and cert2 == "Zm9v"
+ok("OK/TOKEN/CERT handshake response parsed correctly")
 
 print(f"\nALL {len(PASS)} AUTH TESTS PASSED")
