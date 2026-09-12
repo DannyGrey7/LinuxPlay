@@ -105,7 +105,11 @@ Thanks for believing in something made by one person, from scratch, with actual 
   - Heartbeat (PING/PONG).
   - Host stops streams and returns to waiting state on timeout/disconnect.
 - **Stats Overlay (Client)**
-  - Real-time **FPS, CPU, RAM, GPU** metrics via OpenGL with triple-buffered PBO uploads.
+  - On-screen panel (**F1**, or start with `--stats`) with live numbers *and* graphs:
+    video and encoder Mb/s, latency (RTT) and jitter, decode time, decode FPS,
+    client CPU/GPU, host CPU/GPU, dropped frames — each with a rolling one-minute
+    sparkline. Draws with QPainter over the video, ignores mouse events, never
+    touches the OpenGL path.
 - **Cross-Platform**
   - Host: Linux (X11 and Wayland sessions).
   - Clients: Linux, Windows, and macOS.
@@ -276,6 +280,31 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
   - Clears session state.
   - Returns to “Waiting for connection…”.
 - Reconnects start video/audio again without manual restart.
+
+---
+
+## Stats Overlay
+
+Press **F1** in the client (or launch with `--stats`) for a translucent panel in the
+top-left corner. Everything on it is graphed over the last 60 seconds:
+
+| Metric | Where it comes from |
+|--------|---------------------|
+| video in (Mb/s) | bytes actually demuxed on the client — the real received rate |
+| encoder out (Mb/s) | the host's own `ffmpeg -progress` bitrate |
+| latency / jitter (ms) | heartbeat round trip (the client echoes the host's timestamp, so no clock sync is needed) |
+| decode (ms) / decode (fps) | frame timing in the decoder thread |
+| client cpu / gpu (%) | this machine |
+| host cpu / gpu (%) | the host's `STATS` broadcast |
+| dropped (/s) | frames the host's encoder dropped, per second |
+
+The header also shows link mode, connection state, uptime, reconnects, resolution,
+hardware decoder and renderer; the footer shows total received data and keyframes/s.
+Comparing *video in* against *encoder out* is the quickest way to spot packet loss.
+
+Note: with host and client on the **same** machine the two processes collide on UDP 7004
+(heartbeat/stats), so latency and host stats will read zero there. On separate machines
+(the normal case, including over Tailscale) they work.
 
 ---
 

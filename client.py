@@ -9,6 +9,7 @@ import base64
 import psutil
 import time
 import json
+import math
 import threading
 import statistics
 import subprocess
@@ -19,9 +20,10 @@ import logging
 import argparse
 
 from queue import Queue
-from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QOpenGLWidget, QInputDialog
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QSurfaceFormat
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QMessageBox, QOpenGLWidget,
+                             QInputDialog, QWidget)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QRectF
+from PyQt5.QtGui import QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath
 
 from OpenGL.GL import *
 
@@ -514,13 +516,22 @@ def heartbeat_responder(host_ip):
             while True:
                 try:
                     data, addr = sock.recvfrom(256)
-                    if data == b"PING":
+                    if data.startswith(b"PING"):
                         token = CLIENT_STATE.get("token") or ""
-                        sock.sendto(f"PONG {token}".encode("utf-8"), addr)
+                        # Echo the host's timestamp so it can measure the RTT.
+                        parts = data.split(maxsplit=1)
+                        stamp = parts[1].decode("ascii", errors="ignore") if len(parts) > 1 else ""
+                        pong = f"PONG {token} {stamp}" if stamp else f"PONG {token}"
+                        sock.sendto(pong.encode("utf-8"), addr)
                         CLIENT_STATE["last_heartbeat"] = time.time()
                         if not CLIENT_STATE["connected"]:
                             CLIENT_STATE["connected"] = True
                             CLIENT_STATE["reconnecting"] = False
+                    elif data.startswith(b"STATS"):
+                        stats = _parse_host_stats(data.decode("utf-8", errors="ignore"))
+                        if stats:
+                            CLIENT_STATE["host_stats"] = stats
+                            logging.debug("host stats: %s", stats)
                 except socket.timeout:
                     pass
                 except Exception:
@@ -639,6 +650,60 @@ def audio_listener(host_ip, enabled=True):
     t.start()
     return t
 
+class StreamCounters:
+    """Byte/frame counters filled by the decode loop, read by the stats overlay."""
+
+    def __init__(self):
+        self.bytes = 0
+        self.packets = 0
+        self.keyframes = 0
+        self.frames = 0
+        self.errors = 0
+
+    def snapshot(self):
+        return (self.bytes, self.packets, self.keyframes, self.frames)
+
+
+def _counted_decode(container, counters, **kwargs):
+    """container.decode(), but counting demuxed bytes/packets/keyframes.
+
+    PyAV's decode() is literally demux+decode, so this yields the same frames
+    while giving the overlay real receive-rate numbers.
+    """
+    for packet in container.demux(**kwargs):
+        try:
+            counters.bytes += int(packet.size or 0)
+            counters.packets += 1
+            if packet.is_keyframe:
+                counters.keyframes += 1
+        except Exception:
+            counters.errors += 1
+        for frame in packet.decode():
+            counters.frames += 1
+            yield frame
+
+
+def _parse_host_stats(msg):
+    """Parse the host's STATS datagram into a dict.
+
+    STATS <cpu%> <gpu%> <mem MB> <encode fps> <rtt ms> <jitter ms>
+          <encoder kbit/s> <dropped frames> <encoded frames>
+    Older hosts send fewer fields; missing ones are simply absent.
+    """
+    parts = msg.split()
+    if len(parts) < 3 or parts[0] != "STATS":
+        return None
+    names = ("cpu", "gpu", "mem", "fps", "rtt", "jitter",
+             "enc_kbps", "drops", "frame")
+    out = {}
+    for name, raw in zip(names, parts[1:]):
+        try:
+            out[name] = float(raw)
+        except Exception:
+            pass
+    return out or None
+
+
 class DecoderThread(QThread):
     frame_ready = pyqtSignal(object)
 
@@ -666,6 +731,7 @@ class DecoderThread(QThread):
         self._last_error = ""
         self._has_first_frame = False
         self._hw_name = None
+        self.counters = StreamCounters()
 
     def _open_container(self):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
@@ -746,7 +812,7 @@ class DecoderThread(QThread):
                 hw_frames = None
                 t_decode = []
 
-                for frame in container.decode(video=0):
+                for frame in _counted_decode(container, self.counters, video=0):
                     if not self._running:
                         break
                     if not frame or frame.is_corrupt:
@@ -1047,7 +1113,8 @@ def pick_best_renderer():
     return selected
 
 class VideoWidgetGL(QOpenGLWidget):
-    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip, parent=None):
+    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip,
+                 parent=None, toggle_overlay=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1057,6 +1124,7 @@ class VideoWidgetGL(QOpenGLWidget):
 
         self.host_ip = host_ip
         self.control_callback = control_callback
+        self.toggle_overlay = toggle_overlay
         self.texture_width = rwidth
         self.texture_height = rheight
         self.offset_x = offset_x
@@ -1307,6 +1375,12 @@ class VideoWidgetGL(QOpenGLWidget):
     def keyPressEvent(self, e):
         if e.isAutoRepeat():
             return
+        if e.key() == Qt.Key_F1:
+            # Local overlay toggle: do not forward this one to the host.
+            if callable(self.toggle_overlay):
+                self.toggle_overlay()
+            e.accept()
+            return
         key_name = self._get_key_name(e)
         if key_name:
             self.control_callback(f"KEY_PRESS {key_name}")
@@ -1453,10 +1527,169 @@ class GamepadThread(threading.Thread):
         except Exception:
             pass
 
+STATS_HISTORY = 60          # one sample per second -> a one-minute window
+
+
+class _Series:
+    """One sparkline: a labelled ring buffer of samples."""
+
+    def __init__(self, label, unit, color, fmt="{:.1f}"):
+        self.label = label
+        self.unit = unit
+        self.color = color
+        self.fmt = fmt
+        self.values = []
+        self.peak = 0.0
+
+    def push(self, value):
+        try:
+            value = float(value)
+        except Exception:
+            return
+        self.values.append(value)
+        if len(self.values) > STATS_HISTORY:
+            del self.values[0]
+        self.peak = max(self.values) if self.values else 0.0
+
+    @property
+    def latest(self):
+        return self.values[-1] if self.values else 0.0
+
+    def text(self):
+        return self.fmt.format(self.latest)
+
+
+class StatsOverlay(QWidget):
+    """Translucent on-screen stats panel with live numbers and sparklines.
+
+    Painted with QPainter onto a child widget that ignores mouse events, so it
+    cannot interfere with input forwarding or the OpenGL video path.
+    """
+
+    PANEL_BG = QColor(10, 12, 16, 205)
+    PANEL_BORDER = QColor(255, 255, 255, 45)
+    TEXT = QColor(230, 234, 240)
+    DIM = QColor(152, 160, 170)
+    GRID = QColor(255, 255, 255, 26)
+
+    def __init__(self, provider, parent=None):
+        super().__init__(parent)
+        self._provider = provider
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.resize(392, 368)
+        self.series = {
+            "mbps":   _Series("video in", "Mb/s", QColor(84, 220, 148)),
+            "enc":    _Series("encoder out", "Mb/s", QColor(110, 150, 255)),
+            "fps":    _Series("decode", "fps", QColor(120, 190, 255), "{:.0f}"),
+            "rtt":    _Series("latency", "ms", QColor(255, 190, 90), "{:.0f}"),
+            "jitter": _Series("jitter", "ms", QColor(255, 140, 120), "{:.1f}"),
+            "dec":    _Series("decode", "ms", QColor(150, 210, 160), "{:.1f}"),
+            "hcpu":   _Series("host cpu", "%", QColor(255, 120, 200), "{:.0f}"),
+            "hgpu":   _Series("host gpu", "%", QColor(205, 205, 120), "{:.0f}"),
+            "ccpu":   _Series("client cpu", "%", QColor(190, 150, 255), "{:.0f}"),
+            "cgpu":   _Series("client gpu", "%", QColor(150, 220, 220), "{:.0f}"),
+            "drop":   _Series("dropped", "/s", QColor(255, 90, 90), "{:.0f}"),
+        }
+        self.info = []
+        self.headline = ""
+        self._font = QFont("monospace")
+        self._font.setStyleHint(QFont.TypeWriter)
+        self._font.setPointSize(8)
+        self._sample_timer = QTimer(self)
+        self._sample_timer.timeout.connect(self._sample)
+        self._paint_timer = QTimer(self)
+        self._paint_timer.timeout.connect(self.update)
+
+    def start(self):
+        self._sample_timer.start(1000)
+        self._paint_timer.start(250)
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        self._sample_timer.stop()
+        self._paint_timer.stop()
+        self.hide()
+
+    def _sample(self):
+        try:
+            data = self._provider() or {}
+        except Exception as e:
+            logging.debug("Stats provider failed: %s", e)
+            return
+        for key, series in self.series.items():
+            if data.get(key) is not None:
+                series.push(data[key])
+        if data.get("info"):
+            self.info = data["info"]
+        if data.get("headline"):
+            self.headline = data["headline"]
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.setPen(self.PANEL_BORDER)
+        painter.setBrush(self.PANEL_BG)
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+
+        painter.setFont(self._font)
+        y = 20
+        painter.setPen(self.TEXT)
+        painter.drawText(10, y, self.headline or "LinuxPlay")
+        y += 15
+        painter.setPen(self.DIM)
+        for line in self.info:
+            painter.drawText(10, y, line)
+            y += 13
+        y += 6
+
+        cell_w, cell_h = 190, 56
+        for i, key in enumerate(self.series):
+            col, row = i % 2, i // 2
+            x = 10 + col * (cell_w + 4)
+            self._draw_series(painter, self.series[key], x, y + row * cell_h,
+                              cell_w - 12, cell_h - 8)
+        painter.end()
+
+    def _draw_series(self, painter, series, x, y, w, h):
+        label_h = 12
+        painter.setPen(self.DIM)
+        painter.drawText(x, y + 9, series.label)
+        painter.setPen(self.TEXT)
+        painter.drawText(QRectF(x, y, w, 12), Qt.AlignRight | Qt.AlignVCenter,
+                         f"{series.text()} {series.unit}")
+        box = QRectF(x, y + label_h, w, max(6, h - label_h))
+        painter.setPen(self.GRID)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(box)
+        values = series.values
+        if len(values) < 2:
+            return
+        vmax = max(series.peak, 1e-9)
+        step = 10 ** math.floor(math.log10(vmax))
+        vmax = max(math.ceil(vmax / step) * step, step)
+        path = QPainterPath()
+        for i, value in enumerate(values):
+            px = box.left() + box.width() * i / (STATS_HISTORY - 1)
+            py = box.bottom() - box.height() * min(value, vmax) / vmax
+            if i == 0:
+                path.moveTo(px, py)
+            else:
+                path.lineTo(px, py)
+        pen = QPen(series.color, 1.4)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
-                 gamepad="disable", gamepad_dev=None, pin=None, audio=True):
+                 gamepad="disable", gamepad_dev=None, pin=None, audio=True,
+                 stats_visible=False):
         super().__init__(parent)
 
         self.window_id = SESSION.register()
@@ -1480,7 +1713,8 @@ class MainWindow(QMainWindow):
         self.send_control(f"NET {net_mode}")
 
         self.video_widget = VideoWidgetGL(self.send_control, rwidth, rheight,
-                                          offset_x, offset_y, host_ip)
+                                          offset_x, offset_y, host_ip,
+                                          toggle_overlay=self.toggle_stats)
         self.setCentralWidget(self.video_widget)
         self.video_widget.setFocus()
         self.setAcceptDrops(True)
@@ -1495,6 +1729,18 @@ class MainWindow(QMainWindow):
         self._start_decoder_thread()
         self._start_background_threads()
         self._start_timers()
+
+        self._stats_visible = bool(stats_visible)
+        self._session_start = time.time()
+        self._total_bytes = 0
+        self._prev_counters = None
+        self._prev_drops = None
+        self._prev_drops_t = 0.0
+        self.overlay = StatsOverlay(self._collect_metrics, self)
+        self.overlay.move(12, 12)
+        if self._stats_visible:
+            self.overlay.start()
+            logging.info("Stats overlay enabled (F1 toggles it off)")
 
     def _start_timers(self):
         self.clip_timer = QTimer(self)
@@ -1605,13 +1851,14 @@ class MainWindow(QMainWindow):
             CLIENT_STATE["connected"], CLIENT_STATE["reconnecting"] = True, False
             logging.info("Heartbeat restored")
 
-    def _read_gpu_usage(self):
+    def _read_gpu_percent(self):
+        """Client GPU utilisation as a number plus its vendor (None if unknown)."""
         try:
             import pynvml
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            return f"{util.gpu}% (NVENC)"
+            return float(util.gpu), "NVENC"
         except Exception:
             pass
 
@@ -1620,8 +1867,7 @@ class MainWindow(QMainWindow):
                 busy_path = f"/sys/class/drm/{card}/device/gpu_busy_percent"
                 if os.path.exists(busy_path):
                     with open(busy_path, "r") as f:
-                        val = f.read().strip()
-                        return f"{val}% (VAAPI)"
+                        return float(f.read().strip()), "VAAPI"
         except Exception:
             pass
 
@@ -1630,12 +1876,104 @@ class MainWindow(QMainWindow):
             out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
             if '"Busy"' in out:
                 j = json.loads(out)
-                busy = j["engines"]["Render/3D/0"]["busy"]
-                return f"{busy}% (iGPU)"
+                return float(j["engines"]["Render/3D/0"]["busy"]), "iGPU"
         except Exception:
             pass
 
-        return "N/A"
+        return None, ""
+
+    def _read_gpu_usage(self):
+        pct, vendor = self._read_gpu_percent()
+        if pct is None:
+            return "N/A"
+        return f"{pct:.0f}% ({vendor})"
+
+    def _collect_metrics(self):
+        """Snapshot everything the stats overlay draws (called once per second)."""
+        now = time.time()
+        host_stats = CLIENT_STATE.get("host_stats") or {}
+        data = {"info": []}
+
+        counters = getattr(getattr(self, "decoder_thread", None), "counters", None)
+        if counters is not None:
+            snap = counters.snapshot()
+            prev = self._prev_counters
+            if prev:
+                dt = max(0.2, now - prev["t"])
+                if snap[0] >= prev["bytes"] and snap[3] >= prev["frames"]:
+                    data["mbps"] = (snap[0] - prev["bytes"]) * 8.0 / dt / 1e6
+                    data["fps"] = (snap[3] - prev["frames"]) / dt
+                    keyframes = (snap[2] - prev["keyframes"]) / dt
+                    self._total_bytes += snap[0] - prev["bytes"]
+                    data["keyframes"] = keyframes
+            self._prev_counters = {"t": now, "bytes": snap[0],
+                                   "frames": snap[3], "keyframes": snap[2]}
+
+        try:
+            data["ccpu"] = self._proc.cpu_percent(interval=None)
+        except Exception:
+            pass
+        try:
+            data["cgpu"] = self._read_gpu_percent()[0]
+        except Exception:
+            pass
+        data["dec"] = getattr(getattr(self, "decoder_thread", None),
+                              "_avg_decode_time", None)
+
+        for src, dst in (("cpu", "hcpu"), ("gpu", "hgpu"), ("rtt", "rtt"),
+                         ("jitter", "jitter")):
+            if host_stats.get(src) is not None:
+                data[dst] = host_stats[src]
+        enc_kbps = host_stats.get("enc_kbps")
+        if enc_kbps:
+            data["enc"] = enc_kbps / 1000.0
+
+        drops = host_stats.get("drops")
+        if drops is not None:
+            if self._prev_drops is not None and drops >= self._prev_drops:
+                dt = max(0.2, now - self._prev_drops_t)
+                data["drop"] = (drops - self._prev_drops) / dt
+            self._prev_drops, self._prev_drops_t = drops, now
+
+        uptime = int(now - self._session_start)
+        try:
+            backend = self.video_widget.renderer.name()
+        except Exception:
+            backend = "?"
+        hw = getattr(getattr(self, "decoder_thread", None), "_hw_name", None) or "CPU"
+        status = ("connected" if CLIENT_STATE["connected"]
+                  else ("reconnecting…" if CLIENT_STATE["reconnecting"] else "idle"))
+        enc_txt = f"{enc_kbps / 1000:.1f} Mb/s" if enc_kbps else "—"
+        kf_txt = f"{data.get('keyframes', 0):.0f}/s" if "keyframes" in data else "—"
+        data["headline"] = (f"LinuxPlay · {self.host_ip}:{self.udp_port} · "
+                            f"{self.texture_width}x{self.texture_height}")
+        data["info"] = [
+            f"link {CLIENT_STATE.get('net_mode', 'lan')} · {status} · "
+            f"{uptime // 60:02d}:{uptime % 60:02d} up · {self._restarts} restarts",
+            f"decode {hw} · render {backend}",
+            f"host encode {enc_txt} @ {host_stats.get('fps', 0):.0f} fps · "
+            f"cpu {host_stats.get('cpu', 0):.0f}% gpu {host_stats.get('gpu', 0):.0f}%",
+            f"received {self._total_bytes / 1e6:.0f} MB · keyframes {kf_txt}",
+        ]
+        return data
+
+    def toggle_stats(self):
+        """F1: show or hide the on-screen stats panel."""
+        self._stats_visible = not self._stats_visible
+        if self._stats_visible:
+            self.overlay.start()
+        else:
+            self.overlay.stop()
+        logging.info("Stats overlay %s (F1 toggles)",
+                     "shown" if self._stats_visible else "hidden")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.overlay.move(12, 12)
+            self.overlay.raise_()
+        except Exception:
+            pass
 
     def _update_stats(self):
         try:
@@ -1738,6 +2076,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._running = False
+        try:
+            self.overlay.stop()
+        except Exception:
+            pass
         logging.info("Closing client window…")
         try:
             self.send_control(f"WINDOW_CLOSE {self.monitor_index}")
@@ -1803,6 +2145,8 @@ def main():
     p.add_argument("--monitor", default="0", help="Index or 'all'")
     p.add_argument("--hwaccel", choices=["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi", "videotoolbox"], default="auto")
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--stats", action="store_true",
+                   help="Show the on-screen stats overlay at startup (F1 toggles it).")
     p.add_argument("--net", choices=["auto", "lan", "wifi", "vpn"], default="auto")
     p.add_argument("--ultra", action="store_true", help="Enable ultra-low-latency (LAN only). Auto-disabled on Wi-Fi/WAN.")
     p.add_argument("--gamepad", choices=["enable", "disable"], default="enable")
@@ -1931,7 +2275,7 @@ def main():
             win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + i,
                              ox, oy, net_mode, ultra=ultra_active,
                              gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
-                             audio=(args.audio == "enable"))
+                             audio=(args.audio == "enable"), stats_visible=args.stats)
             win.setWindowTitle(f"LinuxPlay — Monitor {i}")
             win.show()
             windows.append(win)
@@ -1946,7 +2290,7 @@ def main():
         win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + idx,
                          ox, oy, net_mode, ultra=ultra_active,
                          gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
-                         audio=(args.audio == "enable"))
+                         audio=(args.audio == "enable"), stats_visible=args.stats)
         win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
         win.show()
         windows.append(win)

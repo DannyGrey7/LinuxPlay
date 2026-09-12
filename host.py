@@ -323,7 +323,7 @@ def _marker_value() -> str:
     return f"{marker}:{sid}" if sid else marker
 
 def _ffmpeg_base_cmd() -> list:
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2"]
 
 def _marker_opt() -> list:
     return ["-metadata", f"comment={_marker_value()}"]
@@ -422,6 +422,10 @@ class HostState:
         self.gui_window = None     # set by HostWindow: enables pairing prompts
         self.log_path = None
         self.session_epoch = 0     # bumped on connect/disconnect to clear backoff
+        self.last_rtt_ms = 0.0
+        self.last_jitter_ms = 0.0
+        self.encoder_stats = {}    # stream name -> latest ffmpeg -progress values
+        self.current_fps = 0.0
 
 host_state = HostState()
 HOST_ARGS = None
@@ -710,6 +714,89 @@ def ffmpeg_has_device(name: str) -> bool:
     except Exception:
         return False
 
+def _handle_pong(msg: str, peer_ip: str, now: float) -> bool:
+    """Accept a heartbeat PONG and measure the round trip when we get a stamp.
+
+    The client echoes the timestamp we put in the PING, so the RTT here needs
+    no clock sync between the two machines.
+    """
+    parts = msg.split()
+    if (not parts or parts[0] != "PONG" or peer_ip != host_state.client_ip
+            or len(parts) not in (2, 3) or not _token_ok(parts[1])):
+        return False
+    host_state.last_pong_ts = now
+    if len(parts) == 3:
+        try:
+            rtt = (now - float(parts[2])) * 1000.0
+        except Exception:
+            return True
+        if 0.0 <= rtt < 60000.0:
+            prev = host_state.last_rtt_ms
+            host_state.last_rtt_ms = rtt
+            if prev > 0.0:
+                host_state.last_jitter_ms = (0.8 * host_state.last_jitter_ms
+                                             + 0.2 * abs(rtt - prev))
+    return True
+
+def _stats_payload(cpu: float, gpu: float, mem: float) -> str:
+    """The STATS datagram the client's overlay reads.
+
+    Kept separate from the sender so the wire format is testable on its own.
+    """
+    enc = _video_encoder_stats()
+    return (f"STATS {cpu:.1f} {gpu:.1f} {mem:.1f} "
+            f"{float(enc.get('fps') or 0.0):.1f} "
+            f"{host_state.last_rtt_ms:.1f} {host_state.last_jitter_ms:.1f} "
+            f"{float(enc.get('bitrate_kbps') or 0.0):.0f} "
+            f"{float(enc.get('drop_frames') or 0.0):.0f} "
+            f"{float(enc.get('frame') or 0.0):.0f}")
+
+_PROGRESS_KEYS = {"frame", "fps", "bitrate", "total_size", "out_time_ms",
+                  "out_time_us", "speed", "drop_frames", "dup_frames"}
+# Any other "name=value" line is still -progress metadata (progress=continue,
+# out_time=…, stream_0_0_q=…), not an encoder error worth logging.
+_PROGRESS_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+def _progress_update(store: dict, line: str) -> bool:
+    """Fold one ffmpeg -progress line into store. Returns True if it was progress."""
+    key, sep, val = line.partition("=")
+    key = key.strip()
+    if not sep or key not in _PROGRESS_KEYS:
+        return False
+    val = val.strip()
+    if key == "bitrate":
+        store["bitrate"] = val
+        try:
+            store["bitrate_kbps"] = float(val.split("k", 1)[0])
+        except Exception:
+            pass
+        return True
+    try:
+        store[key] = float(val)
+    except Exception:
+        store[key] = val
+    if key == "fps":
+        try:
+            host_state.current_fps = float(val)
+        except Exception:
+            pass
+    return True
+
+def _video_encoder_stats() -> dict:
+    """Latest ffmpeg -progress numbers for the lowest-indexed video stream."""
+    try:
+        names = [n for n in (host_state.encoder_stats or {})
+                 if str(n).lower().startswith("video")]
+        if names:
+            best = sorted(names, key=lambda n: str(n))[0]
+            stats = dict(host_state.encoder_stats.get(best) or {})
+            stats["stream"] = str(best)
+            return stats
+    except Exception:
+        pass
+    return {}
+
+
 class StreamThread(threading.Thread):
     """Run one ffmpeg encoder (plus optional feeder) and keep it running.
 
@@ -802,7 +889,38 @@ class StreamThread(threading.Thread):
             logging.debug(f"Affinity + priority applied to {self.name}")
         except Exception as e:
             logging.debug(f"Affinity set failed: {e}")
+
+        self._stderr_tail = []
+        threading.Thread(target=self._drain_stderr, args=(self.process,),
+                         name=f"{self.name}-stderr", daemon=True).start()
         return True
+
+    def _drain_stderr(self, proc):
+        """Read the encoder's stderr continuously.
+
+        ffmpeg -progress writes here as well, and an unread pipe fills up
+        (~64 KB) and then blocks the encoder, so this both keeps the stream
+        alive and feeds the client's stats overlay with real encoder numbers.
+        """
+        store = host_state.encoder_stats.setdefault(self.name, {})
+        try:
+            for raw in iter(proc.stderr.readline, ""):
+                line = raw.strip()
+                if not line:
+                    continue
+                if _progress_update(store, line):
+                    continue
+                if _PROGRESS_LINE_RE.match(line):
+                    continue
+                tail = getattr(self, "_stderr_tail", None)
+                if tail is None:
+                    tail = self._stderr_tail = []
+                tail.append(line)
+                if len(tail) > 25:
+                    del tail[0]
+                logging.warning("%s encoder: %s", self.name, line)
+        except Exception:
+            pass
 
     def _wait_for_exit(self):
         """Block until the encoder exits; returns (returncode, stderr)."""
@@ -813,9 +931,15 @@ class StreamThread(threading.Thread):
                 return None, ""
             if ret is not None:
                 try:
-                    _, err = self.process.communicate(timeout=0.5)
+                    self.process.wait(timeout=0.5)      # stderr is drained live
                 except Exception:
-                    err = ""
+                    pass
+                err = "\n".join(getattr(self, "_stderr_tail", None) or [])
+                if not err:
+                    try:
+                        _, err = self.process.communicate(timeout=0.5)
+                    except Exception:
+                        err = ""
                 if self.feeder and self.feeder.poll() is not None:
                     try:
                         self.feeder.wait(timeout=0.5)
@@ -2716,7 +2840,10 @@ def heartbeat_manager(args):
         if host_state.client_ip:
             if now - last_ping >= HEARTBEAT_INTERVAL:
                 try:
-                    s.sendto(b"PING", (host_state.client_ip, UDP_HEARTBEAT_PORT))
+                    # The timestamp comes back in the PONG, which is how the
+                    # client's overlay gets a real round-trip time.
+                    s.sendto(f"PING {time.time():.6f}".encode("ascii"),
+                             (host_state.client_ip, UDP_HEARTBEAT_PORT))
                     last_ping = now
                 except Exception as e:
                     logging.warning("Heartbeat send error: %s", e)
@@ -2725,10 +2852,8 @@ def heartbeat_manager(args):
             try:
                 data, addr = s.recvfrom(1024)
                 msg = data.decode("utf-8", errors="ignore").strip()
-                pong_parts = msg.split()
-                if (msg.startswith("PONG") and addr[0] == host_state.client_ip
-                        and len(pong_parts) == 2 and _token_ok(pong_parts[1])):
-                    host_state.last_pong_ts = now
+                _handle_pong(msg, addr[0], now)
+                _handle_pong(msg, addr[0], now)
             except socket.timeout:
                 pass
             except Exception as e:
@@ -2860,8 +2985,7 @@ def stats_broadcast():
                     except Exception:
                         gpu = 0.0
 
-                fps = getattr(host_state, "current_fps", 0)
-                msg = f"STATS {cpu:.1f} {gpu:.1f} {mem:.1f} {fps:.1f}"
+                msg = _stats_payload(cpu, gpu, mem)
                 sock.sendto(msg.encode("utf-8"), (host_state.client_ip, UDP_HEARTBEAT_PORT))
             except Exception:
                 pass
