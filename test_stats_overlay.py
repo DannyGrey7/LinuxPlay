@@ -218,4 +218,19 @@ finally:
 ok("wire test: PING is answered with the timestamp echoed, STATS is ingested")
 
 
+# ── 8c. client cpu accounting includes ffplay (a separate process) ──
+class _FakeProc:
+    def __init__(self, own, kids):
+        self._own, self._kids = own, kids
+    def cpu_percent(self, interval=None):
+        return self._own
+    def children(self, recursive=True):
+        return self._kids
+class _DeadKid:
+    def cpu_percent(self, interval=None):
+        raise RuntimeError("child exited")
+assert client._client_cpu_percent(_FakeProc(12.5, [_FakeProc(4.0, []), _DeadKid()])) == 16.5
+assert client._client_cpu_percent(_FakeProc(3.0, [])) == 3.0
+ok("client cpu sums the process and its (restartable) children")
+
 print(f"\nALL {len(PASS)} STATS OVERLAY TESTS PASSED")

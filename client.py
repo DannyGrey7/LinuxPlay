@@ -805,6 +805,153 @@ def _counted_decode(container, counters, **kwargs):
             yield frame
 
 
+# ── YUV plane payload: lets the GPU do the YUV→RGB conversion ─────────
+# The old path ran swscale (to_ndarray("rgb24")) per frame — the single
+# biggest CPU cost left after hardware decode. These helpers hand the
+# decoder's planes to the renderer as zero-copy views instead; the GL
+# shader (and the CPU fallback below) do the colour maths.
+
+_YUV_PLANAR_FORMATS = ("yuv420p", "yuv444p", "nv12")
+
+
+def _frame_planes(frame):
+    """Zero-copy plane views for the formats the shader path understands.
+
+    Returns ("yuv", [(view, plane_w, plane_h, stride), ...], w, h, cs709,
+    frame) or None for anything else (odd layouts, 10-bit, …) — the caller
+    then falls back to to_ndarray("rgb24") exactly like before. The frame
+    itself travels in the payload because the views alias its buffers.
+    """
+    name = getattr(getattr(frame, "format", None), "name", "")
+    if name not in _YUV_PLANAR_FORMATS:
+        return None
+    try:
+        if int(getattr(frame.format, "bits_per_raw", 8) or 8) > 8:
+            return None
+    except Exception:
+        pass
+    w, h = frame.width, frame.height
+    cw, ch = (w + 1) // 2, (h + 1) // 2
+    dims = {
+        "yuv444p": ((w, h), (w, h), (w, h)),
+        "yuv420p": ((w, h), (cw, ch), (cw, ch)),
+        "nv12":    ((w, h), (cw, ch)),
+    }[name]
+    planes = []
+    for i, plane in enumerate(frame.planes):
+        try:
+            view = np.frombuffer(memoryview(plane), dtype=np.uint8)
+        except Exception:
+            view = np.frombuffer(plane.to_bytes(), dtype=np.uint8)
+        stride = plane.line_size
+        pw, ph = dims[i]
+        if view.size < stride * ph or stride <= 0:
+            return None            # unexpected layout; let the RGB path handle it
+        planes.append((view[: stride * ph], pw, ph, stride))
+    cs = str(getattr(frame, "colorspace", "") or "")
+    return ("yuv", tuple(planes), w, h, "709" in cs, frame)
+
+
+# BT.601/709 limited-range coefficients, shared with the fragment shader.
+_YUV_MATRIX_601 = ((1.164383, 0.0, 1.596027),
+                   (1.164383, -0.391762, -0.812968),
+                   (1.164383, 2.017232, 0.0))
+_YUV_MATRIX_709 = ((1.164383, 0.0, 1.792741),
+                   (1.164383, -0.213249, -0.532909),
+                   (1.164383, 2.112402, 0.0))
+
+
+def _yuv_planes_to_rgb(payload):
+    """CPU YUV→RGB with the same maths as the shader.
+
+    Only used when the GLSL program failed to build, so the shader path
+    degrades to the legacy RGB upload instead of showing nothing.
+    """
+    _, planes, w, h, cs709, _frame = payload
+
+    def rows(p):
+        view, pw, ph, stride = p
+        return view.reshape(ph, stride)[:, :pw].astype(np.float32)
+
+    y = rows(planes[0])
+    if len(planes) == 2:                        # nv12: U,V byte-interleaved rows
+        _v, _pw, ph, stride = planes[1]
+        uv = _v.reshape(ph, stride).astype(np.float32)
+        u, v = uv[:, 0::2], uv[:, 1::2]
+    else:
+        u, v = rows(planes[1]), rows(planes[2])
+    fy, fx = max(1, y.shape[0] // max(1, u.shape[0])), max(1, y.shape[1] // max(1, u.shape[1]))
+    if fx > 1 or fy > 1:
+        u = np.repeat(np.repeat(u, fy, axis=0), fx, axis=1)
+        v = np.repeat(np.repeat(v, fy, axis=0), fx, axis=1)
+    yuv = np.stack([(y - 16.0) / 255.0, (u - 128.0) / 255.0,
+                    (v - 128.0) / 255.0], axis=-1)
+    rgb = np.clip(yuv @ np.array(_YUV_MATRIX_709 if cs709 else _YUV_MATRIX_601).T,
+                  0.0, 1.0)
+    return np.ascontiguousarray((rgb * 255.0 + 0.5).astype(np.uint8))
+
+
+def _client_cpu_percent(proc):
+    """Process CPU % plus its children — ffplay (audio) is a separate
+    process, and without it the overlay under-reports the real client cost."""
+    total = 0.0
+    try:
+        total += proc.cpu_percent(interval=None)
+        for child in proc.children(recursive=True):
+            try:
+                total += child.cpu_percent(interval=None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return total
+
+
+# GLSL 1.20 so it runs on the same 2.1-style compatibility context the
+# immediate-mode draw already uses (macOS included). The quad still comes
+# from glBegin/glTexCoord2f; the shaders only replace the colour maths.
+_YUV_VS = """
+#version 120
+void main() {
+    gl_TexCoord[0] = gl_MultiTexCoord0;
+    gl_Position = gl_Vertex;
+}
+"""
+_YUV_FS = """
+#version 120
+uniform sampler2D texY;
+uniform sampler2D texU;
+uniform sampler2D texV;
+uniform int twoPlane;
+uniform int cs709;
+void main() {
+    vec2 st = gl_TexCoord[0].xy;
+    float y = texture2D(texY, st).r - 0.0627451;      // 16/255
+    float u;
+    float v;
+    if (twoPlane == 1) {
+        vec2 uv = texture2D(texU, st).ra;             // LUMINANCE_ALPHA pair
+        u = uv.x - 0.5019608;                         // 128/255
+        v = uv.y - 0.5019608;
+    } else {
+        u = texture2D(texU, st).r - 0.5019608;
+        v = texture2D(texV, st).r - 0.5019608;
+    }
+    vec3 rgb;
+    if (cs709 == 1) {
+        rgb = vec3(1.164383 * y + 1.792741 * v,
+                   1.164383 * y - 0.213249 * u - 0.532909 * v,
+                   1.164383 * y + 2.112402 * u);
+    } else {
+        rgb = vec3(1.164383 * y + 1.596027 * v,
+                   1.164383 * y - 0.391762 * u - 0.812968 * v,
+                   1.164383 * y + 2.017232 * u);
+    }
+    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+"""
+
+
 def _parse_host_stats(msg):
     """Parse the host's STATS datagram into a dict.
 
@@ -975,11 +1122,16 @@ class DecoderThread(QThread):
                         self._has_first_frame = True
                         self.frame_ready.emit(("dmabuf", dmabuf_fd, frame.width, frame.height))
                     else:
-                        arr = frame.to_ndarray(format="rgb24")
-                        if not arr.flags["C_CONTIGUOUS"]:
-                            arr = np.ascontiguousarray(arr, dtype=np.uint8)
-                        self._has_first_frame = True
-                        self.frame_ready.emit((arr, frame.width, frame.height))
+                        payload = _frame_planes(frame)
+                        if payload is not None:
+                            self._has_first_frame = True
+                            self.frame_ready.emit(payload)
+                        else:
+                            arr = frame.to_ndarray(format="rgb24")
+                            if not arr.flags["C_CONTIGUOUS"]:
+                                arr = np.ascontiguousarray(arr, dtype=np.uint8)
+                            self._has_first_frame = True
+                            self.frame_ready.emit((arr, frame.width, frame.height))
 
                     t1 = time.perf_counter()
                     self._frame_count += 1
@@ -1279,6 +1431,10 @@ class VideoWidgetGL(QOpenGLWidget):
         self.texture_id = None
         self.pbo_ids = []
         self.current_pbo = 0
+        self._yuv_prog = None
+        self._yuv_locs = {}
+        self._yuv_textures = []
+        self._yuv_alloc = None            # (w, h, nplanes) the textures were sized for
         self._last_frame_recv = time.time()
         self._last_mouse_ts = 0.0
         self._mouse_throttle = 0.0025
@@ -1324,6 +1480,34 @@ class VideoWidgetGL(QOpenGLWidget):
         glClearColor(0.0, 0.0, 0.0, 1.0)
         self.texture_id = glGenTextures(1)
         self._initialize_texture(self.texture_width, self.texture_height)
+        self._init_yuv_program()
+
+    def _init_yuv_program(self):
+        """Compile the YUV shader; on failure the widget keeps working through
+        the legacy rgb24 upload (fed by _yuv_planes_to_rgb), just slower."""
+        def compile_stage(stype, source):
+            sh = glCreateShader(stype)
+            glShaderSource(sh, source)
+            glCompileShader(sh)
+            if glGetShaderiv(sh, GL_COMPILE_STATUS) != GL_TRUE:
+                log = glGetShaderInfoLog(sh)
+                raise RuntimeError(f"shader compile failed: {log}")
+            return sh
+        try:
+            prog = glCreateProgram()
+            glAttachShader(prog, compile_stage(GL_VERTEX_SHADER, _YUV_VS))
+            glAttachShader(prog, compile_stage(GL_FRAGMENT_SHADER, _YUV_FS))
+            glLinkProgram(prog)
+            if glGetProgramiv(prog, GL_LINK_STATUS) != GL_TRUE:
+                raise RuntimeError(f"program link failed: {glGetProgramInfoLog(prog)}")
+            self._yuv_prog = prog
+            self._yuv_locs = {name: glGetUniformLocation(prog, name)
+                              for name in ("texY", "texU", "texV", "twoPlane", "cs709")}
+            logging.info("YUV→RGB shader program built; GPU colour conversion active.")
+        except Exception as e:
+            self._yuv_prog = None
+            logging.warning("YUV shader unavailable (%s) — falling back to CPU "
+                            "colour conversion through the legacy upload.", e)
 
     def _initialize_texture(self, w, h):
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
@@ -1354,12 +1538,93 @@ class VideoWidgetGL(QOpenGLWidget):
             logging.info(f"Resize texture {self.texture_width}x{self.texture_height} → {w}x{h}")
             self._pending_resize = (w, h)
 
+    def _quad_scale(self, fw, fh):
+        aspect_tex = fw / float(fh)
+        aspect_win = self.width() / float(self.height())
+        if aspect_win > aspect_tex:
+            return (aspect_tex / aspect_win), 1.0
+        return 1.0, (aspect_win / aspect_tex)
+
+    def _ensure_yuv_textures(self, w, h, plane_dims):
+        # The plane dims (not just w/h/nplanes) must be part of the key:
+        # yuv420p and yuv444p share all three but need different chroma
+        # texture sizes, and a stale smaller texture makes the upload go
+        # out of bounds.
+        if self._yuv_alloc == (w, h, plane_dims) and self._yuv_textures:
+            return
+        if self._yuv_textures:
+            glDeleteTextures(len(self._yuv_textures), self._yuv_textures)
+        self._yuv_textures = list(glGenTextures(len(plane_dims)))
+        for i, (tex, (tw, th)) in enumerate(zip(self._yuv_textures, plane_dims)):
+            glBindTexture(GL_TEXTURE_2D, tex)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            fmt = GL_LUMINANCE_ALPHA if (len(plane_dims) == 2 and i == 1) else GL_LUMINANCE
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(GL_TEXTURE_2D, 0, fmt, tw, th, 0, fmt, GL_UNSIGNED_BYTE, None)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        self._yuv_alloc = (w, h, plane_dims)
+
+    def _paint_yuv(self, payload):
+        """Upload the planes as-is (no conversion, no staging copy) and let
+        the fragment shader produce RGB — the fast path."""
+        _, planes, w, h, cs709, _frame = payload
+        n = len(planes)
+        self._ensure_yuv_textures(w, h, tuple((pw, ph) for _v, pw, ph, _s in planes))
+        for i, (view, pw, ph, stride) in enumerate(planes):
+            interleaved = (n == 2 and i == 1)     # nv12: U,V as LUMINANCE_ALPHA pairs
+            # ROW_LENGTH makes the driver skip row padding; for interleaved
+            # planes a texel is 2 bytes, so the length is counted in pairs.
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride // 2 if interleaved else stride)
+            glBindTexture(GL_TEXTURE_2D, self._yuv_textures[i])
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, pw, ph,
+                            GL_LUMINANCE_ALPHA if interleaved else GL_LUMINANCE,
+                            GL_UNSIGNED_BYTE, view)
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        glUseProgram(self._yuv_prog)
+        try:
+            for unit, tex in enumerate(self._yuv_textures):
+                glActiveTexture(GL_TEXTURE0 + unit)
+                glBindTexture(GL_TEXTURE_2D, tex)
+            glUniform1i(self._yuv_locs["texY"], 0)
+            glUniform1i(self._yuv_locs["texU"], 1)
+            glUniform1i(self._yuv_locs["texV"], 2)
+            glUniform1i(self._yuv_locs["twoPlane"], 1 if n == 2 else 0)
+            glUniform1i(self._yuv_locs["cs709"], 1 if cs709 else 0)
+
+            sx, sy = self._quad_scale(w, h)
+            glClear(GL_COLOR_BUFFER_BIT)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0.0, 1.0); glVertex2f(-sx, -sy)
+            glTexCoord2f(1.0, 1.0); glVertex2f(sx, -sy)
+            glTexCoord2f(1.0, 0.0); glVertex2f(sx, sy)
+            glTexCoord2f(0.0, 0.0); glVertex2f(-sx, sy)
+            glEnd()
+        finally:
+            glUseProgram(0)
+            glActiveTexture(GL_TEXTURE0)
+
     def paintGL(self):
         if not self.frame_data:
             glClear(GL_COLOR_BUFFER_BIT)
             return
 
-        arr, fw, fh = self.frame_data
+        payload = self.frame_data
+        kind = payload[0] if isinstance(payload[0], str) else "rgb"
+        if kind == "yuv":
+            if self._yuv_prog is not None:
+                self._paint_yuv(payload)
+                return
+            # shader build failed: convert on the CPU and take the legacy upload
+            arr = _yuv_planes_to_rgb(payload)
+            fw, fh = payload[2], payload[3]
+        else:
+            arr, fw, fh = payload
+
         if self._pending_resize:
             w, h = self._pending_resize
             self._initialize_texture(w, h)
@@ -1370,24 +1635,16 @@ class VideoWidgetGL(QOpenGLWidget):
         current_pbo = self.pbo_ids[self.current_pbo]
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, current_pbo)
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, size, None, GL_STREAM_DRAW)
-        ptr = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY)
-        if ptr:
-            ctypes.memmove(ptr, data.ctypes.data, size)
-            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+        # Fill the staging PBO straight from the numpy buffer: the driver does
+        # the copy, so the ctypes.memmove of a full frame is gone.
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, size, data, GL_STREAM_DRAW)
 
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fw, fh, GL_RGB, GL_UNSIGNED_BYTE, None)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
 
-        aspect_tex = fw / float(fh)
-        aspect_win = self.width() / float(self.height())
-        if aspect_win > aspect_tex:
-            sx, sy = (aspect_tex / aspect_win), 1.0
-        else:
-            sx, sy = 1.0, (aspect_win / aspect_tex)
-
+        sx, sy = self._quad_scale(fw, fh)
         glClear(GL_COLOR_BUFFER_BIT)
         glEnable(GL_TEXTURE_2D)
         glBegin(GL_QUADS)
@@ -1404,9 +1661,19 @@ class VideoWidgetGL(QOpenGLWidget):
 
     def updateFrame(self, frame_tuple):
         self.frame_data = frame_tuple
-        _, fw, fh = frame_tuple
-        if (fw, fh) != (self.texture_width, self.texture_height):
-            self.resizeTexture(fw, fh)
+        kind = frame_tuple[0] if isinstance(frame_tuple[0], str) else "rgb"
+        if kind == "yuv":
+            # plane textures manage their own size; just track it
+            _, _planes, fw, fh, _cs, _frame = frame_tuple
+            self.texture_width, self.texture_height = fw, fh
+        elif kind == "dmabuf":
+            _, _fd, fw, fh = frame_tuple
+            if (fw, fh) != (self.texture_width, self.texture_height):
+                self.resizeTexture(fw, fh)
+        else:
+            _arr, fw, fh = frame_tuple
+            if (fw, fh) != (self.texture_width, self.texture_height):
+                self.resizeTexture(fw, fh)
         self._last_frame_recv = time.time()
 
         now = time.time()
@@ -2061,7 +2328,7 @@ class MainWindow(QMainWindow):
                                    "frames": snap[3], "keyframes": snap[2]}
 
         try:
-            data["ccpu"] = self._proc.cpu_percent(interval=None)
+            data["ccpu"] = _client_cpu_percent(self._proc)
         except Exception:
             pass
         try:
