@@ -656,15 +656,15 @@ def audio_listener(host_ip, enabled=True):
     except Exception:
         pass
 
+    # No aresample=async/first_pts in either filter: measured to add ~6 s of
+    # playout delay. The stall watchdog in loop() already recovers dead audio.
     if max_channels > 2:
         afilter = (f"aresample=matrix_encoding=none,"
-                   f"aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'},"
-                   f"aresample=async=1:first_pts=0")
+                   f"aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'}")
         logging.info(f"Detected {max_channels}-channel output device — enabling surround audio.")
     else:
         afilter = ("aresample=matrix_encoding=none,"
-                   "pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC,"
-                   "aresample=async=1:first_pts=0")
+                   "pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC")
         logging.info("Stereo-only output detected — downmixing surround audio.")
 
     def loop():
@@ -676,10 +676,7 @@ def audio_listener(host_ip, enabled=True):
                 "ffplay",
                 "-hide_banner", "-loglevel", "info",
                 "-nodisp", "-autoexit",
-                # No -fflags nobuffer here: starving Opus of buffering is what
-                # made audio glitch on a jittery link. The async resampler in
-                # -af absorbs drift and the odd lost packet instead.
-                "-fflags", "+discardcorrupt",
+                "-fflags", "nobuffer+discardcorrupt",
                 "-af", afilter,
                 "-f", "mpegts",
                 url,

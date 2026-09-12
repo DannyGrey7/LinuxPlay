@@ -47,8 +47,11 @@ def _func_source(name):
               if isinstance(n, ast.FunctionDef) and n.name == name)
     return ast.get_source_segment(src, fn)
 audio_src = _func_source("audio_listener")
-assert '"-fflags", "nobuffer"' not in audio_src, "audio must not be starved of buffering"
-assert "aresample=async=1:first_pts=0" in audio_src, "drift/gap recovery missing"
+# comments legitimately mention the forbidden flags when explaining their absence
+audio_code = "\n".join(l for l in audio_src.splitlines() if not l.lstrip().startswith("#"))
+assert '"-fflags", "nobuffer+discardcorrupt"' in audio_code, "low-latency audio flags missing"
+assert "aresample=async" not in audio_code and "first_pts" not in audio_code, \
+    "async/first_pts add seconds of playout delay (measured ~6.3 s)"
 assert "bufsize=0" in audio_src and "universal_newlines" not in audio_src, \
     "the reader parses bytes; the pipe must not be in text mode"
 assert "AUDIO_STALL_SECS" in audio_src and "_parse_ffplay_clock" in audio_src
@@ -56,7 +59,7 @@ assert "AUDIO_STALL_SECS" in audio_src and "_parse_ffplay_clock" in audio_src
 assert "audio_stop.set()" not in audio_src, "closeEvent must own that, not the listener"
 close_src = _func_source("closeEvent")
 assert "if remaining == 0:" in close_src and "audio_stop.set()" in close_src
-ok("audio buffering/async resampling on; only the last window stops the player")
+ok("low-latency audio flags on, no async resampler; only the last window stops the player")
 # ── 3. hwaccel factory: only offers what this PyAV/FFmpeg can actually do ──
 from av.codec.hwaccel import hwdevices_available          # noqa: E402
 offered = list(hwdevices_available() or ())
