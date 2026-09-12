@@ -254,11 +254,15 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
 
 ## Network Modes
 
-- Client auto-detects Wi-Fi vs Ethernet and sends `NET WIFI` / `NET LAN`.
+- Client auto-detects Wi-Fi vs Ethernet vs VPN tunnel and sends `NET WIFI` / `NET LAN` / `NET VPN`.
 - Host adjusts buffers accordingly.
+- Tailscale/WireGuard links (`tailscale0`, `wg*`, `tun*`, peers in `100.64.0.0/10`) are classified
+  as `vpn`: they get the cautious buffering profile and `--ultra` is auto-disabled, because the
+  tunnel path can change (direct ↔ relay) even when the local link looks fine.
 - Manual override:
   - `client.py --net wifi`
   - `client.py --net lan`
+  - `client.py --net vpn`
 - Default: `auto`.
 
 ---
@@ -272,6 +276,17 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
   - Clears session state.
   - Returns to “Waiting for connection…”.
 - Reconnects start video/audio again without manual restart.
+
+---
+
+## Logs
+
+- Host: `~/.local/state/linuxplay/host.log` (rotating, 2 MB × 3). The GUI prints the path at
+  startup, and the file is written even when the host runs without a GUI — so a host that
+  dies overnight leaves evidence instead of nothing.
+- Launcher: `host-launch.log` / `client-launch.log` in the same directory. If a host or
+  client exits with a non-zero code, the launcher shows the last lines in a dialog.
+- Override the directory anywhere with `LINUXPLAY_STATE_DIR`.
 
 ---
 
@@ -355,8 +370,15 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
   - First login via rotating PIN.
   - Subsequent logins via per-device certificate.
   - Private keys stay on the client; host tracks fingerprints.
+  - Bad PINs cost the sender: after 3 failures from one address the host refuses that
+    address for a growing cool-off (30 s, doubling up to 15 min). A bad PIN no longer
+    rotates the displayed PIN, so an attacker cannot keep the code out of your hands.
+  - Pairing a **new** device needs your approval in the host window before a certificate
+    is issued (headless hosts auto-approve, since nobody is there to ask).
+  - Every channel is session-token gated, including file uploads (TCP 7003).
 - To revoke:
-  - Edit or remove entries in `trusted_clients.json` on the host.
+  - Edit or remove entries in `trusted_clients.json` on the host (read at handshake time),
+    or set `"status": "revoked"` on the record.
 
 ---
 

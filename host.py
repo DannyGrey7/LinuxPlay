@@ -22,7 +22,8 @@ import hmac
 from shutil import which
 
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton, QLabel, QHBoxLayout
+    QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton, QLabel, QHBoxLayout,
+    QMessageBox
 )
 from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
@@ -40,6 +41,19 @@ ACTIVE_CLIENT = None
 ACTIVE_CLIENT_LOCK = threading.Lock()
 PIN_LENGTH = 6
 PIN_ROTATE_SECS = 30
+
+# A wrong PIN must cost the sender something: after PIN_MAX_FAILURES bad
+# attempts one address is refused for a doubling cool-off (30s -> 15min).
+PIN_MAX_FAILURES = 3
+PIN_LOCKOUT_BASE = 30.0
+PIN_LOCKOUT_MAX  = 900.0
+
+# How long the local user has to approve pairing a brand-new device (GUI hosts).
+PAIR_APPROVAL_TIMEOUT = 45.0
+
+# A failing encoder is restarted with backoff instead of stopping the host.
+STREAM_MAX_RESTARTS = 5
+STREAM_RESTART_MAX_DELAY = 20.0
 
 DEFAULT_FPS = "30"
 LEGACY_BITRATE = "8M"
@@ -122,12 +136,27 @@ def _ensure_ca():
         logging.error("[AUTH] Failed to create CA: %s", e)
         return False
 
+def _trust_db_sane(db) -> bool:
+    """A hand-edited or truncated trust DB must never crash the host."""
+    if not isinstance(db, dict):
+        return False
+    entries = db.get("trusted_clients", [])
+    if not isinstance(entries, list):
+        return False
+    return all(isinstance(rec, dict) for rec in entries)
+
+
 def _load_trust_db():
     db = {"trusted_clients": []}
     try:
         if os.path.exists(TRUSTED_DB):
             with open(TRUSTED_DB, "r", encoding="utf-8") as f:
-                db = json.load(f)
+                loaded = json.load(f)
+            if _trust_db_sane(loaded):
+                db = loaded
+            else:
+                logging.error("%s is malformed — treating it as empty "
+                              "(no client trusted until it is repaired).", TRUSTED_DB)
     except Exception:
         pass
     return db
@@ -143,8 +172,10 @@ def _save_trust_db(db):
         return False
 
 def _trust_record_for(fp_hex, db):
-    for rec in db.get("trusted_clients", []):
-        if rec.get("fingerprint") == fp_hex:
+    if not isinstance(db, dict):
+        return None
+    for rec in db.get("trusted_clients", []) or []:
+        if isinstance(rec, dict) and rec.get("fingerprint") == fp_hex:
             return rec
     return None
 
@@ -343,6 +374,19 @@ def _resolve_capture_mode():
         return "portal"
     return "kmsgrab"
 
+_warn_throttle = {}
+_warn_throttle_lock = threading.Lock()
+
+def _warn_throttled(key: str, msg: str, interval: float = 30.0, exc_info: bool = False):
+    """Log a recurring non-fatal error at most once per interval (per key)."""
+    now = time.time()
+    with _warn_throttle_lock:
+        if now - _warn_throttle.get(key, 0.0) < interval:
+            return
+        _warn_throttle[key] = now
+    logging.warning(msg, exc_info=exc_info)
+
+
 class HostState:
     def __init__(self):
         self.video_threads = {}
@@ -373,6 +417,11 @@ class HostState:
         self.starting_streams = False
         self.gamepad_thread = None
         self.session_token = None
+        self.pin_failures = {}     # peer ip -> [fail_count, locked_until_ts]
+        self.pin_fail_lock = threading.Lock()
+        self.gui_window = None     # set by HostWindow: enables pairing prompts
+        self.log_path = None
+        self.session_epoch = 0     # bumped on connect/disconnect to clear backoff
 
 host_state = HostState()
 HOST_ARGS = None
@@ -540,6 +589,40 @@ def cleanup():
     stop_all()
 atexit.register(cleanup)
 
+def _pin_lockout_remaining(peer_ip: str) -> float:
+    with host_state.pin_fail_lock:
+        rec = host_state.pin_failures.get(peer_ip)
+        if not rec:
+            return 0.0
+        return max(0.0, float(rec[1]) - time.time())
+
+
+def _pin_note_failure(peer_ip: str):
+    """Count a bad PIN; repeated failures from one address earn a cool-off."""
+    with host_state.pin_fail_lock:
+        now = time.time()
+        if len(host_state.pin_failures) > 500:
+            for ip in [k for k, v in host_state.pin_failures.items()
+                       if v[1] < now - 3600.0]:
+                host_state.pin_failures.pop(ip, None)
+        rec = host_state.pin_failures.setdefault(peer_ip, [0, 0.0])
+        rec[0] += 1
+        if rec[0] >= PIN_MAX_FAILURES:
+            over = min(rec[0] - PIN_MAX_FAILURES, 5)
+            lock = min(PIN_LOCKOUT_BASE * (2 ** over), PIN_LOCKOUT_MAX)
+            rec[1] = now + lock
+            logging.warning("[AUTH] %s: %d bad PINs — locked out for %.0fs.",
+                            peer_ip, rec[0], lock)
+        else:
+            logging.info("[AUTH] %s: bad PIN (%d/%d before cool-off).",
+                         peer_ip, rec[0], PIN_MAX_FAILURES)
+
+
+def _pin_clear_failures(peer_ip: str):
+    with host_state.pin_fail_lock:
+        host_state.pin_failures.pop(peer_ip, None)
+
+
 def _gen_pin(length=PIN_LENGTH):
     import secrets
     n = secrets.randbelow(10**length)
@@ -628,6 +711,14 @@ def ffmpeg_has_device(name: str) -> bool:
         return False
 
 class StreamThread(threading.Thread):
+    """Run one ffmpeg encoder (plus optional feeder) and keep it running.
+
+    A transient encoder failure used to call trigger_shutdown() and take the
+    whole host with it. Now the child is restarted with backoff; only after
+    STREAM_MAX_RESTARTS consecutive failures does the thread retire, which
+    lets the session manager retry the stream later.
+    """
+
     def __init__(self, cmd, name, feeder_cmd=None):
         super().__init__(daemon=True)
         self.cmd = cmd
@@ -637,10 +728,35 @@ class StreamThread(threading.Thread):
         self.process = None
         self._running = True
 
-    def run(self):
-        logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
+    def _kill_children(self):
+        """Terminate and reap the encoder and its feeder, if they are alive."""
+        for proc in (self.process, self.feeder):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=1.0)
+                        except Exception:
+                            pass
+                else:
+                    proc.wait(timeout=0.2)          # reap an already-dead child
+            except Exception:
+                pass
+
+    def _start_children(self) -> bool:
+        # Never inherit an older encoder or feeder: it would keep encoding to
+        # the same UDP port as its replacement.
+        self._kill_children()
+        self.process = None
+        self.feeder = None
+
         if self.feeder_cmd:
-            logging.info("Starting %s feeder: %s", self.name, " ".join(self.feeder_cmd))
             try:
                 self.feeder = subprocess.Popen(
                     self.feeder_cmd,
@@ -648,8 +764,9 @@ class StreamThread(threading.Thread):
                     stderr=subprocess.DEVNULL,
                 )
             except Exception as e:
-                trigger_shutdown(f"{self.name} feeder failed to start: {e}")
-                return
+                logging.error("%s feeder failed to start: %s", self.name, e)
+                self.feeder = None
+                return False
         try:
             self.process = subprocess.Popen(
                 self.cmd,
@@ -658,34 +775,103 @@ class StreamThread(threading.Thread):
                 stderr=subprocess.PIPE,
                 universal_newlines=True
             )
-
-            try:
-                import psutil, os
-                ps = psutil.Process(self.process.pid)
-                ps.nice(-10)
-                cpu_count = os.cpu_count()
-                if cpu_count and cpu_count > 4:
-                    ps.cpu_affinity(list(range(0, min(cpu_count, 8))))
-                logging.debug(f"Affinity + priority applied to {self.name}")
-            except Exception as e:
-                logging.debug(f"Affinity set failed: {e}")
-
         except Exception as e:
-            trigger_shutdown(f"{self.name} failed to start: {e}")
-            return
+            logging.error("%s failed to start: %s", self.name, e)
+            self._kill_children()
+            self.process = None
+            self.feeder = None
+            return False
 
+        if not self._running or host_state.should_terminate:
+            # stop() ran while we were spawning: do not orphan a live encoder
+            # that would then fight the next session for the same UDP port.
+            logging.info("%s was starting while the stream stopped — terminating it.",
+                         self.name)
+            self._kill_children()
+            self.process = None
+            self.feeder = None
+            return False
+
+        try:
+            import psutil, os
+            ps = psutil.Process(self.process.pid)
+            ps.nice(-10)
+            cpu_count = os.cpu_count()
+            if cpu_count and cpu_count > 4:
+                ps.cpu_affinity(list(range(0, min(cpu_count, 8))))
+            logging.debug(f"Affinity + priority applied to {self.name}")
+        except Exception as e:
+            logging.debug(f"Affinity set failed: {e}")
+        return True
+
+    def _wait_for_exit(self):
+        """Block until the encoder exits; returns (returncode, stderr)."""
         while self._running and not host_state.should_terminate:
-            ret = self.process.poll()
+            try:
+                ret = self.process.poll()
+            except Exception:
+                return None, ""
             if ret is not None:
                 try:
                     _, err = self.process.communicate(timeout=0.5)
                 except Exception:
                     err = ""
-                if ret != 0 and not host_state.should_terminate and self._running:
-                    logging.error("%s exited (%s). stderr:\n%s", self.name, ret, err or "(no output)")
-                    trigger_shutdown(f"{self.name} crashed/quit with code {ret}")
-                break
+                if self.feeder and self.feeder.poll() is not None:
+                    try:
+                        self.feeder.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                return ret, err
             time.sleep(0.2)
+        return None, ""
+
+    def _retire(self):
+        """Drop this thread from host_state so the session manager retries later."""
+        self._kill_children()
+        self.process = None
+        self.feeder = None
+        with host_state.video_thread_lock:
+            for idx, t in list(host_state.video_threads.items()):
+                if t is self:
+                    host_state.video_threads.pop(idx, None)
+        if host_state.audio_thread is self:
+            host_state.audio_thread = None
+
+    def run(self):
+        logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
+        if self.feeder_cmd:
+            logging.info("Starting %s feeder: %s", self.name, " ".join(self.feeder_cmd))
+
+        failures = 0
+        while self._running and not host_state.should_terminate:
+            if self._start_children():
+                ret, err = self._wait_for_exit()
+                if not self._running or host_state.should_terminate:
+                    break
+                if ret == 0:
+                    logging.error("%s stopped unexpectedly (exit 0).", self.name)
+                elif ret is not None:
+                    logging.error("%s exited (%s). stderr tail:\n%s", self.name, ret,
+                                  (err or "(no output)").strip()[-1500:])
+            else:
+                logging.error("%s could not be started.", self.name)
+
+            failures += 1
+            if failures > STREAM_MAX_RESTARTS:
+                logging.error("%s failed %d times in a row — pausing this stream; "
+                              "the session manager will retry.", self.name, failures)
+                set_status(f"{self.name} failed — retrying shortly…")
+                self._retire()
+                return
+
+            delay = min(1.0 * (2 ** (failures - 1)), STREAM_RESTART_MAX_DELAY)
+            logging.warning("%s restarting in %.0fs (attempt %d/%d).",
+                            self.name, delay, failures, STREAM_MAX_RESTARTS)
+            set_status(f"{self.name} restarting in {int(delay)}s…")
+            waited = 0.0
+            while waited < delay and self._running and not host_state.should_terminate:
+                time.sleep(0.2)
+                waited += 0.2
 
     def stop(self):
         self._running = False
@@ -1043,7 +1229,7 @@ def _udp_buffer_sizes(pkt_size):
     """(fifo_size, buffer_size) for UDP outputs. Tunnels (sub-1500 path MTU)
     and Wi-Fi get the larger burst buffers — undersized buffers drop TS
     packets, which shows up as slice/macroblock artifacts on the client."""
-    if host_state.net_mode == "wifi" or pkt_size < 1316:
+    if host_state.net_mode in ("wifi", "vpn") or pkt_size < 1316:
         return 131072, 262144
     return 65536, 262144
 
@@ -1441,8 +1627,8 @@ def build_audio_cmd():
     net_mode = getattr(host_state, "net_mode", "lan")
     aud_pkt = _udp_ts_pkt_size(str(host_state.client_ip))
     tunneled = aud_pkt < 1316
-    aud_buf = "4194304" if (net_mode == "wifi" or tunneled) else "1048576"
-    aud_delay = "150000" if (net_mode == "wifi" or tunneled) else "0"
+    aud_buf = "4194304" if (net_mode in ("wifi", "vpn") or tunneled) else "1048576"
+    aud_delay = "150000" if (net_mode in ("wifi", "vpn") or tunneled) else "0"
 
     mon = os.environ.get("PULSE_MONITOR", "")
     if not mon and which("pactl"):
@@ -1869,6 +2055,7 @@ def _begin_session_locked(peer_ip, encoder_str):
     host_state.last_pong_ts = time.time()
     host_state.session_token = token
     host_state.client_ip = peer_ip
+    host_state.session_epoch += 1
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}"
 
 def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
@@ -1912,21 +2099,46 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
 
 def _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=""):
     provided_pin = parts[1] if len(parts) >= 2 else ""
+
+    locked_for = _pin_lockout_remaining(peer_ip)
+    if locked_for > 0:
+        logging.warning("[AUTH] %s is locked out for another %.0fs after repeated bad PINs.",
+                        peer_ip, locked_for)
+        _send_and_close(conn, b"FAIL:BADPIN")
+        return
+
     reply = None
     with host_state.pin_lock:
+        expected = str(host_state.pin_code or "")
+        guess_ok = (bool(expected) and isinstance(provided_pin, str)
+                    and provided_pin.isascii() and provided_pin.isdigit()
+                    and len(provided_pin) == PIN_LENGTH
+                    and hmac.compare_digest(provided_pin, expected))
         if (not host_state.session_active
-                and provided_pin == str(host_state.pin_code)
+                and guess_ok
                 and time.time() < host_state.pin_expiry):
             reply = _begin_session_locked(peer_ip, encoder_str)
 
     if reply is not None:
+        _pin_clear_failures(peer_ip)
         logging.info(f"[AUTH] Client {peer_ip} authenticated — PIN invalidated and rotation paused.")
+
         cert_line = ""
         keyreq_b64 = ""
         for line in (raw or "").splitlines()[1:]:
             if line.startswith("KEYREQ "):
                 keyreq_b64 = line.split(None, 1)[1].strip()
                 break
+
+        # Signing a client key mints a long-lived credential, so the local user
+        # confirms it when a GUI is up (headless hosts auto-approve). A client
+        # that already holds a certificate never reaches this path.
+        if keyreq_b64 and not request_pair_approval(peer_ip):
+            logging.warning(f"[AUTH] Pairing declined for {peer_ip}; session stays PIN-only.")
+            _send_and_close(conn, reply.encode("utf-8"))
+            set_status(f"Client: {host_state.client_ip} (pairing declined)")
+            set_pin_display(f"Session live: {peer_ip} — PIN paused")
+            return
         if keyreq_b64:
             issued = _issue_client_cert(client_name="linuxplay-client",
                                         export_hint_ip=peer_ip, public_key_pem=keyreq_b64)
@@ -1950,7 +2162,7 @@ def _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=""):
         else:
             logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN.")
             _send_and_close(conn, b"FAIL:BADPIN")
-            pin_rotate_if_needed(force=True)
+            _pin_note_failure(peer_ip)
 
 def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
     conn.settimeout(5.0)
@@ -1978,7 +2190,12 @@ def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
 
         _send_and_close(conn, b"FAIL")
     except Exception as e:
-        trigger_shutdown(f"Handshake server error: {e}")
+        # One malformed or hostile connection must never stop the host.
+        logging.error("Handshake handler error: %s", e)
+        try:
+            _send_and_close(conn, b"FAIL")
+        except Exception:
+            pass
 
 def tcp_handshake_server(sock, encoder_str, args):
     logging.info("TCP handshake server on %d", TCP_HANDSHAKE_PORT)
@@ -2060,9 +2277,17 @@ def start_streams_for_current_client(args):
 
 def control_listener(sock):
     logging.info("Control listener UDP %d", UDP_CONTROL_PORT)
+    error_streak = 0
     while not host_state.should_terminate:
         try:
             data, addr = sock.recvfrom(2048)
+            error_streak = 0
+            if not addr:
+                # The socket was closed under us during shutdown: a blocked
+                # recvfrom then returns (b"", None) instead of raising.
+                if host_state.should_terminate:
+                    break
+                continue
             peer_ip = addr[0]
 
             if not host_state.session_active:
@@ -2091,13 +2316,17 @@ def control_listener(sock):
 
             if cmd == "NET" and len(tokens) >= 2:
                 mode = tokens[1].strip().lower()
-                if mode in ("wifi", "lan"):
+                if mode in ("wifi", "lan", "vpn"):
                     old = getattr(host_state, "net_mode", "lan")
                     if mode != old:
                         logging.info(f"Network mode switch requested: {old} → {mode}")
                         host_state.net_mode = mode
                         try:
                             stop_streams_only()
+                            # stop_streams_only() arms the reconnect cooldown, but
+                            # this restart is deliberate: clear it so the switch
+                            # does not black out the screen for two seconds.
+                            host_state.last_disconnect_ts = 0.0
                             if HOST_ARGS:
                                 start_streams_for_current_client(HOST_ARGS)
                         except Exception as e:
@@ -2113,6 +2342,7 @@ def control_listener(sock):
                     host_state.session_active = False
                     host_state.authed_client_ip = None
                     host_state.session_token = None
+                    host_state.session_epoch += 1
                     set_status("Client disconnected — waiting for connection…")
                     logging.debug("All streams stopped after GOODBYE.")
 
@@ -2170,8 +2400,13 @@ def control_listener(sock):
         except OSError:
             break
         except Exception as e:
-            trigger_shutdown(f"Control listener error: {e}")
-            break
+            error_streak += 1
+            _warn_throttled("control-listener", f"Control listener error: {e}", exc_info=True)
+            if error_streak > 50:
+                logging.critical("Control listener stopped after %d consecutive errors: %s",
+                                 error_streak, e)
+                break
+            time.sleep(0.05)
 
 def clipboard_monitor_host():
     if not HAVE_PYPERCLIP:
@@ -2191,8 +2426,10 @@ def clipboard_monitor_host():
                 try:
                     sock.sendto(msg, (host_state.client_ip, UDP_CLIPBOARD_PORT))
                 except Exception as e:
-                    trigger_shutdown(f"Clipboard send error: {e}")
-                    break
+                    # A route that vanished (client moved between LAN and VPN, or
+                    # Wi-Fi dropped) must not take the host down; retry next tick.
+                    _warn_throttled("clipboard-send",
+                                    f"Clipboard send to {host_state.client_ip} failed: {e}")
         time.sleep(1)
     sock.close()
 
@@ -2202,6 +2439,10 @@ def clipboard_listener_host(sock):
     while not host_state.should_terminate:
         try:
             data, addr = sock.recvfrom(65535)
+            if not addr:
+                if host_state.should_terminate:
+                    break
+                continue
             if not host_state.session_active or addr[0] != host_state.authed_client_ip:
                 continue
             msg = data.decode("utf-8", errors="ignore")
@@ -2218,15 +2459,14 @@ def clipboard_listener_host(sock):
                         if (pyperclip.paste() or "") != new_content:
                             pyperclip.copy(new_content)
                     except Exception as e:
-                        trigger_shutdown(f"Clipboard apply error: {e}")
-                        break
+                        _warn_throttled("clipboard-apply", f"Clipboard apply failed: {e}")
                     finally:
                         host_state.ignore_clipboard_update = False
         except OSError:
             break
         except Exception as e:
-            trigger_shutdown(f"Clipboard listener error: {e}")
-            break
+            _warn_throttled("clipboard-listener", f"Clipboard listener error: {e}")
+            time.sleep(0.2)
 
 def recvall(sock, n):
     data = b""
@@ -2235,6 +2475,28 @@ def recvall(sock, n):
         if not chunk: return None
         data += chunk
     return data
+
+def _read_line(sock, limit: int = 128, deadline: float = 2.0):
+    """Read one newline-terminated line, bounded in bytes AND time.
+
+    Used for the upload AUTH header. A peer that dribbles one byte per socket
+    timeout must not be able to hold the (single-threaded) upload listener.
+    """
+    buf = b""
+    started = time.monotonic()
+    while len(buf) < limit:
+        if time.monotonic() - started > deadline:
+            return None
+        try:
+            ch = sock.recv(1)
+        except Exception:
+            return None
+        if not ch:
+            return None
+        if ch == b"\n":
+            return buf.decode("utf-8", errors="ignore").strip()
+        buf += ch
+    return None
 
 def file_upload_listener():
     import re
@@ -2282,6 +2544,7 @@ def file_upload_listener():
         return
 
     while not host_state.should_terminate:
+        conn = None
         try:
             conn, addr = s.accept()
             conn.settimeout(10.0)
@@ -2289,6 +2552,20 @@ def file_upload_listener():
 
             if not host_state.session_active or peer_ip != host_state.authed_client_ip:
                 logging.warning(f"[UPLOAD] Rejected unauthorized upload from {peer_ip}")
+                conn.close()
+                continue
+
+            # Same session token as every other channel: a spoofed source IP
+            # alone must not be enough to write files into the home directory.
+            try:
+                conn.settimeout(2.0)
+                auth_line = _read_line(conn)
+            finally:
+                conn.settimeout(10.0)
+            token = auth_line[5:].strip() if (auth_line or "").startswith("AUTH ") else ""
+            if not token or not _token_ok(token):
+                logging.warning(f"[UPLOAD] Rejected upload from {peer_ip} "
+                                f"(missing or invalid session token)")
                 conn.close()
                 continue
 
@@ -2324,7 +2601,11 @@ def file_upload_listener():
                 continue
 
             dest_dir = Path(os.path.expanduser("~")) / "LinuxPlayDrop"
-            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(str(dest_dir), 0o700)
+            except Exception:
+                pass
 
             final_path = _unique_path(dest_dir, filename)
             real_dest_dir = dest_dir.resolve()
@@ -2368,7 +2649,16 @@ def file_upload_listener():
                 logging.warning(f"[UPLOAD] Temp file missing after write for {peer_ip}")
                 continue
 
-            os.replace(str(tmp_path), str(final_path))
+            try:
+                os.replace(str(tmp_path), str(final_path))
+            except Exception as e:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                conn.close()
+                logging.error(f"[UPLOAD] Could not finalize {final_path.name}: {e}")
+                continue
             try:
                 os.chmod(str(final_path), 0o600)
             except Exception:
@@ -2377,11 +2667,29 @@ def file_upload_listener():
             conn.close()
             logging.info("Received file from %s -> %s (%d bytes)", peer_ip, str(final_path), file_size)
 
-        except OSError:
-            break
+        except socket.timeout as e:
+            # A client that vanished mid-upload must not kill the listener.
+            logging.warning("[UPLOAD] Connection timed out: %s", e)
+            if conn:
+                try: conn.close()
+                except Exception: pass
+            continue
+        except OSError as e:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+            if host_state.should_terminate:
+                break
+            logging.warning("[UPLOAD] Socket error: %s — listener continues.", e)
+            time.sleep(0.2)
+            continue
         except Exception as e:
-            trigger_shutdown(f"File upload error: {e}")
-            break
+            if conn:
+                try: conn.close()
+                except Exception: pass
+            logging.error("[UPLOAD] Unexpected error: %s — listener continues.", e)
+            time.sleep(0.2)
+            continue
 
     try:
         s.close()
@@ -2443,6 +2751,7 @@ def heartbeat_manager(args):
                     host_state.session_active = False
                     host_state.authed_client_ip = None
                     host_state.session_token = None
+                    host_state.session_epoch += 1
                     pin_rotate_if_needed(force=True)
 
                     time.sleep(RECONNECT_COOLDOWN)
@@ -2731,14 +3040,46 @@ class GamepadServer(threading.Thread):
             pass
 
 def session_manager(args):
+    consecutive_failures = 0
+    next_attempt_ts = 0.0
+    seen_epoch = host_state.session_epoch
+
     while not host_state.should_terminate:
+        # A new session (or a disconnect) clears accumulated backoff: the next
+        # client must not stare at a black screen because a previous one hit a
+        # bad patch.
+        if host_state.session_epoch != seen_epoch:
+            seen_epoch = host_state.session_epoch
+            consecutive_failures = 0
+            next_attempt_ts = 0.0
+
         if time.time() - host_state.last_disconnect_ts < RECONNECT_COOLDOWN:
             time.sleep(0.5)
             continue
 
         if host_state.client_ip and not host_state.video_threads:
+            if time.time() < next_attempt_ts:
+                time.sleep(0.5)
+                continue
             set_status(f"Client: {host_state.client_ip}")
             start_streams_for_current_client(args)
+            if host_state.video_threads:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                delay = min(2.0 * (2 ** (consecutive_failures - 1)), 30.0)
+                next_attempt_ts = time.time() + delay
+                logging.error("Streams did not start (attempt %d) — retrying in %.0fs.",
+                              consecutive_failures, delay)
+                set_status(f"Streams failed to start — retrying in {int(delay)}s…")
+        elif (host_state.client_ip and host_state.video_threads
+              and args.audio == "enable" and not host_state.audio_thread):
+            # Video is healthy but the audio stream gave up: bring back audio only.
+            ac = build_audio_cmd()
+            if ac:
+                logging.info("Restarting the audio stream.")
+                host_state.audio_thread = StreamThread(ac, "Audio")
+                host_state.audio_thread.start()
         time.sleep(0.5)
 
 def _signal_handler(signum, frame):
@@ -2833,6 +3174,7 @@ class LogEmitter(QObject):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
     pin = pyqtSignal(str)
+    pair_request = pyqtSignal(object)
 
 log_emitter = LogEmitter()
 
@@ -2848,6 +3190,78 @@ def set_status(text: str):
     except Exception:
         pass
 
+class PairRequest:
+    """A pending 'may this new device pair?' question for the local user."""
+
+    def __init__(self, peer_ip: str, request_id: str):
+        self.peer_ip = peer_ip
+        self.request_id = request_id
+        self.event = threading.Event()
+        self.approved = False
+
+
+def request_pair_approval(peer_ip: str) -> bool:
+    """Ask the local user before a certificate is issued to a new device.
+
+    Headless hosts keep the auto-pair behaviour (there is nobody to ask, and
+    the PIN was already required). With a GUI up, the request is queued to the
+    window and the handshake waits PAIR_APPROVAL_TIMEOUT for the answer.
+    """
+    request_id = base64.b16encode(secrets.token_bytes(4)).decode("ascii")
+    if getattr(host_state, "gui_window", None) is None:
+        logging.info("[AUTH] Headless host — auto-approving pairing for %s.", peer_ip)
+        return True
+
+    req = PairRequest(peer_ip, request_id)
+    try:
+        log_emitter.pair_request.emit(req)
+    except Exception as e:
+        logging.error("[AUTH] Could not ask for pairing approval (%s) — denying %s.", e, peer_ip)
+        return False
+    if req.event.wait(PAIR_APPROVAL_TIMEOUT):
+        if not req.approved:
+            logging.warning("[AUTH] Pairing request %s from %s denied by the local user.",
+                            request_id, peer_ip)
+        return req.approved
+    logging.warning("[AUTH] Pairing request %s from %s timed out after %.0fs — denied.",
+                    request_id, peer_ip, PAIR_APPROVAL_TIMEOUT)
+    return False
+
+
+def _state_dir() -> str:
+    """Per-user state directory (XDG) used for logs; created 0700."""
+    base = os.environ.get("LINUXPLAY_STATE_DIR")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state", "linuxplay")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    return base
+
+
+def _setup_file_logging(debug: bool):
+    """Attach a rotating log file so a host that dies later leaves evidence.
+
+    Returns the log path (or None). The GUI launcher also captures stderr, but
+    a file survives a crash, a logout, or a host started without a GUI.
+    """
+    try:
+        path = os.path.join(_state_dir(), "host.log")
+    except Exception:
+        try:
+            path = os.path.join(os.getcwd(), "linuxplay_host.log")
+        except Exception:
+            return None
+    try:
+        from logging.handlers import RotatingFileHandler
+        handler = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024,
+                                      backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        handler.setLevel(logging.DEBUG if debug else logging.INFO)
+        logging.getLogger().addHandler(handler)
+        logging.info("Host log file: %s", path)
+        return path
+    except Exception as e:
+        logging.warning("Could not open log file %s: %s", path, e)
+        return None
 class QtLogHandler(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -2939,6 +3353,8 @@ class HostWindow(QWidget):
 
         log_emitter.log.connect(self.append_log)
         log_emitter.status.connect(self.set_status_text)
+        log_emitter.pair_request.connect(self._on_pair_request)
+        host_state.gui_window = self
 
         self._start_core()
 
@@ -2949,6 +3365,8 @@ class HostWindow(QWidget):
     def _start_core(self):
         self.set_status_text("Starting…")
         self.append_log("Launching host core…")
+        if getattr(host_state, "log_path", None):
+            self.append_log(f"Log file: {host_state.log_path}")
         self.core_rc = None
 
         def _run():
@@ -2977,7 +3395,31 @@ class HostWindow(QWidget):
     def set_status_text(self, text: str):
         self.statusLabel.setText(text)
 
+    def _on_pair_request(self, req):
+        """Ask the local user before a new device is given a certificate."""
+        try:
+            answer = QMessageBox.question(
+                self,
+                "Approve new device?",
+                f"A device wants to pair with this host:\n\n"
+                f"    {req.peer_ip}\n\n"
+                f"Allow it to receive a client certificate?\n\n"
+                f"(request {req.request_id} — approve only if you just started "
+                f"the connection from that device)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            req.approved = (answer == QMessageBox.Yes)
+            self.append_log(f"Pairing request {req.request_id} from {req.peer_ip}: "
+                            f"{'approved' if req.approved else 'denied'}")
+        except Exception as e:
+            logging.error("Pairing prompt failed: %s", e)
+            req.approved = False
+        finally:
+            req.event.set()
+
     def closeEvent(self, event):
+        host_state.gui_window = None
         if not host_state.should_terminate:
             trigger_shutdown("Window closed")
         event.accept()
@@ -3010,6 +3452,7 @@ def main():
     logging.basicConfig(level=(logging.DEBUG if args.debug else logging.INFO),
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
+    host_state.log_path = _setup_file_logging(args.debug)
 
     if not IS_LINUX:
         logging.critical("Hosting is Linux-only. Run this on a Linux machine.")

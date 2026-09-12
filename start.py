@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QTextEdit, QLabel, QMessageBox, QListWidget, QScrollArea
 )
 from PyQt5.QtGui import QPalette, QColor
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 try:
@@ -31,6 +31,54 @@ IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
 CFG_PATH = os.path.join(os.path.expanduser("~"), ".linuxplay_start_cfg.json")
 LINUXPLAY_MARKER = "LinuxPlayHost"
+
+def _launch_log_path(name):
+    """Launch logs live next to the host's own log so a failed start leaves evidence."""
+    try:
+        base = os.environ.get("LINUXPLAY_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".local", "state", "linuxplay")
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        return os.path.join(base, name)
+    except Exception:
+        try:
+            return os.path.join(HERE, name)
+        except Exception:
+            return None
+
+
+def _open_launch_log(path):
+    if not path:
+        return None
+    try:
+        return open(path, "w", encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _tail_text(path, lines=10, limit=4000):
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+        return "\n".join(data.splitlines()[-lines:])[-limit:]
+    except Exception:
+        return ""
+
+
+class LaunchEmitter(QObject):
+    """Carries child-process exits from the watcher threads to the GUI thread.
+
+    A plain threading.Thread has no Qt event loop, so touching widgets (or even
+    QTimer.singleShot) from it is not guaranteed to run — a failure dialog would
+    silently never appear. Signals are queued to the thread that owns the object.
+    """
+    host_exited = pyqtSignal(object, object)      # (process, returncode)
+    client_exited = pyqtSignal(object, object)
+
+
+launch_emitter = LaunchEmitter()
+
 
 def _client_cert_present(base_dir):
     try:
@@ -198,6 +246,7 @@ def _warn_ffmpeg(parent):
 class HostTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        launch_emitter.host_exited.connect(self._on_host_exited)
         main_layout = QVBoxLayout()
         wg_group = QGroupBox("Security Status")
         wg_layout = QVBoxLayout()
@@ -434,6 +483,7 @@ class HostTab(QWidget):
         self.setLayout(main_layout)
         self.host_process = None
         self._exit_watcher_thread = None
+        self._host_log_path = None
         self.pollTimerWG = QTimer(self)
         self.pollTimerWG.timeout.connect(self.refresh_wg_status)
         self.pollTimerWG.start(1500)
@@ -559,6 +609,24 @@ class HostTab(QWidget):
             self.host_process = None
         self._update_buttons()
 
+    def _on_host_exited(self, proc, rc):
+        """GUI-thread handler for a finished host process."""
+        if proc is not self.host_process:
+            return                       # a newer launch already owns the slot
+        self.host_process = None
+        self._update_buttons()
+        if rc in (0, None):
+            return
+        lpath = getattr(self, "_host_log_path", None)
+        tail = _tail_text(lpath)
+        logging.error("Host exited with code %s", rc)
+        QMessageBox.warning(
+            self, "Host stopped",
+            f"host.py exited with code {rc}.\n\n"
+            + (f"Last lines of {lpath}:\n\n{tail}" if tail
+               else "No output was captured."),
+        )
+
     def _update_buttons(self):
         running_host = _proc_is_running(self.host_process)
         running_ffmpeg = _ffmpeg_running_for_us()
@@ -671,12 +739,15 @@ class HostTab(QWidget):
             if val:
                 env["LINUXPLAY_KMS_DEVICE"] = val
 
+        log_path = _launch_log_path("host-launch.log")
+        self._host_log_path = log_path
+        log_file = _open_launch_log(log_path)
         try:
             self.host_process = subprocess.Popen(
                 cmd,
                 preexec_fn=os.setsid,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_file or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
                 env=env,
             )
         except Exception as e:
@@ -685,18 +756,19 @@ class HostTab(QWidget):
             self.host_process = None
             self._update_buttons()
             return
+        finally:
+            if log_file:
+                log_file.close()
 
         def _watch():
             try:
-                _ = self.host_process.wait()
+                rc = self.host_process.wait()
+            except Exception:
+                rc = None
+            try:
+                launch_emitter.host_exited.emit(self.host_process, rc)
             except Exception:
                 pass
-
-            def done():
-                self.host_process = None
-                self._update_buttons()
-
-            QTimer.singleShot(0, done)
 
         self._exit_watcher_thread = threading.Thread(
             target=_watch, name="HostExitWatcher", daemon=True
@@ -763,6 +835,8 @@ class HostTab(QWidget):
 class ClientTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._client_log_path = None
+        launch_emitter.client_exited.connect(self._on_client_exited)
         main_layout = QVBoxLayout()
 
         form_group = QGroupBox("Client Configuration")
@@ -799,7 +873,7 @@ class ClientTab(QWidget):
 
         self.monitorField = QLineEdit("0")
         self.netCombo = QComboBox()
-        self.netCombo.addItems(["auto", "lan", "wifi"])
+        self.netCombo.addItems(["auto", "lan", "wifi", "vpn"])
         self.ultraCheck = QCheckBox("Ultra (LAN only)")
         self.debugCheck = QCheckBox("Enable Debug")
 
@@ -950,11 +1024,53 @@ class ClientTab(QWidget):
         if pin:
             cmd.extend(["--pin", pin])
 
+        log_path = _launch_log_path("client-launch.log")
+        self._client_log_path = log_path
+        log_file = _open_launch_log(log_path)
         try:
-            subprocess.Popen(cmd)
+            client_proc = subprocess.Popen(
+                cmd,
+                stdout=log_file or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
+            )
         except Exception as e:
             logging.error(f"Failed to start client: {e}")
             QMessageBox.critical(self, "Start Client Failed", str(e))
+            client_proc = None
+        finally:
+            if log_file:
+                log_file.close()
+
+        if client_proc is not None:
+            def _watch_client(proc=client_proc):
+                try:
+                    rc = proc.wait()
+                except Exception:
+                    return
+                if rc in (0, None):
+                    return
+                try:
+                    launch_emitter.client_exited.emit(proc, rc)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_watch_client, name="ClientExitWatcher",
+                             daemon=True).start()
+
+    def _on_client_exited(self, proc, rc):
+        """GUI-thread handler for a finished client process."""
+        if rc in (0, None):
+            return
+        lpath = getattr(self, "_client_log_path", None)
+        tail = _tail_text(lpath)
+        logging.error("Client exited with code %s", rc)
+        QMessageBox.warning(
+            self, "Client stopped",
+            f"client.py exited with code {rc}.\n\n"
+            + (f"Last lines of {lpath}:\n\n{tail}" if tail
+               else "No output was captured."),
+        )
+
 
 class HelpTab(QWidget):
     def __init__(self, parent=None):

@@ -36,6 +36,10 @@ UDP_AUDIO_PORT = 6001
 
 DEFAULT_RESOLUTION = "1920x1080"
 
+# Mirrors host.PAIR_APPROVAL_TIMEOUT: the host may ask its own user to approve
+# a first-time pairing, so the PIN handshake must wait longer than 8s.
+PAIR_APPROVAL_TIMEOUT = 45.0
+
 IS_WINDOWS = py_platform.system() == "Windows"
 IS_LINUX   = py_platform.system() == "Linux"
 IS_MAC     = py_platform.system() == "Darwin"
@@ -141,7 +145,51 @@ def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     max_payload = max(512, mtu_guess - overhead)
     return max(188, (max_payload // 188) * 188)
 
+def _is_tunnel_iface(iface: str) -> bool:
+    """Overlay/VPN links (Tailscale, WireGuard, generic tun) are not 'LAN'.
+
+    Tailscale gives a 1280-byte path and can silently move between a direct
+    route and a DERP relay, so the LAN low-latency profile is wrong for it.
+    """
+    name = (iface or "").lower()
+    return name.startswith(("tailscale", "wg", "tun", "tap", "utun", "ppp",
+                            "nebula", "zerotier", "nordlynx", "proton"))
+
+
+def _ip_in_cgnat(ip: str) -> bool:
+    """100.64.0.0/10 is the CGNAT range Tailscale (and carrier NAT) uses."""
+    try:
+        parts = [int(p) for p in str(ip).split(".")]
+    except Exception:
+        return False
+    return len(parts) == 4 and parts[0] == 100 and 64 <= parts[1] <= 127
+
+
+def _route_mtu(ip: str) -> int:
+    """Path MTU to ip from the kernel routing table (Linux); 0 when unknown."""
+    if not IS_LINUX:
+        return 0
+    try:
+        import re
+        out = subprocess.check_output(["ip", "route", "get", str(ip)],
+                                      stderr=subprocess.DEVNULL,
+                                      universal_newlines=True, timeout=1.0)
+        m = re.search(r"\bdev (\S+)", out)
+        if not m:
+            return 0
+        out = subprocess.check_output(["ip", "-o", "link", "show", "dev", m.group(1)],
+                                      stderr=subprocess.DEVNULL,
+                                      universal_newlines=True, timeout=1.0)
+        m = re.search(r"\bmtu (\d+)", out)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
 def detect_network_mode(host_ip: str) -> str:
+    """Classify the link to the host: 'lan', 'wifi' or 'vpn' (overlay tunnel)."""
+    if _ip_in_cgnat(host_ip):
+        return "vpn"
     try:
         if IS_LINUX:
             import subprocess, re, os
@@ -150,6 +198,8 @@ def detect_network_mode(host_ip: str) -> str:
                                           stderr=subprocess.STDOUT)
             m = re.search(r"\bdev\s+(\S+)", out)
             iface = m.group(1) if m else ""
+            if iface and _is_tunnel_iface(iface):
+                return "vpn"
             if iface and os.path.exists(f"/sys/class/net/{iface}/wireless"):
                 return "wifi"
             if iface.startswith("wl"):
@@ -365,6 +415,9 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
             if keyreq_b64:
                 keyreq_line = "\nKEYREQ " + keyreq_b64
 
+        # The host asks its own user to approve a first-time pairing, so this
+        # wait can be much longer than the 8s connect/handshake timeout.
+        sock.settimeout(PAIR_APPROVAL_TIMEOUT + 15)
         sock.sendall(f"HELLO {code}{keyreq_line}".encode("utf-8"))
         resp = sock.recv(8192).decode("utf-8", errors="replace").strip()
         logging.debug("Handshake response: %s", resp.splitlines()[0] if resp else '(empty)')
@@ -1414,6 +1467,7 @@ class MainWindow(QMainWindow):
         self.texture_width, self.texture_height = rwidth, rheight
         self.offset_x, self.offset_y = offset_x, offset_y
         self.host_ip, self.ultra = host_ip, ultra
+        self.udp_port = udp_port
         self._running, self._restarts = True, 0
         self.gamepad_mode = gamepad
         self.gamepad_dev = gamepad_dev
@@ -1431,14 +1485,7 @@ class MainWindow(QMainWindow):
         self.video_widget.setFocus()
         self.setAcceptDrops(True)
 
-        mtu_guess = int(os.environ.get("LINUXPLAY_MTU", "1500"))
-        pkt = _best_ts_pkt_size(mtu_guess, False)
-        self.video_url = (
-            f"udp://@0.0.0.0:{udp_port}"
-            f"?pkt_size={pkt}"
-            f"&reuse=1&buffer_size=4194304&fifo_size=131072"
-            f"&overrun_nonfatal=1&max_delay=0"
-        )
+        self.video_url = self._video_url_for_path()
 
         self.decoder_opts = dict(decoder_opts)
         logging.debug("Decoder options: %s", self.decoder_opts)
@@ -1493,7 +1540,34 @@ class MainWindow(QMainWindow):
                 logging.error("Gamepad thread failed: %s", e)
                 self._gp_thread = None
 
+    def _video_url_for_path(self):
+        """Recompute the video input URL, re-probing the path MTU to the host.
+
+        Called on every decoder (re)start so a client that moved between
+        Wi-Fi, Ethernet and Tailscale picks up the new path MTU instead of a
+        stale one. rw_timeout matches the audio listener: a blackholed stream
+        then fails and is restarted instead of freezing on the last frame.
+        """
+        mtu_guess = _route_mtu(self.host_ip) or 1500
+        try:
+            env_mtu = int(os.environ.get("LINUXPLAY_MTU", "1500") or 1500)
+            if env_mtu > 0:
+                mtu_guess = min(mtu_guess, env_mtu)
+        except Exception:
+            pass
+        pkt = _best_ts_pkt_size(mtu_guess, ":" in str(self.host_ip))
+        if mtu_guess < 1500:
+            logging.info("Path MTU to %s is %d → TS pkt_size %d (no IP fragmentation).",
+                         self.host_ip, mtu_guess, pkt)
+        return (
+            f"udp://@0.0.0.0:{self.udp_port}"
+            f"?pkt_size={pkt}"
+            f"&reuse=1&buffer_size=4194304&fifo_size=131072"
+            f"&overrun_nonfatal=1&max_delay=0&rw_timeout=5000000"
+        )
+
     def _start_decoder_thread(self):
+        self.video_url = self._video_url_for_path()
         self.decoder_thread = DecoderThread(self.video_url, self.decoder_opts, ultra=self.ultra)
         self.decoder_thread.frame_ready.connect(self.video_widget.updateFrame, Qt.DirectConnection)
         self.decoder_thread.finished.connect(self._on_decoder_exit)
@@ -1630,8 +1704,15 @@ class MainWindow(QMainWindow):
 
     def upload_file(self, file_path):
         try:
+            token = CLIENT_STATE.get("token")
+            if not token:
+                logging.error(f"Upload refused for {file_path}: no session token yet.")
+                return
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(20)      # a blackholed host must not wedge the thread
                 sock.connect((self.control_addr[0], UDP_FILE_PORT))
+                # Every other channel is token-gated; the upload channel is too.
+                sock.sendall(f"AUTH {token}\n".encode("utf-8"))
                 filename = os.path.basename(file_path).encode("utf-8")
                 header = len(filename).to_bytes(4, "big") + filename
                 size = os.path.getsize(file_path)
@@ -1722,7 +1803,7 @@ def main():
     p.add_argument("--monitor", default="0", help="Index or 'all'")
     p.add_argument("--hwaccel", choices=["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi", "videotoolbox"], default="auto")
     p.add_argument("--debug", action="store_true")
-    p.add_argument("--net", choices=["auto", "lan", "wifi"], default="auto")
+    p.add_argument("--net", choices=["auto", "lan", "wifi", "vpn"], default="auto")
     p.add_argument("--ultra", action="store_true", help="Enable ultra-low-latency (LAN only). Auto-disabled on Wi-Fi/WAN.")
     p.add_argument("--gamepad", choices=["enable", "disable"], default="enable")
     p.add_argument("--gamepad_dev", default=None)
