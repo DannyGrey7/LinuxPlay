@@ -559,6 +559,10 @@ def attempt_rehandshake(host_ip, pin=None):
 
 def heartbeat_responder(host_ip):
     def loop():
+        first_ping = True
+        first_stats = True
+        last_stats = 0.0
+        last_stats_warn = 0.0
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -572,6 +576,9 @@ def heartbeat_responder(host_ip):
                 try:
                     data, addr = sock.recvfrom(256)
                     if data.startswith(b"PING"):
+                        if first_ping:
+                            first_ping = False
+                            logging.info("Heartbeat PING received from %s — control link is live.", addr[0])
                         token = CLIENT_STATE.get("token") or ""
                         # Echo the host's timestamp so it can measure the RTT.
                         parts = data.split(maxsplit=1)
@@ -586,11 +593,25 @@ def heartbeat_responder(host_ip):
                         stats = _parse_host_stats(data.decode("utf-8", errors="ignore"))
                         if stats:
                             CLIENT_STATE["host_stats"] = stats
-                            logging.debug("host stats: %s", stats)
+                            last_stats = time.time()
+                            if first_stats:
+                                first_stats = False
+                                logging.info("Host STATS telemetry active (%d fields).", len(stats))
                 except socket.timeout:
                     pass
                 except Exception:
                     time.sleep(0.2)
+                # Heartbeats arriving while STATS never shows up is the exact
+                # signature of the overlay reading zeros with a healthy link,
+                # so make it impossible to miss in the log.
+                now = time.time()
+                if (CLIENT_STATE.get("connected") and now - last_stats > 15.0
+                        and now - last_stats_warn > 15.0):
+                    logging.warning(
+                        "Heartbeats arrive but no STATS telemetry in %.0fs — "
+                        "host-side overlay graphs will read zero.",
+                        now - last_stats)
+                    last_stats_warn = now
     t = threading.Thread(target=loop, daemon=True)
     t.start()
     return t
@@ -1530,6 +1551,11 @@ class VideoWidgetGL(QOpenGLWidget):
             Qt.Key_ScrollLock: "Scroll_Lock",
             **{getattr(Qt, f"Key_F{i}"): f"F{i}" for i in range(1, 13)},
         }
+        if IS_MAC:
+            # Command is the Mac's primary shortcut modifier; forwarding it as
+            # Super would hand every Cmd+X to the desktop shell instead of the
+            # remote app, so Mac clients send it as the host's Ctrl instead.
+            key_map[Qt.Key_Meta] = "Control_L"
         if key in key_map:
             return key_map[key]
         if (Qt.Key_A <= key <= Qt.Key_Z) or (Qt.Key_0 <= key <= Qt.Key_9):
@@ -1712,6 +1738,7 @@ class StatsOverlay(QWidget):
         }
         self.info = []
         self.headline = ""
+        self._provider_failed = False
         self._font = QFont("monospace")
         self._font.setStyleHint(QFont.TypeWriter)
         self._font.setPointSize(8)
@@ -1735,7 +1762,13 @@ class StatsOverlay(QWidget):
         try:
             data = self._provider() or {}
         except Exception as e:
-            logging.debug("Stats provider failed: %s", e)
+            # A persistently failing provider looks exactly like "the overlay
+            # shows zeros" — say so loudly once, then keep the noise down.
+            if not self._provider_failed:
+                self._provider_failed = True
+                logging.warning("Stats provider failed (%s) — the overlay will show zeros.", e)
+            else:
+                logging.debug("Stats provider failed again: %s", e)
             return
         for key, series in self.series.items():
             if data.get(key) is not None:

@@ -1989,6 +1989,9 @@ class _UInputInjector:
         ec = self._ec
         code, needs_shift = self._resolve_key(name)
         if code is None:
+            # Usually a Mac client sending a character the US-layout evdev
+            # table cannot produce (Option combos, dead-key accents).
+            _warn_throttled(f"keymap:{name}", f"No evdev mapping for key {name!r} — dropped")
             return False
         down = (action == "down")
         try:
@@ -2946,6 +2949,7 @@ def resource_monitor():
 def stats_broadcast():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     p = psutil.Process(os.getpid())
+    started_log_done = False
 
     def get_host_memory_mb():
         total = 0
@@ -2987,8 +2991,14 @@ def stats_broadcast():
 
                 msg = _stats_payload(cpu, gpu, mem)
                 sock.sendto(msg.encode("utf-8"), (host_state.client_ip, UDP_HEARTBEAT_PORT))
-            except Exception:
-                pass
+                if not started_log_done:
+                    started_log_done = True
+                    logging.info("Stats broadcast to %s started (%d bytes, UDP %d).",
+                                 host_state.client_ip, len(msg), UDP_HEARTBEAT_PORT)
+            except Exception as e:
+                # Silent failure here is indistinguishable from a client-side
+                # bug: the overlay just reads zeros.
+                _warn_throttled("stats-send", f"Stats broadcast send failed: {e}")
         time.sleep(1)
 
 class GamepadServer(threading.Thread):

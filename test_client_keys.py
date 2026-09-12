@@ -50,6 +50,18 @@ expect("", Qt.Key_F5, "F5")
 expect("", Qt.Key_F12, "F12")
 ok("function keys F1–F12 map by key code (previously dropped)")
 
+# macOS modifier semantics: Command must act as the host's Ctrl (Cmd+X would
+# otherwise hit the desktop shell's Super shortcuts), Option stays Alt.
+# IS_MAC is a plain module global, so patch it to exercise both branches.
+from unittest import mock    # noqa: E402
+with mock.patch.object(client, "IS_MAC", True):
+    expect("", Qt.Key_Meta, "Control_L")
+    expect("", Qt.Key_Alt, "Alt_L")
+with mock.patch.object(client, "IS_MAC", False):
+    expect("", Qt.Key_Meta, "Super_L")
+    expect("", Qt.Key_Alt, "Alt_L")
+ok("Command forwards as Ctrl on macOS, as Super elsewhere; Option is always Alt")
+
 expect(None, Qt.Key_MediaPlay, None)
 ok("unmapped keys yield None (no packet sent)")
 
