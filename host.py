@@ -349,6 +349,14 @@ try:
 except Exception:
     HAVE_UINPUT = False
 
+if HAVE_UINPUT:
+    # evdev assigns letter codes in physical QWERTY order (KEY_Q=16…KEY_P=25,
+    # KEY_A=30…KEY_L=38, KEY_Z=44…KEY_M=50), not alphabetically, so
+    # KEY_A+offset arithmetic maps almost every letter to a different key
+    # ('q' → KEY_C, 'w' → KEY_DOT, …). Resolve by name instead.
+    _LETTER_KEY = {c: getattr(ecodes, f"KEY_{c.upper()}")
+                   for c in "abcdefghijklmnopqrstuvwxyz"}
+
 try:
     import portal_capture
     HAVE_PORTAL = True
@@ -1887,7 +1895,7 @@ class _UInputInjector:
             if ch in base_chars:
                 return base_chars[ch]
             if ch.isascii() and ch.isalpha():
-                return ec.KEY_A + (ord(ch.lower()) - ord("a"))
+                return _LETTER_KEY[ch.lower()]
             if ch.isdigit() and ch.isascii():
                 return ec.KEY_1 + (int(ch) + 9) % 10   # '1'..'9' -> KEY_1..KEY_9, '0' -> KEY_0
             return None
@@ -1899,18 +1907,19 @@ class _UInputInjector:
                 if code is not None:
                     return code, True
             if ch.isascii() and ch.isalpha():
-                return ec.KEY_A + (ord(ch.lower()) - ord("a")), ch.isupper()
+                return _LETTER_KEY[ch.lower()], ch.isupper()
             if ch.isdigit() and ch.isascii():
                 return (ec.KEY_1 + (int(ch) + 9) % 10), False
             return None, False
         self._char_to_key = _char_to_key
 
         key_caps = set(self._key_map.values()) | set(base_chars.values())
-        key_caps |= {ec.KEY_A + i for i in range(26)}
+        key_caps |= set(_LETTER_KEY.values())
         key_caps |= {ec.KEY_1 + i for i in range(10)}
         key_caps |= {ec.KEY_SPACE, ec.KEY_LEFTSHIFT, ec.KEY_RIGHTSHIFT}
 
         self._vw, self._vh = _virtual_screen_size()
+        self.key_caps = key_caps          # kept for tests; the device itself is write-only
         self.kbd = UInput(
             {ec.EV_KEY: sorted(key_caps)},
             name="LinuxPlay Virtual Keyboard",

@@ -146,6 +146,22 @@ ok("named modifier accepted (Shift_L)")
 assert inj.key("down", "Page_Up") and inj.key("up", "Page_Up")
 ok("named key accepted (Page_Up)")
 
+# evdev letter codes follow physical QWERTY order, not the alphabet: the old
+# KEY_A+offset arithmetic typed "c.gvn" for "qwerty" (q→KEY_C, w→KEY_DOT,
+# y→KEY_RIGHTSHIFT). Every letter must resolve to its real code, and the
+# virtual keyboard must declare all of them.
+from evdev import ecodes as _ec                     # noqa: E402
+assert all(host._LETTER_KEY[c] == getattr(_ec, f"KEY_{c.upper()}")
+           for c in host._LETTER_KEY), "letters must resolve by name, not arithmetic"
+qwerty_order = "qwertyuiopasdfghjklzxcvbnm"
+codes_in_order = [host._LETTER_KEY[c] for c in qwerty_order]
+assert codes_in_order == sorted(codes_in_order), "codes must follow QWERTY key order"
+declared = set(inj.key_caps)
+assert set(host._LETTER_KEY.values()) <= declared, "keyboard must declare every letter"
+assert _ec.KEY_Q in declared, "old capability set missed the whole QWERTY top row"
+assert inj.key("down", "q") and inj.key("up", "q")
+ok("every letter maps to its real evdev code and is declared (q≠KEY_C anymore)")
+
 assert not inj.key("down", "NoSuchKey_zz")
 ok("unknown key name falls through to legacy path")
 
