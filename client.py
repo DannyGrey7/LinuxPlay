@@ -18,6 +18,8 @@ import numpy as np
 import av
 import logging
 import argparse
+import re
+import select
 
 from queue import Queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QMessageBox, QOpenGLWidget,
@@ -139,6 +141,59 @@ def choose_auto_hwaccel():
         if cand in accels:
             return cand
     return "cpu"
+
+
+# How long ffplay may go without advancing its playback clock before we assume
+# the demuxer lost sync and replace it (it can otherwise stay silent forever).
+AUDIO_STALL_SECS = 8.0
+
+_FFPLAY_CLOCK_RES = (
+    re.compile(r"^\s*(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\s+[MA]-[AV]\s*:"),
+    re.compile(r"^\s*(\d+(?:\.\d+)?)\s+[MA]-[AV]\s*:"),
+)
+
+
+def _parse_ffplay_clock(line: str):
+    """Playback position (seconds) from an ffplay status line, else None.
+
+    ffplay rewrites its status line with a carriage return: "  12.34 M-A: ..."
+    or "1:02:03.45 M-A: ...". Seeing it move is our proof that audio is flowing.
+    """
+    for rx in _FFPLAY_CLOCK_RES:
+        m = rx.match(line)
+        if not m:
+            continue
+        try:
+            groups = m.groups()
+            if len(groups) == 3:
+                hours = float(groups[0] or 0)
+                return hours * 3600 + float(groups[1]) * 60 + float(groups[2])
+            return float(groups[0])
+        except Exception:
+            return None
+    return None
+
+
+def _make_hwaccel(hw_type, dev=None):
+    """Build a PyAV HWAccel for this device type, or None if unsupported.
+
+    PyAV >= 12 exposes HWAccel, whose default is_hw_owned=False downloads
+    decoded frames to system memory — exactly what the ndarray render path
+    needs, and unlike a raw hw_device_ctx (whose frames to_ndarray() rejects).
+    Software fallback stays enabled so an unsupported stream still plays.
+    """
+    try:
+        from av.codec.hwaccel import HWAccel, hwdevices_available
+    except Exception:
+        return None
+    try:
+        if hw_type not in set(hwdevices_available() or ()):
+            logging.info("Hardware decode %s not offered by this FFmpeg build.", hw_type)
+            return None
+        return HWAccel(device_type=hw_type, device=dev, allow_software_fallback=True)
+    except Exception as e:
+        logging.warning("Could not create a %s hardware decoder: %s", hw_type, e)
+        return None
 
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     if mtu_guess <= 0:
@@ -602,10 +657,14 @@ def audio_listener(host_ip, enabled=True):
         pass
 
     if max_channels > 2:
-        afilter = f"aresample=matrix_encoding=none,aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'}"
+        afilter = (f"aresample=matrix_encoding=none,"
+                   f"aformat=channel_layouts={'5.1' if max_channels==6 else '7.1'},"
+                   f"aresample=async=1:first_pts=0")
         logging.info(f"Detected {max_channels}-channel output device — enabling surround audio.")
     else:
-        afilter = "aresample=matrix_encoding=none,pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC"
+        afilter = ("aresample=matrix_encoding=none,"
+                   "pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC,"
+                   "aresample=async=1:first_pts=0")
         logging.info("Stereo-only output detected — downmixing surround audio.")
 
     def loop():
@@ -617,8 +676,10 @@ def audio_listener(host_ip, enabled=True):
                 "ffplay",
                 "-hide_banner", "-loglevel", "info",
                 "-nodisp", "-autoexit",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
+                # No -fflags nobuffer here: starving Opus of buffering is what
+                # made audio glitch on a jittery link. The async resampler in
+                # -af absorbs drift and the odd lost packet instead.
+                "-fflags", "+discardcorrupt",
                 "-af", afilter,
                 "-f", "mpegts",
                 url,
@@ -629,12 +690,54 @@ def audio_listener(host_ip, enabled=True):
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    universal_newlines=True
+                    bufsize=0            # binary: the reader below parses bytes
                 )
-                for line in audio_proc.stdout:
-                    if "Audio" in line:
-                        logging.info(line.strip())
-                audio_proc.wait()
+                last_clock = None
+                last_progress = time.time()
+                buf = b""
+                while True:
+                    ready, _, _ = select.select([audio_proc.stdout], [], [], 1.0)
+                    if not ready:
+                        if (last_clock is not None
+                                and time.time() - last_progress > AUDIO_STALL_SECS):
+                            logging.warning(
+                                "Audio stalled for %.0fs (clock stuck at %.1fs) — restarting the player.",
+                                AUDIO_STALL_SECS, last_clock)
+                            try:
+                                # Release UDP 6001 before the restart, or the
+                                # replacement player would receive nothing.
+                                audio_proc.terminate()
+                            except Exception:
+                                pass
+                            break
+                        if audio_proc.poll() is not None:
+                            break
+                        continue
+                    chunk = audio_proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while True:
+                        m = re.search(rb"[\r\n]", buf)
+                        if not m:
+                            break
+                        line = buf[:m.start()].decode("utf-8", errors="replace").strip()
+                        buf = buf[m.end():]
+                        if not line:
+                            continue
+                        clock = _parse_ffplay_clock(line)
+                        if clock is not None:
+                            if last_clock is None:
+                                logging.info("Audio stream detected — playout clock running.")
+                            last_clock, last_progress = clock, time.time()
+                        elif "Audio:" in line:
+                            logging.info(line)
+                    if buf and len(buf) > 8192:      # runaway line: drop it
+                        buf = b""
+                try:
+                    audio_proc.wait(timeout=2)
+                except Exception:
+                    pass
             except Exception as e:
                 logging.error("Audio listener failed: %s", e)
             finally:
@@ -643,7 +746,8 @@ def audio_listener(host_ip, enabled=True):
                 break
             restarts += 1
             log = logging.warning if restarts <= 2 else logging.debug
-            log("Audio player exited — restarting in 1s (glitch recovery, restart #%d).", restarts)
+            log("Audio player exited — restarting in 1s (glitch recovery, restart #%d).",
+                restarts)
             audio_stop.wait(1.0)
 
     t = threading.Thread(target=loop, daemon=True)
@@ -732,9 +836,13 @@ class DecoderThread(QThread):
         self._has_first_frame = False
         self._hw_name = None
         self.counters = StreamCounters()
+        self._hwaccel = None
 
     def _open_container(self):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
+        if self._hwaccel is not None:
+            return av.open(self.input_url, format="mpegts",
+                           options=self.decoder_opts, hwaccel=self._hwaccel)
         return av.open(self.input_url, format="mpegts", options=self.decoder_opts)
 
     def run(self):
@@ -799,11 +907,23 @@ class DecoderThread(QThread):
                             self._hw_name = hw_type_norm
                             logging.info(f"DecoderThread: Using hardware decode via {hw_type_norm} ({dev or 'auto'})")
                         else:
-                            logging.warning(f"PyAV build lacks HwDeviceContext; using software decode for {hw_type_norm}.")
-                            self._hw_name = "CPU"
-                            self.decoder_opts.pop("hwaccel", None)
-                            self.decoder_opts.pop("hwaccel_device", None)
+                            raise RuntimeError("PyAV build has no HwDeviceContext")
                     except Exception as e:
+                        # Modern PyAV (>=12) route: HWAccel downloads frames to
+                        # system memory unless is_hw_owned=True, so the ndarray
+                        # render path keeps working. Needs the container to be
+                        # reopened with hwaccel=..., hence the continue.
+                        accel = _make_hwaccel(hw_type_norm, dev)
+                        if accel is not None and self._hwaccel is None:
+                            self._hwaccel = accel
+                            self._hw_name = hw_type_norm
+                            logging.info("DecoderThread: using %s hardware decode via "
+                                         "PyAV HWAccel (%s).", hw_type_norm, e)
+                            try:
+                                container.close()
+                            except Exception:
+                                pass
+                            continue
                         logging.warning(f"Hardware decode init failed for {hw_type_norm}: {e}")
                         self._hw_name = "CPU"
                         self.decoder_opts.pop("hwaccel", None)
@@ -878,7 +998,8 @@ class DecoderThread(QThread):
                     self._last_error = err
 
                 if not self._sw_fallback_done and "hwaccel" in self.decoder_opts:
-                    logging.warning("HW decode failed — switching to CPU.")
+                    logging.warning("HW decode failed (%s) — switching to CPU.", err)
+                    self._hwaccel = None
                     self.decoder_opts.pop("hwaccel", None)
                     self.decoder_opts.pop("hwaccel_device", None)
                     self._sw_fallback_done = True
@@ -2115,15 +2236,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        global audio_proc
-        audio_stop.set()
-        if audio_proc:
-            try:
-                audio_proc.terminate()
-                audio_proc.wait(timeout=2)
-            except Exception as e:
-                logging.error(f"ffplay term error: {e}")
-            audio_proc = None
+        if remaining == 0:
+            # One ffplay serves every monitor window, so only the last window
+            # may stop it — closing one of several must not kill audio for all.
+            global audio_proc
+            audio_stop.set()
+            if audio_proc:
+                try:
+                    audio_proc.terminate()
+                    audio_proc.wait(timeout=2)
+                except Exception as e:
+                    logging.error(f"ffplay term error: {e}")
+                audio_proc = None
 
         try:
             self.control_sock.close()

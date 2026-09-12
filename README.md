@@ -70,6 +70,9 @@ Thanks for believing in something made by one person, from scratch, with actual 
 - **Audio Features**
   - Surround Sound Support (5.1 / 7.1): Host detects and captures up to 8 audio channels.
   - Client performs intelligent downmixing (FFplay filters) to stereo for local speakers when necessary.
+  - Playback is drift/gap tolerant (`aresample=async=1`) — no more jitter on a lossy link — and a
+    watchdog restarts the player if its playout clock stops advancing, instead of going silent
+    for the rest of the session.
 - **Granular Encoder Control**
   - Direct control over FFmpeg parameters: **GOP, QP/CRF, Preset, Tune, and Pixel Format (`yuv420p`, `yuv444p`)** are fully exposed via command line arguments.
 - **Advanced Capture Methods**
@@ -224,6 +227,10 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
 ```
 
 - `--hwaccel auto` selects **VideoToolbox** decoding when available (CPU fallback is automatic).
+  The decoder is built by the **PyAV wheel's own FFmpeg**, which must offer the device — the client
+  log says exactly what was negotiated: `Hardware decode <type> not offered by this FFmpeg build.`
+  means that wheel can't do it and decoding stays on the CPU. The stats overlay shows the decoder
+  in use (`decode CPU` vs `decode videotoolbox`).
 - `./run.sh check` / `./run.sh client ...` also work on macOS — the bootstrap detects Homebrew and skips Linux-only pieces.
 - Controller (gamepad) forwarding is not yet available on macOS; keyboard/mouse, video, audio, clipboard and certificate auth all work.
 - `ffplay` for audio playback ships with Homebrew's `ffmpeg`.
@@ -369,6 +376,11 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
   this to the active seat user). The gamepad server uses the same mechanism.
 - **Audio / clipboard**: unchanged — PipeWire exposes PulseAudio compatibility on Wayland
   desktops, so `pactl` / `-f pulse` keep working.
+- **Capture rate**: the portal path is damage-driven and a single PipeWire consumer tops out at
+  roughly 50 fps even at 2560x1440 (measured: ~48 fps with or without `videoconvert`, and two
+  consumers get ~95 fps between them). Setting `--framerate 60` therefore encodes ~45-50 fps and
+  the overlay's *encoder out* fps is the honest number; nothing is lost client-side if *decode* fps
+  matches it. Reaching a true 60 fps needs a different capture path (`kmsgrab`).
 - **Limitations**: each monitor must be selected in the portal dialog for multi-monitor
   streaming; NVIDIA kmsgrab users may need `nvidia-drm.modeset=1`.
 
