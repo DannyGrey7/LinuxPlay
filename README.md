@@ -420,6 +420,14 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
 - To revoke:
   - Edit or remove entries in `trusted_clients.json` on the host (read at handshake time),
     or set `"status": "revoked"` on the record.
+- If a client asks for the PIN even though it was paired:
+  - Enter the PIN — the client asks the host for a replacement certificate during that
+    pairing, so the next connection skips the PIN again. A replaced pair is kept on the
+    client as `client_cert.pem.replaced-<timestamp>` / `client_key.pem.replaced-<timestamp>`.
+  - The host log names the check that failed, e.g. `[AUTH] Certificate proof from …: signature
+    over the challenge does not match the certificate's key` (the client's key and
+    certificate no longer belong together) or `… does not match the offered fingerprint`
+    (the host no longer trusts that certificate).
 
 ---
 

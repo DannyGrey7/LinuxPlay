@@ -360,6 +360,16 @@ def _install_issued_cert(cert_b64, private_key):
         here = os.path.dirname(os.path.abspath(__file__))
         cert_path = os.path.join(here, "client_cert.pem")
         key_path = os.path.join(here, "client_key.pem")
+        if os.path.exists(cert_path) or os.path.exists(key_path):
+            # Replacing credentials that stopped working — keep the old pair so
+            # a re-pair can be undone by hand.
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            for old in (cert_path, key_path):
+                if os.path.exists(old):
+                    try:
+                        os.replace(old, f"{old}.replaced-{stamp}")
+                    except OSError:
+                        pass
         with open(cert_path, "wb") as f:
             f.write(base64.b64decode(cert_b64))
         with open(key_path, "wb") as f:
@@ -373,6 +383,96 @@ def _install_issued_cert(cert_b64, private_key):
         logging.info("Host issued a client certificate — future connections will skip the PIN.")
     except Exception as e:
         logging.warning("Could not save issued certificate: %s", e)
+
+def _credential_problem(cert_path, key_path):
+    """Why the stored certificate/key pair cannot authenticate ("" if it can).
+
+    A pair that does not belong together still signs happily, so the failure
+    only shows up as the host rejecting every proof — worth catching here.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        with open(key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+    except Exception as e:
+        return f"stored certificate or key is unreadable ({e.__class__.__name__}, {e})"
+    if cert.public_key().public_numbers() != key.public_key().public_numbers():
+        return "client_key.pem does not match client_cert.pem"
+    return ""
+
+def _recv_handshake_reply(sock, want_tokens=0, idle=0.4, max_bytes=65536):
+    """Read a handshake reply that may arrive in several TCP segments.
+
+    Stops at EOF, at a newline, once `want_tokens` fields have arrived, or after
+    `idle` seconds of silence. A lone recv() can return half a reply — the host's
+    answer carries a certificate (~1.5 KB) when it issues one — and half a reply
+    parses as a failure.
+    """
+    buf = b""
+    while len(buf) < max_bytes:
+        if b"\n" in buf or (want_tokens and len(buf.split()) >= want_tokens):
+            break
+        if buf and not select.select([sock], [], [], idle)[0]:
+            break
+        try:
+            chunk = sock.recv(min(4096, max_bytes - len(buf)))
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("utf-8", errors="replace").strip()
+
+def _try_cert_handshake(host_ip, cert_path, key_path):
+    """Authenticate with the stored certificate on a connection of its own.
+
+    Returns (ok, info, rejected): `rejected` means the host turned down the
+    credential itself (rather than the network failing), so pairing should ask
+    for a replacement. The socket is always closed — a host that rejects a proof
+    closes its end, and the PIN handshake that follows needs a live connection.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(8)
+    try:
+        fp_hex = _read_pem_cert_fingerprint(cert_path)
+        if not fp_hex:
+            return (False, None, False)
+        sock.connect((host_ip, TCP_HANDSHAKE_PORT))
+        sock.sendall(f'HELLO CERTFP:{fp_hex}\n'.encode('utf-8'))
+        resp = _recv_handshake_reply(sock, want_tokens=2)
+        if resp.startswith('CHALLENGE '):
+            nonce_hex = resp.split(None, 1)[1].strip()
+            proof = _build_client_proof(cert_path, key_path, nonce_hex)
+            if proof is None:
+                logging.warning('Stored certificate found but signing failed — falling back to PIN.')
+                return (False, None, False)
+            sock.sendall((proof + "\n").encode('utf-8'))
+            resp = _recv_handshake_reply(sock)
+        logging.debug('Cert handshake response: %s', resp.splitlines()[0] if resp else '(empty)')
+        if resp.startswith('OK:'):
+            info, token, _cert = _parse_ok_response(resp)
+            if token:
+                CLIENT_STATE['token'] = token
+            CLIENT_STATE['connected'] = True
+            CLIENT_STATE['last_heartbeat'] = time.time()
+            logging.info('Authenticated via client certificate (FP %s…) — PIN skipped', fp_hex[:12])
+            return (True, info, False)
+        if resp.startswith('FAIL:UNTRUSTEDCERT'):
+            logging.warning('Host does not accept this certificate — falling back to PIN.')
+            return (False, None, True)
+        logging.warning('Unexpected response to certificate auth (%s) — falling back to PIN', resp)
+        return (False, None, False)
+    except Exception as e:
+        logging.debug('Certificate auth failed: %s — falling back to PIN', e)
+        return (False, None, False)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 def _make_keyreq():
     """Generate a fresh client keypair; returns (keyreq_b64, private_key) or (None, None)."""
@@ -391,48 +491,34 @@ def _make_keyreq():
 def tcp_handshake_client(host_ip, pin=None, interactive=True):
     from PyQt5.QtWidgets import QLineEdit
 
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        cert_path = os.path.join(here, 'client_cert.pem')
+        key_path  = os.path.join(here, 'client_key.pem')
+    except Exception:
+        cert_path = 'client_cert.pem'; key_path = 'client_key.pem'
+
+    # Try the stored certificate first, on a connection of its own: the host
+    # closes its end when it rejects a proof, and reusing that socket is what
+    # turned a stale certificate into "broken pipe" instead of a PIN prompt.
+    need_fresh_credentials = not (os.path.exists(cert_path) and os.path.exists(key_path))
+    if not need_fresh_credentials:
+        problem = _credential_problem(cert_path, key_path)
+        if problem:
+            logging.warning('%s — asking the host for a new one during pairing.', problem)
+            need_fresh_credentials = True
+        else:
+            ok, info, rejected = _try_cert_handshake(host_ip, cert_path, key_path)
+            if ok:
+                return (True, info)
+            need_fresh_credentials = rejected
+            logging.info('Continuing with the PIN handshake on a fresh connection.')
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(8)
     try:
         logging.info("Handshake to %s:%s", host_ip, TCP_HANDSHAKE_PORT)
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
-        try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            cert_path = os.path.join(here, 'client_cert.pem')
-            key_path  = os.path.join(here, 'client_key.pem')
-        except Exception:
-            cert_path = 'client_cert.pem'; key_path = 'client_key.pem'
-        if os.path.exists(cert_path) and os.path.exists(key_path):
-            fp_hex = _read_pem_cert_fingerprint(cert_path)
-            if fp_hex:
-                try:
-                    sock.sendall(f'HELLO CERTFP:{fp_hex}'.encode('utf-8'))
-                    resp = sock.recv(4096).decode('utf-8', errors='replace').strip()
-                    if resp.startswith('CHALLENGE '):
-                        nonce_hex = resp.split(None, 1)[1].strip()
-                        proof = _build_client_proof(cert_path, key_path, nonce_hex)
-                        if proof is None:
-                            logging.warning('Host requires certificate proof but signing failed — falling back to PIN.')
-                        else:
-                            sock.sendall(proof.encode('utf-8'))
-                            resp = sock.recv(8192).decode('utf-8', errors='replace').strip()
-                    logging.debug('Cert handshake response: %s', resp.splitlines()[0] if resp else '(empty)')
-                    if resp.startswith('OK:'):
-                        info, token, _cert = _parse_ok_response(resp)
-                        if token:
-                            CLIENT_STATE['token'] = token
-                        sock.close()
-                        CLIENT_STATE['connected'] = True
-                        CLIENT_STATE['last_heartbeat'] = time.time()
-                        logging.info('Authenticated via client certificate (FP %s…) — PIN skipped', fp_hex[:12])
-                        return (True, info)
-                    elif resp.startswith('FAIL:UNTRUSTEDCERT'):
-                        logging.warning('Client cert not yet trusted by host — falling back to PIN.')
-                    else:
-                        logging.warning('Unexpected response to CERTFP auth (%s) — falling back to PIN', resp)
-                except Exception as _e:
-                    logging.debug('CERTFP path failed: %s — falling back to PIN', _e)
-
         code = (pin or "").strip()
         if not code or len(code) != 6 or not code.isdigit():
             if not interactive:
@@ -463,11 +549,12 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
                     QMessageBox.critical(None, "Invalid PIN", "PIN entry was cancelled or invalid.")
                 return (False, None)
 
-        # First-time pairing: offer the host our public key so it can issue a
-        # certificate we store locally — the private key never leaves this machine.
+        # First-time pairing, or replacing credentials the host stopped
+        # accepting: offer the host our public key so it can issue a certificate
+        # we store locally — the private key never leaves this machine.
         generated_key = None
         keyreq_line = ""
-        if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+        if need_fresh_credentials:
             keyreq_b64, generated_key = _make_keyreq()
             if keyreq_b64:
                 keyreq_line = "\nKEYREQ " + keyreq_b64
@@ -475,8 +562,8 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
         # The host asks its own user to approve a first-time pairing, so this
         # wait can be much longer than the 8s connect/handshake timeout.
         sock.settimeout(PAIR_APPROVAL_TIMEOUT + 15)
-        sock.sendall(f"HELLO {code}{keyreq_line}".encode("utf-8"))
-        resp = sock.recv(8192).decode("utf-8", errors="replace").strip()
+        sock.sendall(f"HELLO {code}{keyreq_line}\n".encode("utf-8"))
+        resp = _recv_handshake_reply(sock)
         logging.debug("Handshake response: %s", resp.splitlines()[0] if resp else '(empty)')
 
         if resp.startswith("OK:"):

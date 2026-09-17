@@ -16,6 +16,7 @@ import datetime
 import platform as py_platform
 import re
 import secrets
+import select
 import base64
 import hmac
 
@@ -50,6 +51,9 @@ PIN_LOCKOUT_MAX  = 900.0
 
 # How long the local user has to approve pairing a brand-new device (GUI hosts).
 PAIR_APPROVAL_TIMEOUT = 45.0
+
+# Upper bound on one handshake message we will buffer from a peer.
+HANDSHAKE_MSG_MAX = 65536
 
 # A failing encoder is restarted with backoff instead of stopping the host.
 STREAM_MAX_RESTARTS = 5
@@ -272,29 +276,46 @@ if HAVE_CRYPTO:
         salt_length=_x509_padding.PSS.MAX_LENGTH,
     )
 
-def _verify_client_proof(fp_hex, cert_b64, sig_b64, nonce):
+def _verify_client_proof_detailed(fp_hex, cert_b64, sig_b64, nonce):
     """Verify the client owns the private key of a trusted certificate.
 
     Checks, in order: the offered cert's SHA-256 fingerprint matches the
     trusted fingerprint, the cert was signed by this host's CA, and the
     signature over the fresh nonce verifies with the cert's public key.
+
+    Returns (ok, reason); `reason` names the check that failed, so a rejected
+    pairing can be told apart from a stale client key or a mangled message.
     """
     if not HAVE_CRYPTO or not nonce:
-        return False
+        return False, "cryptography unavailable or no challenge nonce"
     try:
         cert = x509.load_pem_x509_certificate(base64.b64decode(cert_b64), default_backend())
-        if cert.fingerprint(hashes.SHA256()).hex().upper() != fp_hex:
-            return False
+    except Exception as e:
+        return False, f"certificate could not be parsed ({e.__class__.__name__})"
+    if cert.fingerprint(hashes.SHA256()).hex().upper() != fp_hex:
+        return False, "offered certificate does not match the offered fingerprint"
+    try:
         with open(CA_CERT, "rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+    except Exception:
+        return False, f"host CA certificate could not be read ({CA_CERT})"
+    try:
         ca_cert.public_key().verify(
             cert.signature, cert.tbs_certificate_bytes,
             _x509_padding.PKCS1v15(), cert.signature_hash_algorithm,
         )
-        cert.public_key().verify(base64.b64decode(sig_b64), nonce, _PSS_PADDING, hashes.SHA256())
-        return True
     except Exception:
-        return False
+        return False, "certificate was not signed by this host's CA"
+    try:
+        cert.public_key().verify(base64.b64decode(sig_b64), nonce, _PSS_PADDING, hashes.SHA256())
+    except Exception:
+        return False, "signature over the challenge does not match the certificate's key"
+    return True, ""
+
+
+def _verify_client_proof(fp_hex, cert_b64, sig_b64, nonce):
+    """_verify_client_proof_detailed without the failure reason."""
+    return _verify_client_proof_detailed(fp_hex, cert_b64, sig_b64, nonce)[0]
 
 def _token_ok(token) -> bool:
     cur = host_state.session_token
@@ -2161,6 +2182,39 @@ def _inject_key(action, name):
         except Exception as e:
             logging.debug("xdotool key %s failed for %r: %s", action, name, e)
 
+def _recv_handshake_msg(conn, want_tokens=2, max_bytes=HANDSHAKE_MSG_MAX, max_secs=15.0):
+    """Read one handshake message, tolerating TCP segmentation.
+
+    A single recv() can return part of a message: the client's proof line is
+    ~1.7 KB (certificate + signature), so it spans more than one TCP segment on
+    any real path and the tail may still be in flight when we look. Reading that
+    as if it were complete makes a valid proof look corrupted, so keep reading
+    until the message is complete — a newline, or `want_tokens` whitespace
+    separated fields — and stop at max_bytes/max_secs so a hostile peer cannot
+    make us buffer, or wait, without bound.
+    """
+    buf = b""
+    deadline = time.monotonic() + max_secs
+    while len(buf) < max_bytes and time.monotonic() < deadline:
+        if want_tokens and len(buf.split()) >= want_tokens:
+            # The rest of a multi-part message (e.g. a KEYREQ line after the
+            # PIN) normally rides in the same segment; take what has arrived
+            # before calling the message complete.
+            while (len(buf) < max_bytes
+                   and select.select([conn], [], [], 0)[0]):
+                chunk = conn.recv(min(4096, max_bytes - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+            break
+        if b"\n" in buf:
+            break
+        chunk = conn.recv(min(4096, max_bytes - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("utf-8", errors="replace").strip()
+
 def _send_and_close(conn, payload: bytes):
     try:
         conn.sendall(payload)
@@ -2211,15 +2265,18 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
     nonce = secrets.token_bytes(32)
     try:
         conn.sendall(b"CHALLENGE " + nonce.hex().encode("utf-8"))
-        resp = conn.recv(8192).decode("utf-8", errors="replace").strip()
+        resp = _recv_handshake_msg(conn, want_tokens=4)
     except Exception as e:
         logging.warning(f"[AUTH] Challenge exchange with {peer_ip} failed: {e}")
         _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
         return
 
     parts = resp.split()
-    if (len(parts) == 4 and parts[0] == "CERT" and parts[2] == "SIG"
-            and _verify_client_proof(fp_hex, parts[1], parts[3], nonce)):
+    if len(parts) == 4 and parts[0] == "CERT" and parts[2] == "SIG":
+        ok, reason = _verify_client_proof_detailed(fp_hex, parts[1], parts[3], nonce)
+    else:
+        ok, reason = False, f"proof line truncated or malformed ({len(parts)} fields)"
+    if ok:
         with host_state.pin_lock:
             if host_state.session_active:
                 _send_and_close(conn, b"BUSY:ACTIVESESSION")
@@ -2230,7 +2287,7 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
         set_pin_display(f"Session live: {peer_ip} — PIN paused")
         logging.info(f"[AUTH] Client {peer_ip} authenticated via certificate proof.")
     else:
-        logging.warning(f"[AUTH] Certificate proof from {peer_ip} failed verification.")
+        logging.warning(f"[AUTH] Certificate proof from {peer_ip} failed verification: {reason}.")
         _send_and_close(conn, b"FAIL:UNTRUSTEDCERT")
 
 def _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=""):
@@ -2304,7 +2361,7 @@ def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
     conn.settimeout(5.0)
     try:
         try:
-            raw = conn.recv(4096).decode("utf-8", errors="replace").strip()
+            raw = _recv_handshake_msg(conn, want_tokens=2)
         except (socket.timeout, OSError):
             return
         parts = (raw or "").split()
