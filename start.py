@@ -2,6 +2,7 @@
 import sys
 import os
 import json
+import re
 import argparse
 import logging
 import subprocess
@@ -287,6 +288,24 @@ class HostTab(QWidget):
             "300", 
             "360"
         ])
+        self.resolutionCombo = QComboBox()
+        self.resolutionCombo.setEditable(True)
+        self.resolutionCombo.addItems([
+            "Native (desktop)",
+            "1920x1200",
+            "1920x1080",
+            "1600x1000",
+            "1600x900",
+            "1280x800",
+            "1280x720",
+            "1024x768",
+        ])
+        self.resolutionCombo.setToolTip(
+            "Size the host encodes at. The capture is scaled to it before encoding, "
+            "so a smaller stream cuts bandwidth and CPU on both ends. 'Native (desktop)' "
+            "streams each monitor at its own resolution. A size with a different aspect "
+            "ratio stretches the picture — the host log names a matching one."
+        )
         self.bitrateCombo = QComboBox()
         self.bitrateCombo.addItems([
             "0", 
@@ -450,6 +469,7 @@ class HostTab(QWidget):
         form_layout.addRow("Encoder (codec):", self.encoderCombo)
         form_layout.addRow("Encoder Backend:", self.hwencCombo)
         form_layout.addRow("Framerate:", self.framerateCombo)
+        form_layout.addRow("Stream Size:", self.resolutionCombo)
         form_layout.addRow("Max Bitrate:", self.bitrateCombo)
         form_layout.addRow("Audio:", self.audioCombo)
         form_layout.addRow("Audio Mode:", self.audioModeCombo)
@@ -672,6 +692,20 @@ class HostTab(QWidget):
         adaptive = self.adaptiveCheck.isChecked()
         display = self.displayCombo.currentText()
 
+        resolution = self.resolutionCombo.currentText().strip()
+        if resolution.lower() in ("", "native", "native (desktop)", "auto", "desktop"):
+            resolution = "native"
+        elif not re.fullmatch(r"\d{2,5}x\d{2,5}", resolution.lower()):
+            QMessageBox.warning(
+                self,
+                "Stream size not understood",
+                f"'{resolution}' is not a size like 1920x1080.\n\n"
+                "Pick one from the list or type it as WIDTHxHEIGHT "
+                "(or 'Native (desktop)' to stream each monitor as-is).",
+            )
+            self._update_buttons()
+            return
+
         preset = "" if self.presetCombo.currentText() in ("Default", "None") else self.presetCombo.currentText()
         gop = self.gopCombo.currentText()
         qp_val = self.qpCombo.currentText()
@@ -688,6 +722,7 @@ class HostTab(QWidget):
             "--gui",
             "--encoder", encoder,
             "--framerate", framerate,
+            "--resolution", resolution,
             "--bitrate", bitrate,
             "--audio", audio,
             "--pix_fmt", pix_fmt,
@@ -783,6 +818,7 @@ class HostTab(QWidget):
             "encoder": self.encoderCombo.currentText(),
             "hwenc": self.hwencCombo.currentData() or "auto",
             "framerate": self.framerateCombo.currentText(),
+            "resolution": self.resolutionCombo.currentText(),
             "bitrate": self.bitrateCombo.currentText(),
             "audio": self.audioCombo.currentText(),
             "audio_mode": self.audioModeCombo.currentText(),
@@ -815,6 +851,9 @@ class HostTab(QWidget):
         if idx != -1:
             self.hwencCombo.setCurrentIndex(idx)
         set_combo(self.framerateCombo, cfg.get("framerate"))
+        if cfg.get("resolution"):
+            # Editable combo: a saved custom size need not be in the list.
+            self.resolutionCombo.setCurrentText(cfg["resolution"])
         set_combo(self.bitrateCombo, cfg.get("bitrate"))
         set_combo(self.audioCombo, cfg.get("audio"))
         set_combo(self.audioModeCombo, cfg.get("audio_mode", "Voice (low-latency)"))

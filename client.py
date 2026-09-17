@@ -336,22 +336,38 @@ def _build_client_proof(cert_path, key_path, nonce_hex):
         logging.debug("Could not build certificate proof: %s", e)
         return None
 
-def _parse_ok_response(resp):
-    """Parse 'OK:<encoder>:<monitors>\\nTOKEN <hex>[\\nCERT <b64>]' responses.
+def _size_from_text(text, default=None):
+    """'1920x1080' -> (1920, 1080); anything else -> default."""
+    try:
+        w, h = str(text).strip().lower().split("x", 1)
+        w, h = int(w), int(h)
+        if w > 0 and h > 0:
+            return (w, h)
+    except Exception:
+        pass
+    return default
 
-    Returns ((encoder, monitors), token, cert_b64).
+def _parse_ok_response(resp):
+    """Parse 'OK:<encoder>:<monitors>\\nTOKEN <hex>[\\nSTREAM <WxH>][\\nCERT <b64>]'.
+
+    Returns ((encoder, monitors, stream), token, cert_b64). `stream` is the size
+    the video arrives at when the host scales the capture ("" = one pixel per
+    desktop pixel); the click mapping needs it to tell video pixels from desktop
+    coordinates.
     """
     lines = [l.strip() for l in resp.splitlines() if l.strip()]
     parts = lines[0].split(":", 2)
     host_encoder = parts[1].strip() if len(parts) > 1 else "none"
     monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-    token, cert_b64 = "", ""
+    token, cert_b64, stream = "", "", ""
     for ln in lines[1:]:
         if ln.startswith("TOKEN "):
             token = ln.split(None, 1)[1].strip()
+        elif ln.startswith("STREAM "):
+            stream = ln.split(None, 1)[1].strip()
         elif ln.startswith("CERT "):
             cert_b64 = ln.split(None, 1)[1].strip()
-    return (host_encoder, monitor_info), token, cert_b64
+    return (host_encoder, monitor_info, stream), token, cert_b64
 
 def _install_issued_cert(cert_b64, private_key):
     """Save a host-issued certificate (from a KEYREQ handshake) next to this script."""
@@ -1492,7 +1508,7 @@ def pick_best_renderer():
 
 class VideoWidgetGL(QOpenGLWidget):
     def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip,
-                 parent=None, toggle_overlay=None):
+                 parent=None, toggle_overlay=None, desktop_size=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1505,6 +1521,9 @@ class VideoWidgetGL(QOpenGLWidget):
         self.toggle_overlay = toggle_overlay
         self.texture_width = rwidth
         self.texture_height = rheight
+        # Clicks travel in desktop coordinates, which only match video pixels
+        # when the host streams at native size (--resolution scales the capture).
+        self.desktop_width, self.desktop_height = desktop_size or (rwidth, rheight)
         self.offset_x = offset_x
         self.offset_y = offset_y
         self.frame_data = None
@@ -1821,8 +1840,10 @@ class VideoWidgetGL(QOpenGLWidget):
         nx = min(max(nx, 0.0), 1.0)
         ny = min(max(ny, 0.0), 1.0)
 
-        rx = self.offset_x + int(nx * fw)
-        ry = self.offset_y + int(ny * fh)
+        # Normalised position of the video maps onto the desktop, whatever size
+        # the host chose to stream at.
+        rx = self.offset_x + int(nx * self.desktop_width)
+        ry = self.offset_y + int(ny * self.desktop_height)
         return rx, ry
 
     def mousePressEvent(self, e):
@@ -2194,7 +2215,7 @@ class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
                  gamepad="disable", gamepad_dev=None, pin=None, audio=True,
-                 stats_visible=False):
+                 stats_visible=False, desktop_size=None):
         super().__init__(parent)
 
         self.window_id = SESSION.register()
@@ -2219,7 +2240,8 @@ class MainWindow(QMainWindow):
 
         self.video_widget = VideoWidgetGL(self.send_control, rwidth, rheight,
                                           offset_x, offset_y, host_ip,
-                                          toggle_overlay=self.toggle_stats)
+                                          toggle_overlay=self.toggle_stats,
+                                          desktop_size=desktop_size)
         self.setCentralWidget(self.video_widget)
         self.video_widget.setFocus()
         self.setAcceptDrops(True)
@@ -2718,9 +2740,13 @@ def main():
     if not ok or not host_info:
         QMessageBox.critical(None, "Handshake Failed", "Could not negotiate with host.")
         sys.exit(1)
-    host_encoder, monitor_info_str = host_info
+    host_encoder, monitor_info_str = host_info[0], host_info[1]
+    stream_size = _size_from_text(host_info[2]) if len(host_info) > 2 else None
     CLIENT_STATE["connected"] = True
     CLIENT_STATE["last_heartbeat"] = time.time()
+    logging.info("Host streams %s; desktop %s",
+                 f"{stream_size[0]}x{stream_size[1]}" if stream_size else "at native size",
+                 monitor_info_str)
 
     net_mode = args.net
     if net_mode == "auto":
@@ -2780,10 +2806,12 @@ def main():
     windows = []
     if args.monitor.lower() == "all":
         for i, (w, h, ox, oy) in enumerate(monitors):
-            win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + i,
+            win = MainWindow(decoder_opts, *(stream_size or (w, h)), args.host_ip,
+                             DEFAULT_UDP_PORT + i,
                              ox, oy, net_mode, ultra=ultra_active,
                              gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
-                             audio=(args.audio == "enable"), stats_visible=args.stats)
+                             audio=(args.audio == "enable"), stats_visible=args.stats,
+                             desktop_size=(w, h))
             win.setWindowTitle(f"LinuxPlay — Monitor {i}")
             win.show()
             windows.append(win)
@@ -2795,10 +2823,12 @@ def main():
         if idx < 0 or idx >= len(monitors):
             idx = 0
         w, h, ox, oy = monitors[idx]
-        win = MainWindow(decoder_opts, w, h, args.host_ip, DEFAULT_UDP_PORT + idx,
+        win = MainWindow(decoder_opts, *(stream_size or (w, h)), args.host_ip,
+                         DEFAULT_UDP_PORT + idx,
                          ox, oy, net_mode, ultra=ultra_active,
                          gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
-                         audio=(args.audio == "enable"), stats_visible=args.stats)
+                         audio=(args.audio == "enable"), stats_visible=args.stats,
+                         desktop_size=(w, h))
         win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
         win.show()
         windows.append(win)

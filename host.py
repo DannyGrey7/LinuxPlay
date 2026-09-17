@@ -63,6 +63,9 @@ DEFAULT_FPS = "30"
 LEGACY_BITRATE = "8M"
 DEFAULT_RES = "1920x1080"
 
+# --resolution values that mean "stream each monitor at its own size".
+NATIVE_RESOLUTION_ALIASES = ("", "native", "auto", "desktop", "off", "0", "0x0")
+
 IS_LINUX   = py_platform.system() == "Linux"
 
 HEARTBEAT_INTERVAL = 1.0
@@ -423,6 +426,8 @@ class HostState:
         self.authed_client_ip = None
         self.pin_code = None
         self.pin_expiry = 0.0
+        # Fixed stream size (--resolution) or None to capture monitors as-is.
+        self.stream_size = None
         self.pin_lock = threading.Lock()
         self.audio_thread = None
         self.current_bitrate = LEGACY_BITRATE
@@ -1587,18 +1592,55 @@ def _pick_kms_device():
             return p
     return "/dev/dri/card0"
 
-def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None):
+def _prepend_filter(extra_filters, prefix):
+    """Insert `prefix,` at the front of a filter list's -vf value (or add one)."""
+    out = list(extra_filters or [])
+    for i in range(len(out) - 1):
+        if out[i] == "-vf":
+            out[i + 1] = f"{prefix},{out[i + 1]}"
+            return out
+    return out + ["-vf", prefix]
+
+
+def _parse_resolution(value):
+    """Parse a stream size: 'WxH' -> (w, h); a native/auto alias or junk -> None.
+
+    None means "capture each monitor at its own resolution" — the historic
+    behaviour, and the only one that needs no scaling anywhere.
+    """
+    s = str(value or "").strip().lower()
+    if s in NATIVE_RESOLUTION_ALIASES:
+        return None
+    m = re.fullmatch(r"(\d{2,5})x(\d{2,5})", s)
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    if 16 <= w <= 16384 and 16 <= h <= 16384:
+        return (w, h)
+    return None
+
+
+def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None, stream_size=None):
     try:
         fps_i = int(str(args.framerate))
     except Exception:
         fps_i = 60
 
     w, h, ox, oy = monitor_info
+    # cap_* is what the encoder is fed: the monitor's own size unless the user
+    # asked for a fixed stream size, in which case the capture is rescaled.
+    cap_w, cap_h = stream_size or (w, h)
+    if (cap_w, cap_h) != (w, h) and abs((cap_w / cap_h) - (w / h)) / (w / h) > 0.02:
+        logging.warning(
+            "Stream size %dx%d has a different aspect ratio than the %dx%d monitor — "
+            "the picture will be stretched. %dx%d keeps it 1:1.",
+            cap_w, cap_h, w, h, cap_w, int(round(cap_w * h / w))
+        )
     preset = args.preset.strip().lower() if args.preset else ""
     gop, qp, tune, pix_fmt = args.gop, args.qp, args.tune, args.pix_fmt
 
     codec_name = (args.encoder if args.encoder and args.encoder.lower() != "none" else "h.264")
-    min_bits = int(w) * int(h) * max(1, fps_i) * _target_bpp(codec_name, fps_i)
+    min_bits = int(cap_w) * int(cap_h) * max(1, fps_i) * _target_bpp(codec_name, fps_i)
     cur_bits = _parse_bitrate_bits(bitrate)
     bitrate_off = str(bitrate).strip().lower() in ("0", "auto", "")
     if cur_bits < min_bits and not bitrate_off:
@@ -1606,11 +1648,11 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
             "Bitrate %s is below the recommended %s for %dx%d@%dfps — honoring your "
             "setting (expect quality loss on busy scenes). --bitrate 0 = CQP quality "
             "mode; leave unset for the auto floor.",
-            str(bitrate), _format_bits(int(min_bits)), w, h, fps_i
+            str(bitrate), _format_bits(int(min_bits)), cap_w, cap_h, fps_i
         )
     elif bitrate_off and str(bitrate).strip() not in ("0", "auto"):
         safe_str = _format_bits(int(min_bits))
-        logging.warning("No bitrate set; using %s for %dx%d@%dfps.", safe_str, w, h, fps_i)
+        logging.warning("No bitrate set; using %s for %dx%d@%dfps.", safe_str, cap_w, cap_h, fps_i)
         bitrate = safe_str
         host_state.current_bitrate = safe_str
 
@@ -1652,10 +1694,13 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
             *base_in,
             "-f", "rawvideo",
             "-pixel_format", "bgr0",
-            "-video_size", f"{pw}x{ph}",
+            "-video_size", f"{cap_w}x{cap_h}",
             "-framerate", str(fps_i),
             "-i", "-",
         ]
+        if (cap_w, cap_h) != (pw, ph):
+            logging.info("Capture %dx%d → streaming %dx%d (videoscale in the feeder).",
+                         pw, ph, cap_w, cap_h)
         extra_filters, encode = _pick_encoder_args(
             codec=args.encoder, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
@@ -1728,10 +1773,13 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
                 "nv12": "nv12", "yuv420p": "nv12",
                 "p010": "p010", "yuv420p10": "p010"
             }.get((pix_fmt or "nv12").lower(), "nv12")
-            extra_filters = ["-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={w}:h={h}:format={_vaapi_fmt}",
+            extra_filters = ["-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={cap_w}:h={cap_h}:format={_vaapi_fmt}",
                              "-vaapi_device", "/dev/dri/renderD128"]
         elif args.hwenc == "cpu":
-            extra_filters = ["-vf", f"hwdownload,format={pix_fmt or 'yuv420p'}"]
+            _cpu_filters = f"hwdownload,format={pix_fmt or 'yuv420p'}"
+            if (cap_w, cap_h) != (w, h):
+                _cpu_filters += f",scale={cap_w}:{cap_h}"
+            extra_filters = ["-vf", _cpu_filters]
 
     else:
         logging.info("Linux capture: x11grab selected (pref=%s, kms=%s).", capture_pref, kms_available)
@@ -1741,13 +1789,15 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None)
             "-f", "x11grab",
             "-draw_mouse", "0",
             "-framerate", str(fps_i),
-            "-video_size", f"{w}x{h}",
+            "-video_size", f"{w}x{h}",       # the grabbed region is the whole monitor
             "-i", input_arg,
         ]
         extra_filters, encode = _pick_encoder_args(
             codec=args.encoder, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
         )
+        if (cap_w, cap_h) != (w, h):
+            extra_filters = _prepend_filter(extra_filters, f"scale={cap_w}:{cap_h}")
 
     output_side = _output_sync_flags()
     pkt_size = _udp_ts_pkt_size(ip)
@@ -2233,6 +2283,15 @@ def _monitors_payload():
         f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors
     ) if host_state.monitors else DEFAULT_RES
 
+def _stream_payload():
+    """'WxH' when the host scales the capture, else "" (one pixel per monitor pixel).
+
+    The client needs it to tell the video's size from the desktop's: clicks are
+    mapped in desktop coordinates, which only equal video pixels at native size.
+    """
+    size = getattr(host_state, "stream_size", None)
+    return f"{size[0]}x{size[1]}" if size else ""
+
 def _begin_session_locked(peer_ip, encoder_str):
     """Mark the session active and mint a fresh session token.
 
@@ -2246,7 +2305,9 @@ def _begin_session_locked(peer_ip, encoder_str):
     host_state.session_token = token
     host_state.client_ip = peer_ip
     host_state.session_epoch += 1
-    return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}"
+    stream = _stream_payload()
+    stream_line = f"\nSTREAM {stream}" if stream else ""
+    return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
 
 def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
     if host_state.session_active:
@@ -2449,12 +2510,14 @@ def start_streams_for_current_client(args):
             for i, mon in enumerate(host_state.monitors):
                 ps = portal.match_stream(i, mon) if portal else None
                 cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
-                                      portal_stream=ps)
+                                      portal_stream=ps,
+                                      stream_size=getattr(host_state, "stream_size", None))
                 if not cmd:
                     logging.error(f"Failed to build video cmd for monitor {i}; skipping.")
                     continue
                 feeder = portal_capture.build_feeder_cmd(
-                    ps, fps=args.framerate) if (portal and ps) else None
+                    ps, fps=args.framerate,
+                    size=getattr(host_state, "stream_size", None)) if (portal and ps) else None
                 t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder)
                 t.start()
                 host_state.video_threads[i] = t
@@ -3305,6 +3368,13 @@ def core_main(args, use_signals=True) -> int:
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920,1080,0,0)]
     logging.info("Session type: %s; monitors: %s", _session_type(), host_state.monitors)
+    host_state.stream_size = _parse_resolution(args.resolution)
+    if host_state.stream_size:
+        logging.info("Streaming at %dx%d regardless of monitor size (--resolution).",
+                     *host_state.stream_size)
+    elif str(getattr(args, "resolution", "") or "").strip().lower() not in NATIVE_RESOLUTION_ALIASES:
+        logging.warning("--resolution %r is not a WxH size — streaming each monitor at its own size.",
+                        args.resolution)
     host_state.capture_mode = _resolve_capture_mode()
     logging.info("Capture mode: %s", host_state.capture_mode)
 
@@ -3632,6 +3702,9 @@ def parse_args():
     p.add_argument("--hwenc", choices=["auto","cpu","nvenc","qsv","vaapi"], default="auto",
                    help="Manual encoder backend selection (auto=heuristic).")
     p.add_argument("--framerate", default=DEFAULT_FPS)
+    p.add_argument("--resolution", default="native",
+                   help="Stream size as WxH (e.g. 1920x1080) — the capture is scaled to it "
+                        "before encoding; 'native' streams each monitor at its own size.")
     p.add_argument("--bitrate", default=LEGACY_BITRATE)
     p.add_argument("--audio", choices=["enable","disable"], default="disable")
     p.add_argument("--adaptive", action="store_true")

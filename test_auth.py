@@ -133,14 +133,20 @@ assert host._extract_authed_cmd("AUTH tok123") is None
 ok("AUTH token prefix enforced on control packets")
 host.host_state.session_token = None
 
-# ── OK/TOKEN/CERT response parsing ──
+# ── OK/TOKEN/CERT/STREAM response parsing ──
 info, token, cert = client._parse_ok_response("OK:h.264:1920x1080+0+0;2560x1440+1080+162\nTOKEN deadbeef01")
-assert info == ("h.264", "1920x1080+0+0;2560x1440+1080+162"), info
+assert info == ("h.264", "1920x1080+0+0;2560x1440+1080+162", ""), info
 assert token == "deadbeef01", token
 assert cert == "", cert
 info2, token2, cert2 = client._parse_ok_response("OK:h.265:1920x1080\nTOKEN ab\nCERT Zm9v")
 assert token2 == "ab" and info2[0] == "h.265" and cert2 == "Zm9v"
-ok("OK/TOKEN/CERT handshake response parsed correctly")
+assert info2[2] == "", info2
+info3, token3, cert3 = client._parse_ok_response(
+    "OK:h.265:1707x1067+0+0\nTOKEN ab\nSTREAM 1280x720")
+assert info3[1] == "1707x1067+0+0" and info3[2] == "1280x720", info3
+assert client._size_from_text(info3[2]) == (1280, 720)
+assert client._size_from_text("") is None
+ok("OK/TOKEN/STREAM/CERT handshake response parsed correctly")
 
 # ── failure reasons distinguish a stale client key from a mangled message ──
 with tempfile.TemporaryDirectory() as tmp:
@@ -299,6 +305,25 @@ with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
     s.close()
     assert resp.startswith("OK:") and "CERT " in resp, resp[:200]
     ok("a pre-fix client's PIN+KEYREQ line still gets a certificate")
+
+    # ── the host's stream size reaches the client ──
+    # Native (default): no STREAM line, so the client maps clicks by the desktop
+    # size it already knows. With --resolution the host says what it encodes.
+    reset_host()
+    install(good_cert, good_key)
+    host.host_state.stream_size = None
+    ok_native, info_native = client.tcp_handshake_client("127.0.0.1", None, interactive=False)
+    assert ok_native and info_native[2] == "", info_native
+    reset_host()
+    host.host_state.stream_size = (1280, 720)
+    ok_scaled, info_scaled = client.tcp_handshake_client("127.0.0.1", None, interactive=False)
+    assert ok_scaled, info_scaled
+    assert info_scaled[2] == "1280x720", info_scaled
+    assert client._size_from_text(info_scaled[2]) == (1280, 720)
+    desktop = client._size_from_text(info_scaled[1].split(";")[0].split("+")[0])
+    assert desktop and desktop != (1280, 720), (desktop, info_scaled)
+    ok("handshake carries the stream size separately from the desktop geometry")
+    host.host_state.stream_size = None
 
     srv.close()
 

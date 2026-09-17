@@ -42,6 +42,40 @@ ok("detect_monitors() prefers the logical Wayland layout (matches the portal)")
 vw, vh = host._virtual_screen_size()
 assert (vw, vh) == (max(w + x for w, h, x, y in ks), max(h + y for w, h, x, y in ks)), (vw, vh)
 ok(f"virtual screen bounding box {vw}x{vh} matches the detected layout")
+
+# ── 2b. Stream size (--resolution) ───────────────────────────────────
+assert host._parse_resolution("1920x1080") == (1920, 1080)
+assert host._parse_resolution(" 1280x720 ") == (1280, 720)
+assert host._parse_resolution("native") is None
+assert host._parse_resolution("") is None
+assert host._parse_resolution("1080p") is None          # junk must not crash the host
+assert host._parse_resolution("8x8") is None            # too small to encode
+assert host._parse_resolution("99999x1080") is None
+ok("--resolution parses WxH, treats native/junk as the monitor's own size")
+
+assert host._prepend_filter(["-vf", "format=nv12,hwupload", "-vaapi_device", "d"],
+                            "scale=1280:720") == \
+    ["-vf", "scale=1280:720,format=nv12,hwupload", "-vaapi_device", "d"]
+assert host._prepend_filter(None, "scale=1280:720") == ["-vf", "scale=1280:720"]
+ok("scale filter composes with an encoder's existing -vf")
+
+_scaled = argparse.Namespace(
+    encoder="h.265", hwenc="auto", framerate="60", bitrate="30M", preset="", gop="30",
+    qp="", tune="", pix_fmt="yuv444p", display=":0", audio="enable",
+)
+_portal = {"node": 110, "w": 1707, "h": 1067}
+host.host_state.client_ip = "127.0.0.1"
+stream_cmd = host.build_video_cmd(_scaled, "30M", (1707, 1067, 0, 0), 5000,
+                                 portal_stream=_portal, stream_size=(1280, 720))
+assert stream_cmd[stream_cmd.index("-video_size") + 1] == "1280x720", stream_cmd
+native_cmd = host.build_video_cmd(_scaled, "30M", (1707, 1067, 0, 0), 5000,
+                                  portal_stream=_portal)
+assert native_cmd[native_cmd.index("-video_size") + 1] == "1707x1067", native_cmd
+ok("--resolution sets what the encoder is fed; native keeps the monitor's size")
+
+# The portal path scales in the feeder, so ffmpeg must not scale a second time.
+assert stream_cmd[stream_cmd.index("-vf") + 1] == "format=nv12,hwupload", stream_cmd
+ok("portal capture leaves the scaling to the feeder (no double scale)")
 args = argparse.Namespace(
     encoder="h.264", hwenc="auto", framerate="60", bitrate="8M", preset="medium",
     gop="15", qp="", tune="", pix_fmt="yuv420p", display=":0", audio="enable",
@@ -54,6 +88,11 @@ os.environ.pop("LINUXPLAY_CAPTURE", None)
 cmd = host.build_video_cmd(args, "8M", (2560, 1440, 1080, 162), 5000)
 assert cmd and "kmsgrab" in cmd, cmd
 ok("auto capture picks kmsgrab (Wayland-safe)")
+
+kms_scaled = host.build_video_cmd(args, "8M", (2560, 1440, 1080, 162), 5000,
+                                  stream_size=(1280, 720))
+assert any("scale_vaapi=w=1280:h=720" in x for x in kms_scaled), kms_scaled
+ok("kmsgrab scales in the VAAPI filter (stream size honored on all three backends)")
 
 old_probe = host.ffmpeg_has_device
 host.ffmpeg_has_device = lambda name: False
@@ -68,6 +107,13 @@ os.environ["LINUXPLAY_CAPTURE"] = "x11grab"
 cmd2 = host.build_video_cmd(args, "8M", (1920, 1080, 0, 0), 5000)
 assert cmd2 and "x11grab" in cmd2, cmd2
 ok("explicit LINUXPLAY_CAPTURE=x11grab override still honored (with warning)")
+
+# x11grab's -video_size is the grabbed region (the whole monitor), so a stream
+# size has to reach the encoder through the filter chain instead.
+cmd2s = host.build_video_cmd(args, "8M", (1707, 1067, 0, 0), 5000, stream_size=(1280, 720))
+assert cmd2s[cmd2s.index("-video_size") + 1] == "1707x1067", cmd2s
+assert "scale=1280:720" in cmd2s[cmd2s.index("-vf") + 1], cmd2s
+ok("x11grab keeps the full-monitor region and scales in the filter chain")
 host.ffmpeg_has_device = old_probe
 os.environ.pop("LINUXPLAY_CAPTURE", None)
 

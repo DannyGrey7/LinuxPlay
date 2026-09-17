@@ -244,7 +244,7 @@ class PortalCapture:
             self.conn = None
 
 
-def build_feeder_cmd(stream, fps=None):
+def build_feeder_cmd(stream, fps=None, size=None):
     """gst-launch pipeline piping raw BGRx frames of this stream to stdout.
 
     videoscale is not optional here: the portal reports the monitor's *logical*
@@ -255,11 +255,15 @@ def build_feeder_cmd(stream, fps=None):
     empty pipe and the client shows a black screen. At 100% scaling the two
     sizes coincide, which is why this only bites on a scaled desktop.
 
+    size is the stream size the host asked for (--resolution); the same scaling
+    stage produces it, so a smaller stream costs nothing extra here.
+
     fps caps the rate the compositor pushes — a 120 Hz panel under damage can
     exceed the host's --framerate; drop-only means a slow compositor is never
     padded out with duplicate frames.
     """
-    caps = f"video/x-raw,format=BGRx,width={stream['w']},height={stream['h']}"
+    w, h = size or (stream["w"], stream["h"])
+    caps = f"video/x-raw,format=BGRx,width={w},height={h}"
     if fps:
         caps += f",framerate={int(fps)}/1"
     cmd = ["gst-launch-1.0", "-q", "pipewiresrc", f"path={stream['node']}", "!"]

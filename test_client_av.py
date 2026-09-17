@@ -229,4 +229,49 @@ finally:
 ok("live Opus stream: clock advances, no false stall restart, no crash")
 
 
+# ── 2d. clicks map to desktop pixels, not video pixels ────────────────
+# The host can encode a scaled stream (--resolution). The video is then, say,
+# 1280x720 while the desktop is 1707x1067, and a click still has to land on the
+# desktop pixel under the cursor — so the mapping uses the desktop size.
+class _Click:
+    def __init__(self, x, y):
+        self._x, self._y = x, y
+    def x(self):
+        return self._x
+    def y(self):
+        return self._y
+
+_map_w = client.VideoWidgetGL(lambda m: None, 1280, 720, 0, 0, "127.0.0.1",
+                              desktop_size=(1707, 1067))
+_map_w.resize(1280, 720)          # same aspect as the stream: no letterboxing
+assert _map_w._scaled_mouse_coords(_Click(640, 360)) == (853, 533)
+assert _map_w._scaled_mouse_coords(_Click(0, 0)) == (0, 0)
+assert _map_w._scaled_mouse_coords(_Click(1280, 720)) == (1707, 1067)
+ok("scaled stream: window centre/corners map onto the desktop, not the video")
+
+_map_off = client.VideoWidgetGL(lambda m: None, 1280, 720, 1080, 162, "127.0.0.1",
+                                desktop_size=(2560, 1440))
+_map_off.resize(1280, 720)
+assert _map_off._scaled_mouse_coords(_Click(640, 360)) == (1080 + 1280, 162 + 720)
+ok("monitor origin is added after scaling, so secondary displays stay aligned")
+
+# A window taller than the video letterboxes it; clicks in the black bar must
+# clamp to the edge rather than running off the desktop.
+_map_lb = client.VideoWidgetGL(lambda m: None, 1280, 720, 0, 0, "127.0.0.1",
+                               desktop_size=(1707, 1067))
+_map_lb.resize(1000, 800)
+top = _map_lb._scaled_mouse_coords(_Click(500, 2))
+bottom = _map_lb._scaled_mouse_coords(_Click(500, 798))
+assert top[1] == 0 and bottom[1] == 1067, (top, bottom)
+assert top[0] == bottom[0] == 853, (top, bottom)
+ok("letterboxed window clamps clicks to the desktop edges")
+
+# Native streaming keeps the historic mapping (desktop == video pixels).
+_map_native = client.VideoWidgetGL(lambda m: None, 2560, 1440, 1080, 162, "127.0.0.1")
+_map_native.resize(1280, 720)
+assert _map_native._scaled_mouse_coords(_Click(640, 360)) == (1080 + 1280, 162 + 720)
+assert (_map_native.desktop_width, _map_native.desktop_height) == (2560, 1440)
+ok("native stream: mapping unchanged (desktop size defaults to the stream size)")
+
+
 print(f"\nALL {len(PASS)} CLIENT A/V TESTS PASSED")

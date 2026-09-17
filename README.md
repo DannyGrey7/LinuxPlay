@@ -255,7 +255,7 @@ python3 start.py
 
 ```bash
 # Host
-python3 host.py --gui --encoder h.264 --hwenc auto --framerate 60 --bitrate 8M --audio enable --gop 15 --pix_fmt yuv420p
+python3 host.py --gui --encoder h.264 --hwenc auto --framerate 60 --bitrate 8M --audio enable --gop 15 --pix_fmt yuv420p --resolution native
 
 # Client
 python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio enable --monitor 0 --gamepad enable --debug
@@ -379,6 +379,16 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
 - **Scaling**: the portal reports a monitor's *logical* size (1707x1067 for a 2560x1600 panel at
   150%), while the node hands out buffers at the panel's own size. LinuxPlay rescales in the
   `gst-launch` feeder, so fractionally-scaled desktops stream the same pixels you see.
+- **Stream size**: `--resolution WxH` (launcher: *Stream Size*) encodes at that size instead of
+  the monitor's, scaling the capture before it reaches the encoder — a smaller stream, and a
+  smaller bill for bandwidth, host CPU and client decode. `--resolution native` (the default)
+  streams each monitor at its own resolution. The desktop is untouched either way, and clicks
+  stay aligned because the host tells the client both sizes. Two things to know: a size whose
+  aspect ratio differs from the monitor's stretches the picture (the host log names a matching
+  size, e.g. `1920x1200` for a 16:10 desktop), and streaming at a non-native size needs the
+  matching client on the other end — an older client would map clicks by the scaled video.
+  Odd sizes work but the encoder pads them to even (1707x1067 arrives as 1708x1068), so a
+  standard size like 1920x1080 avoids the extra pixel row.
 - **Capture rate**: the portal path is damage-driven, and how fast it can push depends on the
   panel's refresh and the captured resolution — measured ~48 fps at 2560x1440 on 60 Hz panels,
   but ~72 fps at 1707x1067 on a 119 Hz panel (a single PipeWire consumer either way; two
