@@ -376,11 +376,15 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
   this to the active seat user). The gamepad server uses the same mechanism.
 - **Audio / clipboard**: unchanged — PipeWire exposes PulseAudio compatibility on Wayland
   desktops, so `pactl` / `-f pulse` keep working.
-- **Capture rate**: the portal path is damage-driven and a single PipeWire consumer tops out at
-  roughly 50 fps even at 2560x1440 (measured: ~48 fps with or without `videoconvert`, and two
-  consumers get ~95 fps between them). Setting `--framerate 60` therefore encodes ~45-50 fps and
-  the overlay's *encoder out* fps is the honest number; nothing is lost client-side if *decode* fps
-  matches it. Reaching a true 60 fps needs a different capture path (`kmsgrab`).
+- **Scaling**: the portal reports a monitor's *logical* size (1707x1067 for a 2560x1600 panel at
+  150%), while the node hands out buffers at the panel's own size. LinuxPlay rescales in the
+  `gst-launch` feeder, so fractionally-scaled desktops stream the same pixels you see.
+- **Capture rate**: the portal path is damage-driven, and how fast it can push depends on the
+  panel's refresh and the captured resolution — measured ~48 fps at 2560x1440 on 60 Hz panels,
+  but ~72 fps at 1707x1067 on a 119 Hz panel (a single PipeWire consumer either way; two
+  consumers get roughly double between them). The feeder drops whatever exceeds `--framerate`
+  (`videorate drop-only=true`), so the overlay's *encoder out* fps stays at your setting instead
+  of running away with the bitrate.
 - **Limitations**: each monitor must be selected in the portal dialog for multi-monitor
   streaming; NVIDIA kmsgrab users may need `nvidia-drm.modeset=1`.
 

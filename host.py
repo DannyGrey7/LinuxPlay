@@ -2453,7 +2453,8 @@ def start_streams_for_current_client(args):
                 if not cmd:
                     logging.error(f"Failed to build video cmd for monitor {i}; skipping.")
                     continue
-                feeder = portal_capture.build_feeder_cmd(ps) if (portal and ps) else None
+                feeder = portal_capture.build_feeder_cmd(
+                    ps, fps=args.framerate) if (portal and ps) else None
                 t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder)
                 t.start()
                 host_state.video_threads[i] = t

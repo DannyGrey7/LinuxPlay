@@ -244,14 +244,26 @@ class PortalCapture:
             self.conn = None
 
 
-def build_feeder_cmd(stream):
-    """gst-launch pipeline piping raw BGRx frames of this stream to stdout."""
-    return [
-        "gst-launch-1.0", "-q",
-        "pipewiresrc", f"path={stream['node']}",
-        "!",
-        "videoconvert", "!",
-        f"video/x-raw,format=BGRx,width={stream['w']},height={stream['h']}",
-        "!",
-        "fdsink", "sync=false",
-    ]
+def build_feeder_cmd(stream, fps=None):
+    """gst-launch pipeline piping raw BGRx frames of this stream to stdout.
+
+    videoscale is not optional here: the portal reports the monitor's *logical*
+    size (1707x1067 for a 2560x1600 panel at 150% scaling) while the node hands
+    out buffers at the panel's own size (BGRA 2560x1600). videoconvert cannot
+    rescale, so without a scaler the caps below can never be satisfied:
+    pipewiresrc gives up with "no more input formats", the encoder is fed an
+    empty pipe and the client shows a black screen. At 100% scaling the two
+    sizes coincide, which is why this only bites on a scaled desktop.
+
+    fps caps the rate the compositor pushes — a 120 Hz panel under damage can
+    exceed the host's --framerate; drop-only means a slow compositor is never
+    padded out with duplicate frames.
+    """
+    caps = f"video/x-raw,format=BGRx,width={stream['w']},height={stream['h']}"
+    if fps:
+        caps += f",framerate={int(fps)}/1"
+    cmd = ["gst-launch-1.0", "-q", "pipewiresrc", f"path={stream['node']}", "!"]
+    if fps:
+        cmd += ["videorate", "drop-only=true", "!"]
+    cmd += ["videoconvert", "!", "videoscale", "!", caps, "!", "fdsink", "sync=false"]
+    return cmd
