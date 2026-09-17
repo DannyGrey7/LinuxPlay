@@ -75,6 +75,23 @@ def _clear_restore_token():
         pass
 
 
+class _RestoreTokenRejected(Exception):
+    """The portal accepted a restore token, then failed the Start request."""
+
+
+def parse_framerate(value, default=60):
+    """Framerate both the encoder and the feeder must agree on.
+
+    Accepts what the encoder side tolerates ('30', '29.97') instead of raising
+    inside stream startup, where the failure is swallowed and retried forever.
+    """
+    try:
+        fps = float(str(value).strip())
+    except Exception:
+        return default
+    return int(fps) if fps > 0 else default
+
+
 class PortalCapture:
     """One ScreenCast session, kept alive across client reconnects."""
 
@@ -91,14 +108,33 @@ class PortalCapture:
         msg = new_method_call(self._portal_obj(), method, signature, body)
         return self.conn.send_and_get_reply(msg, timeout=timeout)
 
-    def _wait_response(self, request_path, timeout):
+    def _request(self, method, signature, body, timeout, path, dialog_timeout):
+        """Make a request and wait for its Response signal.
+
+        The jeepney filter is registered *before* the method call: a blocking
+        connection routes inbound messages only to matching filters while it
+        waits for the reply, so a Response that arrives first (instant
+        denials, restore-token reconnects) would otherwise be dropped and the
+        wait would run out its full timeout.
+        """
+        rule = MatchRule(type="signal", interface=REQUEST_IFACE,
+                         member="Response", path=path)
+        with self.conn.filter(rule) as queue:
+            self._call(method, signature, body, timeout)
+            return self._wait_response(path, queue, dialog_timeout)
+
+    def _wait_response(self, request_path, queue, timeout):
         """Wait for the portal Response signal on a specific request path."""
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting for portal response on {request_path}")
-            msg = self.conn.receive(timeout=remaining)
+            try:
+                msg = self.conn.recv_until_filtered(queue, timeout=remaining)
+            except TimeoutError:
+                raise TimeoutError(
+                    f"Timed out waiting for portal response on {request_path}") from None
             if (msg.header.message_type == MessageType.signal
                     and msg.header.fields.get(HeaderFields.interface) == REQUEST_IFACE
                     and msg.header.fields.get(HeaderFields.member) == "Response"
@@ -116,13 +152,61 @@ class PortalCapture:
         self.conn.send_and_get_reply(msg, timeout=10)
 
     # ── negotiation ──────────────────────────────────────────────────
-    def ensure(self, multiple=True, timeout_dialog=120):
-        if self.session is not None:
-            return True
+    def _reset_session(self):
+        """Forget a failed negotiation so the next call prompts again.
+
+        self.session is set as soon as CreateSession succeeds, so leaving it
+        in place after a later failure (declined dialog, failed Start) would
+        make every subsequent ensure() return True immediately with empty
+        streams — the portal path would never ask again until a host restart.
+        """
+        if self.conn and self.session:
+            try:
+                self._call("CloseSession", "o", (self.session,), timeout=5)
+            except Exception:
+                pass
+        self.session = None
+        self.streams = []
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def _open_connection(self):
         from jeepney.io.blocking import open_dbus_connection
         self.conn = open_dbus_connection(bus="SESSION")
         self._add_match()
 
+    def ensure(self, multiple=True, timeout_dialog=120):
+        if self.session is not None:
+            return True
+        self._reset_session()
+        self._open_connection()
+        restore_token = _load_restore_token()
+        if restore_token:
+            try:
+                return self._negotiate(restore_token, multiple, timeout_dialog)
+            except _RestoreTokenRejected as e:
+                # Seen with KWin: SelectSources accepts the token, Start then
+                # fails, and the stale token is never cleared — so every retry
+                # fails the same way until the host restarts.
+                logging.info("Portal restore token failed at Start (%s) — "
+                             "clearing it and asking again.", e)
+                _clear_restore_token()
+                self._reset_session()
+                self._open_connection()
+            except Exception:
+                self._reset_session()
+                raise
+        try:
+            return self._negotiate(None, multiple, timeout_dialog)
+        except Exception:
+            self._reset_session()
+            raise
+
+    def _negotiate(self, restore_token, multiple, timeout_dialog):
         sender = (self.conn.unique_name or ":0")[1:].replace(".", "_")
         session_token = "linuxplay" + secrets.token_hex(4)
 
@@ -135,12 +219,15 @@ class PortalCapture:
 
         # 1. CreateSession
         tok, path = request_path()
-        reply = self._call("CreateSession", "a{sv}", ({
-            "handle_token": ("s", tok),
-            "session_handle_token": ("s", session_token),
-        },), timeout=10)
-        logging.debug("CreateSession -> %s", reply)
-        code, results = self._wait_response(path, 15)
+        code, results = self._request(
+            "CreateSession", "a{sv}",
+            ({
+                "handle_token": ("s", tok),
+                "session_handle_token": ("s", session_token),
+            },),
+            timeout=10, path=path, dialog_timeout=15,
+        )
+        logging.debug("CreateSession requested on %s", path)
         if code != 0:
             raise RuntimeError(f"CreateSession failed (code {code})")
         self.session = results.get("session_handle")
@@ -160,18 +247,15 @@ class PortalCapture:
             }
             if use_restore:
                 options["restore_token"] = ("s", use_restore)
-            self._call("SelectSources", "oa{sv}", (self.session, options), timeout=15)
-            return self._wait_response(path, timeout_dialog)
+            return self._request("SelectSources", "oa{sv}", (self.session, options),
+                                 timeout=15, path=path, dialog_timeout=timeout_dialog)
 
-        restore_token = _load_restore_token()
         if restore_token:
             logging.debug("Reusing portal restore token (should skip the share dialog).")
-            code, results = _select_sources(restore_token)
-            if code != 0:
-                logging.info("Portal restore token no longer valid (code %s) — asking again.", code)
-                _clear_restore_token()
-                code, results = _select_sources(None)
-        else:
+        code, results = _select_sources(restore_token)
+        if code != 0 and restore_token:
+            logging.info("Portal restore token no longer valid (code %s) — asking again.", code)
+            _clear_restore_token()
             code, results = _select_sources(None)
         if code != 0:
             raise RuntimeError(f"Screen selection declined (code {code})")
@@ -188,10 +272,13 @@ class PortalCapture:
 
         # 3. Start
         tok, path = request_path()
-        self._call("Start", "osa{sv}", (self.session, "", {"handle_token": ("s", tok)}),
-                   timeout=15)
-        code, results = self._wait_response(path, timeout_dialog)
+        code, results = self._request(
+            "Start", "osa{sv}", (self.session, "", {"handle_token": ("s", tok)}),
+            timeout=15, path=path, dialog_timeout=timeout_dialog,
+        )
         if code != 0:
+            if restore_token:
+                raise _RestoreTokenRejected(f"code {code}")
             raise RuntimeError(f"ScreenCast start declined (code {code})")
 
         # Some backends only hand out the restore token with the Start response.
@@ -263,11 +350,14 @@ def build_feeder_cmd(stream, fps=None, size=None):
     padded out with duplicate frames.
     """
     w, h = size or (stream["w"], stream["h"])
+    # fps absent = no rate cap; an unparseable value falls back to the same
+    # 60 the encoder side uses, so both halves agree on what is valid.
+    fps_i = parse_framerate(fps, 60) if fps else 0
     caps = f"video/x-raw,format=BGRx,width={w},height={h}"
-    if fps:
-        caps += f",framerate={int(fps)}/1"
+    if fps_i:
+        caps += f",framerate={fps_i}/1"
     cmd = ["gst-launch-1.0", "-q", "pipewiresrc", f"path={stream['node']}", "!"]
-    if fps:
+    if fps_i:
         cmd += ["videorate", "drop-only=true", "!"]
     cmd += ["videoconvert", "!", "videoscale", "!", caps, "!", "fdsink", "sync=false"]
     return cmd

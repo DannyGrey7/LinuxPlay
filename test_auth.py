@@ -21,7 +21,22 @@ def ok(name):
     PASS.append(name)
     print(f"  PASS: {name}")
 
-assert host.HAVE_CRYPTO, "cryptography package required for these tests"
+
+@contextlib.contextmanager
+def _chdir(path):
+    """contextlib.chdir is 3.11+; the project still supports 3.9."""
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+if not host.HAVE_CRYPTO:
+    # Skipping is honest here; the old assert turned a missing optional
+    # dependency into a test failure.
+    print("  SKIP: the 'cryptography' package is not installed — certificate tests cannot run")
+    sys.exit(77)
 from cryptography import x509                                     # noqa: E402
 from cryptography.x509.oid import NameOID                         # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization   # noqa: E402
@@ -179,7 +194,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # The host closes its end when it refuses a proof, so the PIN handshake that
 # follows needs a fresh connection; the client also has to notice a cert/key
 # pair that cannot sign for each other before the host rejects it.
-with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
     # The host writes issued certificates to ./issued_clients, so run from tmp.
     host.CA_CERT = os.path.join(tmp, "host_ca.pem")
     host.CA_KEY = os.path.join(tmp, "host_ca.key")

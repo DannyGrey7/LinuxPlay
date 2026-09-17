@@ -22,6 +22,11 @@ import hmac
 
 from shutil import which
 
+try:
+    import hostlock
+except Exception:              # pragma: no cover - the host runs without it
+    hostlock = None
+
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton, QLabel, QHBoxLayout,
     QMessageBox
@@ -52,8 +57,20 @@ PIN_LOCKOUT_MAX  = 900.0
 # How long the local user has to approve pairing a brand-new device (GUI hosts).
 PAIR_APPROVAL_TIMEOUT = 45.0
 
+# How long a GUI window waits for stop_all() before giving up and closing anyway
+# (a wedged encoder or portal prompt must never make the window unclosable).
+GUI_CLOSE_GRACE_SECS = 6.0
+
+# How long the signal handler waits for the video-thread lock before finishing
+# shutdown without it (see _signal_handler / stop_all).
+SIGNAL_STOP_LOCK_TIMEOUT = 3.0
+
 # Upper bound on one handshake message we will buffer from a peer.
 HANDSHAKE_MSG_MAX = 65536
+
+# How long the handshake reader waits for the rest of a message before calling
+# it complete (TCP may split a ~1.7 KB proof or a two-line PIN request).
+HANDSHAKE_TAIL_GRACE = 0.5
 
 # A failing encoder is restarted with backoff instead of stopping the host.
 STREAM_MAX_RESTARTS = 5
@@ -434,7 +451,10 @@ class HostState:
         self.last_clipboard_content = ""
         self.ignore_clipboard_update = False
         self.should_terminate = False
-        self.video_thread_lock = threading.Lock()
+        # Reentrant: a signal handler runs in the main thread, which can be
+        # inside start_streams_for_current_client() holding this lock across a
+        # portal dialog — a plain Lock would self-deadlock there.
+        self.video_thread_lock = threading.RLock()
         self.clipboard_lock = threading.Lock()
         self.handshake_sock = None
         self.control_sock = None
@@ -453,6 +473,7 @@ class HostState:
         self.session_token = None
         self.pin_failures = {}     # peer ip -> [fail_count, locked_until_ts]
         self.pin_fail_lock = threading.Lock()
+        self.instance_lock_fd = None   # held for the process lifetime (hostlock)
         self.gui_window = None     # set by HostWindow: enables pairing prompts
         self.log_path = None
         self.session_epoch = 0     # bumped on connect/disconnect to clear backoff
@@ -554,14 +575,30 @@ def trigger_shutdown(reason: str):
 
         set_status(f"Stopping… ({reason})")
 
-def stop_all():
+def stop_all(lock_timeout=None):
     host_state.should_terminate = True
 
-    with host_state.video_thread_lock:
-        for thread in list(host_state.video_threads.values()):
-            thread.stop()
-            thread.join(timeout=2)
-        host_state.video_threads.clear()
+    # lock_timeout is set by the signal handler: it runs in the main thread,
+    # and another thread may be holding the lock across a portal dialog for up
+    # to two minutes. Waiting forever there makes Ctrl+C appear to do nothing;
+    # the encoders poll should_terminate and retire on their own instead.
+    if lock_timeout is None:
+        got_lock = host_state.video_thread_lock.acquire()
+    else:
+        got_lock = host_state.video_thread_lock.acquire(timeout=lock_timeout)
+    if got_lock:
+        try:
+            for thread in list(host_state.video_threads.values()):
+                thread.stop()
+                thread.join(timeout=2)
+            host_state.video_threads.clear()
+        finally:
+            host_state.video_thread_lock.release()
+    else:
+        logging.warning(
+            "stop_all: video-thread lock still busy after %.0fs (portal prompt?) — "
+            "not waiting; running encoders will retire via should_terminate.",
+            lock_timeout)
 
     if host_state.audio_thread:
         host_state.audio_thread.stop()
@@ -1236,15 +1273,23 @@ def _route_mtu(ip: str) -> int:
 
 def _udp_ts_pkt_size(ip: str) -> int:
     """MPEG-TS UDP payload size that fits inside the path MTU to ip (never IP-fragmented)."""
-    mtu_guess = 1500
-    rt_mtu = _route_mtu(ip)
-    if rt_mtu:
-        mtu_guess = min(mtu_guess, rt_mtu)
+    mtu_guess = _path_mtu(ip)
     pkt = _best_ts_pkt_size(mtu_guess, ":" in str(ip))
     if mtu_guess < 1500:
         logging.info("Path MTU to %s is %d → TS pkt_size %d (avoids IP fragmentation).",
                      ip, mtu_guess, pkt)
     return pkt
+
+def _path_mtu(ip: str) -> int:
+    """Path MTU to ip, capped at the local Ethernet default (1500 when unknown).
+
+    Callers must use this rather than the rounded TS packet size to decide
+    whether the path is tunneled: _best_ts_pkt_size rounds down to a multiple
+    of 188, so 1420 (WireGuard), 1400 (OpenVPN), 1492 (PPPoE) and 1500 all
+    yield the same 1316 — a 'pkt_size < 1316' test never fires on any of them.
+    """
+    mtu = _route_mtu(ip) or 1500
+    return min(1500, mtu) if mtu > 0 else 1500
 
 def _parse_bitrate_bits(bstr: str) -> int:
     if not bstr: return 0
@@ -1620,9 +1665,25 @@ def _parse_resolution(value):
     return None
 
 
+def _normalise_codec(value) -> str:
+    """Map placeholder encoder values to a real codec name.
+
+    "none" is the argparse default and old launcher configs still carry it; it
+    means "no explicit choice", not "no codec". Left as-is it makes
+    _pick_encoder_args return an empty list, and the MPEG-TS muxer then falls
+    back to mpeg2video at the H.264 bitrate floor.
+    """
+    name = str(value or "").strip().lower()
+    if name in ("h.265", "hevc", "h265"):
+        return "h.265"
+    return "h.264"
+
+
 def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None, stream_size=None):
     try:
-        fps_i = int(str(args.framerate))
+        # float() first so a fractional --framerate (29.97) resolves the same
+        # way the portal feeder resolves it instead of raising there.
+        fps_i = int(float(str(args.framerate)))
     except Exception:
         fps_i = 60
 
@@ -1639,7 +1700,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
     preset = args.preset.strip().lower() if args.preset else ""
     gop, qp, tune, pix_fmt = args.gop, args.qp, args.tune, args.pix_fmt
 
-    codec_name = (args.encoder if args.encoder and args.encoder.lower() != "none" else "h.264")
+    codec_name = _normalise_codec(args.encoder)
     min_bits = int(cap_w) * int(cap_h) * max(1, fps_i) * _target_bpp(codec_name, fps_i)
     cur_bits = _parse_bitrate_bits(bitrate)
     bitrate_off = str(bitrate).strip().lower() in ("0", "auto", "")
@@ -1671,10 +1732,9 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
     vaapi_available = has_vaapi()
 
     def _vaapi_possible_for_codec():
-        enc = (args.encoder or "h.264").lower()
         return (
-            (enc == "h.264" and ffmpeg_has_encoder("h264_vaapi")) or
-            (enc == "h.265" and ffmpeg_has_encoder("hevc_vaapi"))
+            (codec_name == "h.264" and ffmpeg_has_encoder("h264_vaapi")) or
+            (codec_name == "h.265" and ffmpeg_has_encoder("hevc_vaapi"))
         )
 
     use_kms = False
@@ -1702,7 +1762,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
             logging.info("Capture %dx%d → streaming %dx%d (videoscale in the feeder).",
                          pw, ph, cap_w, cap_h)
         extra_filters, encode = _pick_encoder_args(
-            codec=args.encoder, hwenc=args.hwenc, preset=preset,
+            codec=codec_name, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
         )
         if any(x in encode for x in ("h264_vaapi", "hevc_vaapi")):
@@ -1712,8 +1772,10 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
             extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
         output_side = _output_sync_flags()
         pkt_size = _udp_ts_pkt_size(ip)
-        if pkt_size < 1316 and getattr(host_state, "net_mode", "lan") == "lan":
-            logging.info("Tunneled path detected (pkt_size %d) — using larger UDP buffers.", pkt_size)
+        path_mtu = _path_mtu(ip)
+        if path_mtu < 1500 and getattr(host_state, "net_mode", "lan") == "lan":
+            logging.info("Tunneled path detected (path MTU %d, pkt_size %d) — "
+                         "using larger UDP buffers.", path_mtu, pkt_size)
         fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
         out = [
             *(_mpegts_ll_mux_flags()),
@@ -1764,21 +1826,33 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
         ]
 
         extra_filters, encode = _pick_encoder_args(
-            codec=args.encoder, hwenc=args.hwenc, preset=preset,
+            codec=codec_name, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
         )
 
+        # kmsgrab hands over the compositor's framebuffer — on a multi-monitor
+        # desktop that is the whole layout, not the monitor — so the monitor's
+        # rectangle must be cropped out before anything else. The chain is
+        # keyed off the encoder that was actually chosen, not args.hwenc:
+        # "auto" can resolve to nvenc/qsv/libx264 while the request still
+        # reads "auto", and a DRM-PRIME frame that never gets hwdownload-ed
+        # makes those encoders exit immediately (black screen + restart loop).
+        _crop = f"crop={w}:{h}:{ox}:{oy}"
+        _scale = f"scale={cap_w}:{cap_h}" if (cap_w, cap_h) != (w, h) else ""
         if any(x in encode for x in ("h264_vaapi", "hevc_vaapi")):
             _vaapi_fmt = {
                 "nv12": "nv12", "yuv420p": "nv12",
                 "p010": "p010", "yuv420p10": "p010"
             }.get((pix_fmt or "nv12").lower(), "nv12")
-            extra_filters = ["-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={cap_w}:h={cap_h}:format={_vaapi_fmt}",
+            # crop is not hardware-aware on older FFmpeg builds, so crop in
+            # software and upload the monitor-sized frame back to VAAPI.
+            _cpu_filters = ",".join(x for x in ("hwdownload", _crop, _scale,
+                                                f"format={_vaapi_fmt}", "hwupload") if x)
+            extra_filters = ["-vf", _cpu_filters,
                              "-vaapi_device", "/dev/dri/renderD128"]
-        elif args.hwenc == "cpu":
-            _cpu_filters = f"hwdownload,format={pix_fmt or 'yuv420p'}"
-            if (cap_w, cap_h) != (w, h):
-                _cpu_filters += f",scale={cap_w}:{cap_h}"
+        else:
+            _cpu_filters = ",".join(x for x in (f"hwdownload,format={pix_fmt or 'yuv420p'}",
+                                                _crop, _scale) if x)
             extra_filters = ["-vf", _cpu_filters]
 
     else:
@@ -1793,7 +1867,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
             "-i", input_arg,
         ]
         extra_filters, encode = _pick_encoder_args(
-            codec=args.encoder, hwenc=args.hwenc, preset=preset,
+            codec=codec_name, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
         )
         if (cap_w, cap_h) != (w, h):
@@ -1801,8 +1875,10 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
 
     output_side = _output_sync_flags()
     pkt_size = _udp_ts_pkt_size(ip)
-    if pkt_size < 1316 and getattr(host_state, "net_mode", "lan") == "lan":
-        logging.info("Tunneled path detected (pkt_size %d) — using larger UDP buffers.", pkt_size)
+    path_mtu = _path_mtu(ip)
+    if path_mtu < 1500 and getattr(host_state, "net_mode", "lan") == "lan":
+        logging.info("Tunneled path detected (path MTU %d, pkt_size %d) — "
+                     "using larger UDP buffers.", path_mtu, pkt_size)
     fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
 
     out = [
@@ -1829,7 +1905,7 @@ def build_audio_cmd():
 
     net_mode = getattr(host_state, "net_mode", "lan")
     aud_pkt = _udp_ts_pkt_size(str(host_state.client_ip))
-    tunneled = aud_pkt < 1316
+    tunneled = _path_mtu(str(host_state.client_ip)) < 1500
     aud_buf = "4194304" if (net_mode in ("wifi", "vpn") or tunneled) else "1048576"
     aud_delay = "150000" if (net_mode in ("wifi", "vpn") or tunneled) else "0"
 
@@ -2151,6 +2227,8 @@ def _inject_mouse_up(btn):
         subprocess.Popen(["xdotool","mouseup",btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _inject_scroll(btn):
+    if str(btn) not in ("4", "5", "6", "7"):
+        return                      # never hand an arbitrary token to xdotool
     inj = _get_uinput_injector()
     if inj and inj.wheel(btn):
         return
@@ -2199,6 +2277,20 @@ NAME_TO_CHAR = {
     'less':'<', 'greater':'>', 'question':'?', 'sterling':'£', 'notsign':'¬', 'brokenbar':'¦',
 }
 
+_XDOTOOL_KEYNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+
+def _xdotool_safe_keyname(name):
+    """The keysym to hand xdotool for `name`, or None when it is not one.
+
+    `name` comes from the client and xdotool parses a leading '-' as an option
+    rather than a key, so only names from the injector's own tables/charset may
+    reach its argv.
+    """
+    if not isinstance(name, str):
+        return None
+    keyname = CHAR_TO_X11.get(name, name) if len(name) == 1 else name
+    return keyname if _XDOTOOL_KEYNAME_RE.match(keyname) else None
+
 def _inject_key(action, name):
     inj = _get_uinput_injector()
     if inj and inj.key(action, name):
@@ -2223,10 +2315,12 @@ def _inject_key(action, name):
         return
 
     if IS_LINUX:
+        keyname = _xdotool_safe_keyname(name)
+        if not keyname:
+            _warn_throttled(f"xdotool-key:{name}",
+                            f"Refusing to pass key name {name!r} to xdotool")
+            return
         try:
-            keyname = name
-            if isinstance(name, str) and len(name) == 1:
-                keyname = CHAR_TO_X11.get(name, name)
             cmd = ["xdotool", "keydown" if action == "down" else "keyup", keyname]
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
@@ -2236,29 +2330,25 @@ def _recv_handshake_msg(conn, want_tokens=2, max_bytes=HANDSHAKE_MSG_MAX, max_se
     """Read one handshake message, tolerating TCP segmentation.
 
     A single recv() can return part of a message: the client's proof line is
-    ~1.7 KB (certificate + signature), so it spans more than one TCP segment on
-    any real path and the tail may still be in flight when we look. Reading that
-    as if it were complete makes a valid proof look corrupted, so keep reading
-    until the message is complete — a newline, or `want_tokens` whitespace
-    separated fields — and stop at max_bytes/max_secs so a hostile peer cannot
-    make us buffer, or wait, without bound.
+    ~1.7 KB (certificate + signature) and the PIN request is two lines
+    ("HELLO <pin>" then "KEYREQ <b64>"), so both span more than one segment on
+    a real path and the tail may still be in flight when we look. Reading only
+    what has arrived makes a valid proof look corrupted and silently drops the
+    pairing request (the host then minted its own key instead of issuing the
+    one the client asked for). A message is therefore only complete once the
+    socket has been quiet for HANDSHAKE_TAIL_GRACE, bounded by max_bytes and
+    max_secs so a hostile peer can neither buffer nor wait without bound.
     """
     buf = b""
     deadline = time.monotonic() + max_secs
     while len(buf) < max_bytes and time.monotonic() < deadline:
-        if want_tokens and len(buf.split()) >= want_tokens:
-            # The rest of a multi-part message (e.g. a KEYREQ line after the
-            # PIN) normally rides in the same segment; take what has arrived
-            # before calling the message complete.
-            while (len(buf) < max_bytes
-                   and select.select([conn], [], [], 0)[0]):
-                chunk = conn.recv(min(4096, max_bytes - len(buf)))
-                if not chunk:
-                    break
-                buf += chunk
-            break
-        if b"\n" in buf:
-            break
+        grace = min(deadline - time.monotonic(), HANDSHAKE_TAIL_GRACE)
+        has_newline = b"\n" in buf
+        enough_fields = bool(want_tokens) and len(buf.split()) >= want_tokens
+        if not select.select([conn], [], [], grace)[0]:
+            if has_newline or enough_fields:
+                break          # complete-looking and the peer has gone quiet
+            continue           # nothing yet: keep waiting until the deadline
         chunk = conn.recv(min(4096, max_bytes - len(buf)))
         if not chunk:
             break
@@ -2986,7 +3076,6 @@ def heartbeat_manager(args):
                 data, addr = s.recvfrom(1024)
                 msg = data.decode("utf-8", errors="ignore").strip()
                 _handle_pong(msg, addr[0], now)
-                _handle_pong(msg, addr[0], now)
             except socket.timeout:
                 pass
             except Exception as e:
@@ -3276,10 +3365,17 @@ class GamepadServer(threading.Thread):
                         pending.append((t, c, v))
 
                 if pending:
-                    for et, ec, ev in pending:
-                        self.ui.write(et, ec, ev)
+                    # Hand the list over and write from the copy: a write that
+                    # raises (an event outside the device's capabilities) must
+                    # not leave the batch queued for the next datagram, which
+                    # would replay old input and grow without bound.
+                    batch, pending = pending, []
+                    for et, ec, ev in batch:
+                        try:
+                            self.ui.write(et, ec, ev)
+                        except Exception as e:
+                            logging.debug("Gamepad event dropped (%s, %s, %s): %s", et, ec, ev, e)
                     self.ui.syn()
-                    pending.clear()
 
             except Exception as e:
                 logging.debug("Gamepad parse/write error: %s", e)
@@ -3349,11 +3445,29 @@ def session_manager(args):
 def _signal_handler(signum, frame):
     logging.info("Signal %s received, shutting down…", signum)
     trigger_shutdown(f"Signal {signum}")
-    stop_all()
+    # A signal handler runs in the main thread, which may itself be holding
+    # video_thread_lock across a portal prompt — so this must not wait on that
+    # lock without a bound. (stop_all() unbounded here is what left the host
+    # unkillable: the handler blocked on a lock its own thread owned, and a
+    # second Ctrl+C just re-entered it.)
+    stop_all(lock_timeout=SIGNAL_STOP_LOCK_TIMEOUT)
     try:
         sys.exit(0)
     except SystemExit:
         pass
+
+def _gui_signal_handler(signum, frame):
+    """SIGTERM while the Qt event loop runs (logout, launcher takeover).
+
+    A signal handler runs in the main thread but *inside* Qt's C++ loop, so it
+    must not touch widgets or emit Qt signals: set the flag and let HostWindow's
+    timer close the window through the normal path — which then runs stop_all()
+    (portal CloseSession, encoder reaping) instead of dying unregistered.
+    """
+    if not host_state.should_terminate:
+        host_state.shutdown_reason = f"Signal {signum}"
+        host_state.should_terminate = True
+        logging.critical("Signal %s received, shutting down…", signum)
 
 def core_main(args, use_signals=True) -> int:
     if use_signals:
@@ -3364,6 +3478,11 @@ def core_main(args, use_signals=True) -> int:
             pass
 
     logging.debug("FFmpeg marker in use: %s", _marker_value())
+
+    if str(getattr(args, "encoder", "")).strip().lower() in ("", "none"):
+        logging.warning("--encoder none is not a codec — encoding H.264. "
+                        "Pass --encoder h.264/h.265 to pick explicitly.")
+        args.encoder = "h.264"
 
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920,1080,0,0)]
@@ -3499,6 +3618,37 @@ def request_pair_approval(peer_ip: str) -> bool:
     return False
 
 
+def _acquire_instance_lock(args) -> bool:
+    """One host per user, taken before any window or socket exists.
+
+    Without this, a host started by the launcher while one is already running
+    (an autostart host, say) only fails later on the port bind, with a message
+    that says nothing about the cause.
+    """
+    if hostlock is None:
+        logging.debug("hostlock module unavailable; instance guard disabled.")
+        return True
+    fd = hostlock.try_acquire()
+    if fd is not None:
+        host_state.instance_lock_fd = fd
+        return True
+
+    info = hostlock.format_holder(hostlock.probe())
+    logging.error("A LinuxPlay host is already running (%s) — exiting.", info)
+    if getattr(args, "gui", False):
+        try:
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.information(
+                None,
+                "LinuxPlay host already running",
+                f"A LinuxPlay host is already running:\n\n    {info}\n\n"
+                "Use that window (or `./run.sh autostart stop`) to stop it first.",
+            )
+        except Exception as e:
+            logging.debug("Could not show the duplicate-host notice: %s", e)
+    return False
+
+
 def _state_dir() -> str:
     """Per-user state directory (XDG) used for logs; created 0700."""
     base = os.environ.get("LINUXPLAY_STATE_DIR")
@@ -3570,6 +3720,8 @@ class HostWindow(QWidget):
         super().__init__()
         self.args = args
         self.core_thread = None
+        self.core_rc = None
+        self._close_requested_at = 0.0
         self.setWindowTitle("LinuxPlay Host")
         self.resize(840, 520)
 
@@ -3649,8 +3801,23 @@ class HostWindow(QWidget):
         self.core_thread.start()
 
     def _poll_core_done(self):
+        """Every 300 ms: reflect shutdown state, finish a deferred window close.
+
+        The window deliberately outlives the core thread by a moment: quitting on
+        the last window would tear the process down while stop_all() is still
+        closing the portal session and reaping encoders.
+        """
         if host_state.should_terminate:
             self.stopBtn.setEnabled(False)
+            if not self._core_running():
+                self._close_requested_at = 0.0
+                self.close()
+
+    def _core_running(self):
+        try:
+            return self.core_thread is not None and self.core_thread.is_alive()
+        except Exception:
+            return False
 
     def _on_stop(self):
         if not self.stopBtn.isEnabled():
@@ -3690,15 +3857,27 @@ class HostWindow(QWidget):
             req.event.set()
 
     def closeEvent(self, event):
-        host_state.gui_window = None
         if not host_state.should_terminate:
             trigger_shutdown("Window closed")
+        self.stopBtn.setEnabled(False)
+        # Let stop_all() finish on the core thread; _poll_core_done() closes the
+        # window for real once it has (or after the grace period, so a wedged
+        # shutdown can still be abandoned by the user).
+        if self._core_running():
+            if (time.time() - self._close_requested_at) < GUI_CLOSE_GRACE_SECS:
+                if not self._close_requested_at:
+                    self._close_requested_at = time.time()
+                    self.append_log("Stopping streams…")
+                event.ignore()
+                return
+        host_state.gui_window = None
         event.accept()
 
 def parse_args():
     p = argparse.ArgumentParser(description="LinuxPlay Host (Linux only)")
     p.add_argument("--gui", action="store_true", help="Show host GUI window.")
-    p.add_argument("--encoder", choices=["none","h.264","h.265"], default="none")
+    p.add_argument("--encoder", choices=["none","h.264","h.265"], default="none",
+                   help="Video codec; 'none' means 'not chosen' and encodes H.264.")
     p.add_argument("--hwenc", choices=["auto","cpu","nvenc","qsv","vaapi"], default="auto",
                    help="Manual encoder backend selection (auto=heuristic).")
     p.add_argument("--framerate", default=DEFAULT_FPS)
@@ -3732,7 +3911,17 @@ def main():
         logging.critical("Hosting is Linux-only. Run this on a Linux machine.")
         return 2
 
+    if not _acquire_instance_lock(args):
+        return 3
+
     if args.gui:
+        # Logout and `run.sh autostart stop` both send SIGTERM; the Qt loop needs
+        # a handler that lets the window do the stopping (see _gui_signal_handler).
+        try:
+            signal.signal(signal.SIGTERM, _gui_signal_handler)
+            signal.signal(signal.SIGINT, _gui_signal_handler)
+        except Exception as e:
+            logging.debug("Could not install GUI signal handlers: %s", e)
         app = QApplication(sys.argv)
         _apply_dark_palette(app)
         w = HostWindow(args)

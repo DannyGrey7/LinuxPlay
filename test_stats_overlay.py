@@ -125,7 +125,7 @@ assert opaque > 20000, f"panel looks blank ({opaque} opaque pixels)"
 assert colours > 40, f"no graphs or text drawn ({colours} distinct colours)"
 scratch = os.environ.get("PI_SCRATCH_DIR") or "/tmp"
 png = os.path.join(scratch, "linuxplay_stats_overlay.png")
-img.save(png)
+assert img.save(png), f"could not write the overlay snapshot to {png}"
 ok(f"overlay renders a populated panel ({opaque} px, {colours} colours → {png})")
 
 

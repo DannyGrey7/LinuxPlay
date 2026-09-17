@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import os
 import sys
-import mmap
-import ctypes
 import struct
 import socket
 import base64
@@ -660,12 +658,33 @@ def attempt_rehandshake(host_ip, pin=None):
     finally:
         _rehandshake_lock.release()
 
+def _host_source_ips(host_ip):
+    """Every address the negotiated host may legitimately send from.
+
+    The heartbeat socket answers with the session token and treats any PING
+    as proof of host liveness, so an off-path peer must never get through it:
+    resolve the host name the user gave once, up front.
+    """
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(host_ip, None, proto=socket.IPPROTO_UDP):
+            ips.add(info[4][0])
+    except Exception as e:
+        logging.warning("Could not resolve host %r for source checks: %s", host_ip, e)
+    literal = str(host_ip or "").strip().strip("[]")
+    if literal:
+        ips.add(literal)
+    return ips
+
 def heartbeat_responder(host_ip):
+    host_ips = _host_source_ips(host_ip)
+
     def loop():
         first_ping = True
         first_stats = True
         last_stats = 0.0
         last_stats_warn = 0.0
+        last_reject_warn = 0.0
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -678,6 +697,17 @@ def heartbeat_responder(host_ip):
             while True:
                 try:
                     data, addr = sock.recvfrom(256)
+                    if addr[0] not in host_ips:
+                        # PONG carries the session token: never hand it to a
+                        # peer that is not the host we negotiated with, and
+                        # never let one hold the client in "connected".
+                        now = time.time()
+                        if now - last_reject_warn > 30.0:
+                            last_reject_warn = now
+                            logging.warning(
+                                "Ignoring heartbeat/STATS from %s (host is %s).",
+                                addr[0], host_ip)
+                        continue
                     if data.startswith(b"PING"):
                         if first_ping:
                             first_ping = False
@@ -719,7 +749,7 @@ def heartbeat_responder(host_ip):
     t.start()
     return t
 
-def clipboard_listener(app_clipboard):
+def clipboard_listener():
     def loop():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -741,9 +771,11 @@ def clipboard_listener(app_clipboard):
                     if msg.startswith("CLIPBOARD_UPDATE HOST"):
                         text = msg.split("HOST", 1)[1].strip()
                         if text:
-                            app_clipboard.blockSignals(True)
-                            app_clipboard.setText(text)
-                            app_clipboard.blockSignals(False)
+                            # Queue it: QClipboard is a GUI-thread object, so
+                            # setting it from here would emit dataChanged from
+                            # this thread and race the GUI's own clipboard
+                            # access. _drain_clipboard_inbox applies it.
+                            CLIPBOARD_INBOX.put(text)
                 except Exception:
                     time.sleep(0.2)
     t = threading.Thread(target=loop, daemon=True)
@@ -805,19 +837,36 @@ def audio_listener(host_ip, enabled=True):
                 "-f", "mpegts",
                 url,
             ]
+            proc = None
             try:
                 logging.debug("Audio listener command: %s", " ".join(cmd))
-                audio_proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=0            # binary: the reader below parses bytes
                 )
+                audio_proc = proc
+                if audio_stop.is_set():
+                    # Shutdown sampled audio_proc before this spawn assigned
+                    # it, so nothing else will ever stop this player: an
+                    # orphan would keep UDP 6001 and play on after exit.
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
                 last_clock = None
                 last_progress = time.time()
                 buf = b""
                 while True:
-                    ready, _, _ = select.select([audio_proc.stdout], [], [], 1.0)
+                    if audio_stop.is_set():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
+                    ready, _, _ = select.select([proc.stdout], [], [], 1.0)
                     if not ready:
                         if (last_clock is not None
                                 and time.time() - last_progress > AUDIO_STALL_SECS):
@@ -827,14 +876,14 @@ def audio_listener(host_ip, enabled=True):
                             try:
                                 # Release UDP 6001 before the restart, or the
                                 # replacement player would receive nothing.
-                                audio_proc.terminate()
+                                proc.terminate()
                             except Exception:
                                 pass
                             break
-                        if audio_proc.poll() is not None:
+                        if proc.poll() is not None:
                             break
                         continue
-                    chunk = audio_proc.stdout.read(4096)
+                    chunk = proc.stdout.read(4096)
                     if not chunk:
                         break
                     buf += chunk
@@ -856,13 +905,14 @@ def audio_listener(host_ip, enabled=True):
                     if buf and len(buf) > 8192:      # runaway line: drop it
                         buf = b""
                 try:
-                    audio_proc.wait(timeout=2)
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
             except Exception as e:
                 logging.error("Audio listener failed: %s", e)
             finally:
-                audio_proc = None
+                if audio_proc is proc:
+                    audio_proc = None
             if audio_stop.is_set():
                 break
             restarts += 1
@@ -983,10 +1033,15 @@ def _yuv_planes_to_rgb(payload):
         u, v = uv[:, 0::2], uv[:, 1::2]
     else:
         u, v = rows(planes[1]), rows(planes[2])
-    fy, fx = max(1, y.shape[0] // max(1, u.shape[0])), max(1, y.shape[1] // max(1, u.shape[1]))
-    if fx > 1 or fy > 1:
-        u = np.repeat(np.repeat(u, fy, axis=0), fx, axis=1)
-        v = np.repeat(np.repeat(v, fy, axis=0), fx, axis=1)
+    # Chroma is subsampled by 2 (or not at all), but odd frame dimensions make
+    # the ratio inexact — 1079 rows against 540 chroma rows floors to 1 and
+    # used to leave u/v smaller than y, so np.stack raised inside paintEvent.
+    # Ceiling-divide, repeat, then clip back to the luma size.
+    fy = max(1, -(-y.shape[0] // max(1, u.shape[0])))
+    fx = max(1, -(-y.shape[1] // max(1, u.shape[1])))
+    if (u.shape[0], u.shape[1]) != (y.shape[0], y.shape[1]):
+        u = np.repeat(np.repeat(u, fy, axis=0), fx, axis=1)[:y.shape[0], :y.shape[1]]
+        v = np.repeat(np.repeat(v, fy, axis=0), fx, axis=1)[:y.shape[0], :y.shape[1]]
     yuv = np.stack([(y - 16.0) / 255.0, (u - 128.0) / 255.0,
                     (v - 128.0) / 255.0], axis=-1)
     rgb = np.clip(yuv @ np.array(_YUV_MATRIX_709 if cs709 else _YUV_MATRIX_601).T,
@@ -1070,18 +1125,27 @@ def _parse_host_stats(msg):
     out = {}
     for name, raw in zip(names, parts[1:]):
         try:
-            out[name] = float(raw)
+            value = float(raw)
         except Exception:
-            pass
+            continue
+        # "inf"/"nan"/"1e999" all parse as floats but would reach the
+        # graph maths, where log10(inf) raises inside paintEvent — which
+        # PyQt turns into qFatal(). Never let a datagram carry one in.
+        if not math.isfinite(value):
+            continue
+        out[name] = value
     return out or None
 
 
 class DecoderThread(QThread):
     frame_ready = pyqtSignal(object)
 
-    def __init__(self, input_url, decoder_opts, ultra=False):
+    def __init__(self, input_url, decoder_opts, ultra=False, url_provider=None):
         super().__init__()
         self.input_url = input_url
+        # Called before every (re)connect so the path MTU is re-probed when the
+        # client moves between Wi-Fi, Ethernet and Tailscale mid-session.
+        self._url_provider = url_provider
         self.decoder_opts = dict(decoder_opts or {})
         self.decoder_opts.setdefault("probesize", "32")
         self.decoder_opts.setdefault("analyzeduration", "0")
@@ -1105,6 +1169,7 @@ class DecoderThread(QThread):
         self._hw_name = None
         self.counters = StreamCounters()
         self._hwaccel = None
+        self.reconnects = 0
 
     def _open_container(self):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
@@ -1114,9 +1179,15 @@ class DecoderThread(QThread):
         return av.open(self.input_url, format="mpegts", options=self.decoder_opts)
 
     def run(self):
+        first_attempt = True
         while self._running:
             container = None
+            if not first_attempt:
+                self.reconnects += 1
+            first_attempt = False
             try:
+                if self._url_provider is not None:
+                    self.input_url = self._url_provider()
                 container = self._open_container()
                 vstream = next((s for s in container.streams if s.type == "video"), None)
                 if not vstream:
@@ -1197,7 +1268,6 @@ class DecoderThread(QThread):
                         self.decoder_opts.pop("hwaccel", None)
                         self.decoder_opts.pop("hwaccel_device", None)
 
-                hw_frames = None
                 t_decode = []
 
                 for frame in _counted_decode(container, self.counters, video=0):
@@ -1207,34 +1277,21 @@ class DecoderThread(QThread):
                         continue
 
                     t0 = time.perf_counter()
-                    dmabuf_fd = None
 
-                    try:
-                        if frame.hw_frames_ctx:
-                            hw_frames = frame.hw_frames_ctx
-                        if hasattr(frame, "planes") and frame.planes:
-                            p = frame.planes[0]
-                            if hasattr(p, "fd"):
-                                dmabuf_fd = p.fd
-                            elif hasattr(p, "buffer_ptr") and isinstance(p.buffer_ptr, int):
-                                dmabuf_fd = p.buffer_ptr
-                    except Exception:
-                        dmabuf_fd = None
-
-                    if dmabuf_fd is not None:
+                    # No dmabuf payload: paintGL cannot draw one (and the
+                    # ValueError it used to raise inside paintEvent aborts the
+                    # process through qFatal). Planes are read through
+                    # _frame_planes when possible, else converted to RGB.
+                    payload = _frame_planes(frame)
+                    if payload is not None:
                         self._has_first_frame = True
-                        self.frame_ready.emit(("dmabuf", dmabuf_fd, frame.width, frame.height))
+                        self.frame_ready.emit(payload)
                     else:
-                        payload = _frame_planes(frame)
-                        if payload is not None:
-                            self._has_first_frame = True
-                            self.frame_ready.emit(payload)
-                        else:
-                            arr = frame.to_ndarray(format="rgb24")
-                            if not arr.flags["C_CONTIGUOUS"]:
-                                arr = np.ascontiguousarray(arr, dtype=np.uint8)
-                            self._has_first_frame = True
-                            self.frame_ready.emit((arr, frame.width, frame.height))
+                        arr = frame.to_ndarray(format="rgb24")
+                        if not arr.flags["C_CONTIGUOUS"]:
+                            arr = np.ascontiguousarray(arr, dtype=np.uint8)
+                        self._has_first_frame = True
+                        self.frame_ready.emit((arr, frame.width, frame.height))
 
                     t1 = time.perf_counter()
                     self._frame_count += 1
@@ -1292,220 +1349,6 @@ class DecoderThread(QThread):
         self._running = False
         time.sleep(0.05)
 
-class RenderBackend:
-    def render_frame(self, frame_tuple):
-        pass
-    def is_valid(self):
-        return False
-    def name(self):
-        return "unknown"
-
-class RenderKMSDRM(RenderBackend):
-    def __init__(self):
-        self.valid = False
-        self.fd = None
-        self.gbm = None
-        self.bo = None
-        self.map = None
-        self.stride = 0
-        self.width = 0
-        self.height = 0
-        self.device_path = None
-
-        for node in ("/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/card0", "/dev/dri/card1"):
-            if os.path.exists(node) and os.access(node, os.W_OK):
-                try:
-                    self.fd = os.open(node, os.O_RDWR | os.O_CLOEXEC)
-                    self.device_path = node
-                    self.valid = True
-                    break
-                except Exception:
-                    continue
-
-        if not self.valid:
-            logging.debug("KMSDRM: no accessible DRM device found.")
-            return
-
-        try:
-            self.libgbm = ctypes.CDLL("libgbm.so.1")
-
-            self.libgbm.gbm_create_device.argtypes = [ctypes.c_int]
-            self.libgbm.gbm_create_device.restype = ctypes.c_void_p
-
-            self.libgbm.gbm_bo_create.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                                                  ctypes.c_uint32, ctypes.c_uint32]
-            self.libgbm.gbm_bo_create.restype = ctypes.c_void_p
-
-            self.libgbm.gbm_bo_get_stride.argtypes = [ctypes.c_void_p]
-            self.libgbm.gbm_bo_get_stride.restype = ctypes.c_uint32
-
-            self.libgbm.gbm_bo_destroy.argtypes = [ctypes.c_void_p]
-            self.libgbm.gbm_device_destroy.argtypes = [ctypes.c_void_p]
-
-            self.gbm = self.libgbm.gbm_create_device(self.fd)
-            if not self.gbm:
-                raise RuntimeError("gbm_create_device() failed")
-
-            self.valid = True
-            logging.info(f"KMSDRM initialized (safe render-node) via {self.device_path}")
-        except Exception as e:
-            logging.debug(f"KMSDRM init failed: {e}")
-            self.valid = False
-
-    def is_valid(self):
-        return self.valid
-
-    def name(self):
-        return "KMSDRM"
-
-    def _alloc_bo(self, w, h):
-        if not self.valid or not self.gbm:
-            return
-        try:
-            if self.bo:
-                self.libgbm.gbm_bo_destroy(self.bo)
-                self.bo = None
-
-            DRM_FORMAT_ARGB8888 = 0x34325241
-            GBM_BO_USE_RENDERING = 1 << 1
-
-            self.bo = self.libgbm.gbm_bo_create(self.gbm, w, h, DRM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING)
-            if not self.bo:
-                raise RuntimeError("gbm_bo_create() failed")
-
-            self.stride = self.libgbm.gbm_bo_get_stride(self.bo)
-            size = self.stride * h
-
-            if self.map:
-                self.map.close()
-            self.map = mmap.mmap(self.fd, size, mmap.MAP_SHARED,
-                                 mmap.PROT_READ | mmap.PROT_WRITE, offset=0)
-            self.width, self.height = w, h
-            logging.debug(f"KMSDRM GBM buffer {w}x{h} stride={self.stride}")
-        except Exception as e:
-            logging.debug(f"KMSDRM alloc failed: {e}")
-            self.valid = False
-
-    def _import_dmabuf(self, fd, w, h):
-        try:
-            size = w * h * 4
-            with mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ) as buf:
-                data = buf.read(size)
-            logging.debug(f"KMSDRM: imported dmabuf FD={fd} ({w}x{h})")
-            return np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
-        except Exception as e:
-            logging.debug(f"KMSDRM: dmabuf import failed: {e}")
-            return None
-
-    def render_frame(self, frame_tuple):
-        if not self.valid:
-            return
-        t0 = time.perf_counter()
-        try:
-            is_dmabuf = (
-                isinstance(frame_tuple, tuple)
-                and len(frame_tuple) == 4
-                and isinstance(frame_tuple[0], str)
-                and frame_tuple[0] == "dmabuf"
-            )
-
-            if is_dmabuf:
-                _, fd, w, h = frame_tuple
-                w, h = int(w), int(h)
-                arr = self._import_dmabuf(fd, w, h)
-                if not isinstance(arr, np.ndarray) or arr.size == 0:
-                    return
-            else:
-                arr, w, h = frame_tuple
-                w, h = int(w), int(h)
-                if not isinstance(arr, np.ndarray) or arr.size == 0:
-                    return
-
-            cur_w = int(getattr(self, "width", 0) or 0)
-            cur_h = int(getattr(self, "height", 0) or 0)
-            if (w != cur_w) or (h != cur_h):
-                self._alloc_bo(w, h)
-
-            data = np.ascontiguousarray(arr, dtype=np.uint8)
-            if self.map and hasattr(self.map, "write"):
-                self.map.seek(0)
-                self.map.write(data.tobytes())
-
-            dt = (time.perf_counter() - t0) * 1000.0
-            logging.debug(f"KMSDRM upload {w}x{h} ({data.nbytes/1024/1024:.2f} MB) in {dt:.2f} ms to {self.device_path}")
-        except Exception as e:
-            logging.debug(f"KMSDRM render error: {e}")
-
-class RenderVulkan(RenderBackend):
-    def __init__(self):
-        try:
-            import vulkan as vk
-            self.valid = True
-        except Exception:
-            self.valid = False
-
-    def is_valid(self):
-        return self.valid
-
-    def name(self):
-        return "Vulkan"
-
-    def render_frame(self, frame_tuple):
-        try:
-            if isinstance(frame_tuple, tuple) and len(frame_tuple) == 4 and isinstance(frame_tuple[0], str) and frame_tuple[0] == "dmabuf":
-                return
-            arr, w, h = frame_tuple
-            if not isinstance(arr, np.ndarray) or arr.size == 0:
-                return
-            t0 = time.perf_counter()
-            _ = np.mean(arr)
-            dt = (time.perf_counter() - t0) * 1000.0
-            logging.debug(f"Vulkan simulated render {int(w)}x{int(h)} in {dt:.2f} ms")
-        except Exception as e:
-            logging.debug(f"Vulkan render error: {e}")
-
-class RenderOpenGL(RenderBackend):
-    def __init__(self):
-        self.valid = True
-
-    def is_valid(self):
-        return self.valid
-
-    def name(self):
-        return "OpenGL"
-
-    def render_frame(self, frame_tuple):
-        try:
-            if isinstance(frame_tuple, tuple) and len(frame_tuple) == 4 and isinstance(frame_tuple[0], str) and frame_tuple[0] == "dmabuf":
-                return
-            arr, w, h = frame_tuple
-            if not isinstance(arr, np.ndarray) or arr.size == 0:
-                return
-            t0 = time.perf_counter()
-            _ = np.mean(arr)
-            dt = (time.perf_counter() - t0) * 1000.0
-            logging.debug(f"OpenGL simulated render {int(w)}x{int(h)} in {dt:.2f} ms")
-        except Exception as e:
-            logging.debug(f"OpenGL render error: {e}")
-
-def pick_best_renderer():
-    renderers = (RenderKMSDRM, RenderVulkan, RenderOpenGL)
-    selected = None
-    for renderer_cls in renderers:
-        r = renderer_cls()
-        logging.debug(f"Trying renderer: {r.name()} (valid={r.is_valid()})")
-        if r.is_valid():
-            selected = r
-            logging.info(f"Renderer selected: {r.name()}")
-            if hasattr(r, "device_path") and r.device_path:
-                logging.info(f"Using device path: {r.device_path}")
-            break
-
-    if not selected:
-        logging.warning("No GPU renderer found, using dummy software renderer.")
-        selected = RenderBackend()
-    return selected
-
 class VideoWidgetGL(QOpenGLWidget):
     def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip,
                  parent=None, toggle_overlay=None, desktop_size=None):
@@ -1559,12 +1402,10 @@ class VideoWidgetGL(QOpenGLWidget):
             exists = "✅" if os.path.exists(node) else "❌"
             access = "🟢" if os.access(node, os.W_OK) else "🔴"
             logging.info(f"  {node:<20} exists={exists} access={access}")
-        logging.info("Renderer priority order: KMSDRM → Vulkan → OpenGL")
-
-        self.renderer = pick_best_renderer()
-        logging.info(f"Using render backend: {self.renderer.name()}")
-        if hasattr(self.renderer, "device_path") and self.renderer.device_path:
-            logging.info(f"Bound to device: {self.renderer.device_path}")
+        # All drawing happens here in paintGL (QOpenGLWidget); the earlier
+        # KMSDRM/Vulkan/OpenGL renderer classes were never called by anything.
+        self.render_backend = "OpenGL"
+        logging.info("Using render backend: %s (QOpenGLWidget paintGL)", self.render_backend)
         logging.info("────────────────────────────────────────────")
 
     def on_clipboard_change(self):
@@ -1728,8 +1569,14 @@ class VideoWidgetGL(QOpenGLWidget):
             # shader build failed: convert on the CPU and take the legacy upload
             arr = _yuv_planes_to_rgb(payload)
             fw, fh = payload[2], payload[3]
-        else:
+        elif kind == "rgb":
             arr, fw, fh = payload
+        else:
+            # A payload this renderer cannot draw: skipping the frame beats
+            # raising inside a paint handler, which PyQt turns into qFatal().
+            logging.debug("Unsupported frame payload %r — skipping paint.", kind)
+            glClear(GL_COLOR_BUFFER_BIT)
+            return
 
         if self._pending_resize:
             w, h = self._pending_resize
@@ -1772,10 +1619,6 @@ class VideoWidgetGL(QOpenGLWidget):
             # plane textures manage their own size; just track it
             _, _planes, fw, fh, _cs, _frame = frame_tuple
             self.texture_width, self.texture_height = fw, fh
-        elif kind == "dmabuf":
-            _, _fd, fw, fh = frame_tuple
-            if (fw, fh) != (self.texture_width, self.texture_height):
-                self.resizeTexture(fw, fh)
         else:
             _arr, fw, fh = frame_tuple
             if (fw, fh) != (self.texture_width, self.texture_height):
@@ -2195,6 +2038,8 @@ class StatsOverlay(QWidget):
         if len(values) < 2:
             return
         vmax = max(series.peak, 1e-9)
+        if not math.isfinite(vmax):
+            return                       # one bad sample must not abort the paint
         step = 10 ** math.floor(math.log10(vmax))
         vmax = max(math.ceil(vmax / step) * step, step)
         path = QPainterPath()
@@ -2227,7 +2072,7 @@ class MainWindow(QMainWindow):
         self.offset_x, self.offset_y = offset_x, offset_y
         self.host_ip, self.ultra = host_ip, ultra
         self.udp_port = udp_port
-        self._running, self._restarts = True, 0
+        self._running = True
         self.gamepad_mode = gamepad
         self.gamepad_dev = gamepad_dev
 
@@ -2296,7 +2141,7 @@ class MainWindow(QMainWindow):
             self._audio_thread = None
 
         try:
-            self._clip_thread = clipboard_listener(QApplication.clipboard())
+            self._clip_thread = clipboard_listener()
         except Exception as e:
             logging.error(f"Clipboard listener failed: {e}")
             self._clip_thread = None
@@ -2341,26 +2186,15 @@ class MainWindow(QMainWindow):
 
     def _start_decoder_thread(self):
         self.video_url = self._video_url_for_path()
-        self.decoder_thread = DecoderThread(self.video_url, self.decoder_opts, ultra=self.ultra)
-        self.decoder_thread.frame_ready.connect(self.video_widget.updateFrame, Qt.DirectConnection)
-        self.decoder_thread.finished.connect(self._on_decoder_exit)
+        self.decoder_thread = DecoderThread(self.video_url, self.decoder_opts,
+                                            ultra=self.ultra,
+                                            url_provider=self._video_url_for_path)
+        # Queued, not Direct: updateFrame touches widget state (isVisible,
+        # update, texture bookkeeping) that must stay on the GUI thread.
+        self.decoder_thread.frame_ready.connect(self.video_widget.updateFrame,
+                                                Qt.QueuedConnection)
         self.decoder_thread.start()
         logging.info("Decoder thread started")
-
-    def _on_decoder_exit(self):
-        if not self._running:
-            return
-        self._restarts += 1
-        delay = min(1.0 + (self._restarts * 0.3), 5.0)
-        logging.warning(f"Decoder thread exited — attempting restart in {delay:.1f}s")
-        QTimer.singleShot(int(delay * 1000), self._restart_decoder_safe)
-
-    def _restart_decoder_safe(self):
-        if self._running:
-            try:
-                self._start_decoder_thread()
-            except Exception as e:
-                logging.error(f"Decoder restart failed: {e}")
 
     def _poll_connection_state(self):
         now = time.time()
@@ -2463,10 +2297,7 @@ class MainWindow(QMainWindow):
             self._prev_drops, self._prev_drops_t = drops, now
 
         uptime = int(now - self._session_start)
-        try:
-            backend = self.video_widget.renderer.name()
-        except Exception:
-            backend = "?"
+        backend = getattr(self.video_widget, "render_backend", "OpenGL")
         hw = getattr(getattr(self, "decoder_thread", None), "_hw_name", None) or "CPU"
         status = ("connected" if CLIENT_STATE["connected"]
                   else ("reconnecting…" if CLIENT_STATE["reconnecting"] else "idle"))
@@ -2474,9 +2305,10 @@ class MainWindow(QMainWindow):
         kf_txt = f"{data.get('keyframes', 0):.0f}/s" if "keyframes" in data else "—"
         data["headline"] = (f"LinuxPlay · {self.host_ip}:{self.udp_port} · "
                             f"{self.texture_width}x{self.texture_height}")
+        restarts = getattr(getattr(self, "decoder_thread", None), "reconnects", 0)
         data["info"] = [
             f"link {CLIENT_STATE.get('net_mode', 'lan')} · {status} · "
-            f"{uptime // 60:02d}:{uptime % 60:02d} up · {self._restarts} restarts",
+            f"{uptime // 60:02d}:{uptime % 60:02d} up · {restarts} reconnects",
             f"decode {hw} · render {backend}",
             f"host encode {enc_txt} @ {host_stats.get('fps', 0):.0f} fps · "
             f"cpu {host_stats.get('cpu', 0):.0f}% gpu {host_stats.get('gpu', 0):.0f}%",
@@ -2508,9 +2340,7 @@ class MainWindow(QMainWindow):
             mem = self._proc.memory_info().rss / (1024 * 1024)
             gpu = self._read_gpu_usage()
             fps = getattr(self.video_widget, "_fps", 0.0)
-            renderer_name = getattr(self.video_widget.renderer, "name", lambda: "Unknown")()
-            device_info = getattr(self.video_widget.renderer, "device_path", None)
-            backend = f"{renderer_name} ({os.path.basename(device_info)})" if device_info else renderer_name
+            backend = getattr(self.video_widget, "render_backend", "OpenGL")
 
             base_title = "LinuxPlay"
             status = ""
@@ -2668,7 +2498,8 @@ def main():
     from PyQt5.QtGui import QSurfaceFormat
 
     p = argparse.ArgumentParser(description="LinuxPlay Client (Linux/Windows/macOS)")
-    p.add_argument("--decoder", choices=["none", "h.264", "h.265"], default="none")
+    p.add_argument("--decoder", choices=["none", "h.264", "h.265"], default="none",
+                   help="Expected stream codec; a mismatch with the host is logged.")
     p.add_argument("--host_ip", required=True)
     p.add_argument("--pin", default=None, help="6-digit host PIN (optional; will prompt if required)")
     p.add_argument("--audio", choices=["enable", "disable"], default="disable")
@@ -2742,6 +2573,11 @@ def main():
         sys.exit(1)
     host_encoder, monitor_info_str = host_info[0], host_info[1]
     stream_size = _size_from_text(host_info[2]) if len(host_info) > 2 else None
+    # PyAV decodes whatever the stream carries; --decoder only lets the user
+    # state what they expect, so surface a mismatch instead of ignoring it.
+    if args.decoder not in ("none", host_encoder):
+        logging.warning("Host streams %s but --decoder %s was requested — "
+                        "decoding the stream as sent.", host_encoder, args.decoder)
     CLIENT_STATE["connected"] = True
     CLIENT_STATE["last_heartbeat"] = time.time()
     logging.info("Host streams %s; desktop %s",

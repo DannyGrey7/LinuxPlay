@@ -2,14 +2,31 @@
 """Live portal screencast test: negotiate, capture 1 frame per monitor, print stats.
 
 The frame is never written to disk - only numeric statistics are reported.
+A blank frame means the capture could not be verified (the portal is
+damage-driven, so an idle desktop can legitimately produce none): the test
+reports SKIP (exit 77) instead of claiming success, which is how a black-screen
+regression used to pass.
 """
+import os
 import subprocess
 import sys
 
 import numpy as np
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import portal_capture as pc  # noqa: E402
+
+PASS, SKIPPED = [], []
+
+
+def ok(name):
+    PASS.append(name)
+    print(f"  PASS: {name}")
+
+
+def skip(name, why):
+    SKIPPED.append(name)
+    print(f"  SKIP: {name} — {why}")
 
 # ── the feeder must rescale: the portal reports the logical size (e.g.
 # 1707x1067 at 150% scaling) while the node hands out the panel's own buffers
@@ -25,7 +42,7 @@ assert "videorate" not in pc.build_feeder_cmd(_stream), "no fps asked for, no ra
 # --resolution: the same scaling stage produces the smaller stream.
 _scaled_feeder = pc.build_feeder_cmd(_stream, fps=60, size=(1280, 720))
 assert "video/x-raw,format=BGRx,width=1280,height=720,framerate=60/1" in _scaled_feeder, _scaled_feeder
-print("  PASS: feeder command rescales the node's buffers to the logical size")
+ok("feeder command rescales the node's buffers to the logical size")
 
 p = pc.PortalCapture()
 try:
@@ -62,13 +79,25 @@ try:
                 print(f"monitor {i} {want[0]}x{want[1]}: frame bytes={len(raw)} "
                       f"(expected {expected})")
                 print(f"  min={arr.min()} max={arr.max()} mean={arr.mean():.1f} std={arr.std():.1f}")
-                verdict = "CONTENT OK (non-blank)" if arr.std() > 5 else "SUSPICIOUS: blank/uniform frame"
+                if arr.std() > 5:
+                    verdict = "CONTENT OK (non-blank)"
+                    ok(f"monitor {i} {want[0]}x{want[1]}: real content captured")
+                else:
+                    verdict = "blank/uniform"
+                    # The portal only delivers frames when the compositor has
+                    # damage to report, so an idle desktop looks like this.
+                    skip(f"monitor {i} {want[0]}x{want[1]} frame content",
+                         "blank frame — produce some screen damage (notify-send) and rerun")
                 print(f"  -> {verdict}")
             finally:
                 feeder.terminate()
                 err = feeder.stderr.read().decode(errors="replace").strip()
                 if err:
                     print(f"  feeder stderr: {err.splitlines()[0]}")
-    print("PORTAL CAPTURE TEST PASSED")
 finally:
     p.close()
+
+print(f"\nPORTAL CAPTURE TEST PASSED ({len(PASS)} checks"
+      + (f", {len(SKIPPED)} skipped)" if SKIPPED else ")"))
+if SKIPPED:
+    sys.exit(77)

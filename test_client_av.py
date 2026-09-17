@@ -19,10 +19,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import client   # noqa: E402
 
-PASS = []
+PASS, SKIPPED = [], []
+
+
 def ok(name):
     PASS.append(name)
     print(f"  PASS: {name}")
+
+
+def skip(name, why):
+    SKIPPED.append(name)
+    print(f"  SKIP: {name} — {why}")
 
 
 # ── 1. ffplay status-line parser (real line shapes) ──
@@ -128,7 +135,7 @@ _glw.resize(96, 64)
 _glw.show()
 _app.processEvents()
 if _glw._yuv_prog is None:
-    print("  SKIP: no OpenGL context offscreen — shader render test not run")
+    skip("GL shader render", "no OpenGL context offscreen")
 else:
     def _gl_readback():
         img = _glw.grabFramebuffer().scaled(96, 64)
@@ -163,8 +170,53 @@ else:
     want = legacy[2:-2, 2:-2]
     diff = np.abs(got.astype(np.int16) - want.astype(np.int16))
     assert diff.max() <= 2, f"rgb24 payload render diverged (max {diff.max()})"
+    # A payload the renderer cannot draw (the retired dmabuf hand-off) must be
+    # skipped, not raised: an exception in paintEvent is qFatal in PyQt.
+    _glw.frame_data = ("dmabuf", 3, 96, 64)
+    _glw.paintGL()
+    _glw.frame_data = None
     _glw.hide()
     ok("GL shader renders 420p/444p/nv12 (incl. format switches) matching swscale")
+    ok("an undrawable payload is skipped instead of aborting paintEvent")
+
+# ── 2e. frames cross threads through the queued connection ───────────
+# MainWindow hands decoder frames to updateFrame with Qt.QueuedConnection so
+# the widget is only ever touched on the GUI thread. Exercise that wiring with
+# a real QThread, exactly as the decoder thread does it.
+from PyQt5.QtCore import Qt, QThread, pyqtSignal                # noqa: E402
+
+
+class _Emitter(QThread):
+    ready = pyqtSignal(object)
+
+    def run(self):
+        self.ready.emit(("rgb", np.zeros((4, 4, 3), np.uint8), 4, 4))
+
+
+_received = []
+_emitter = _Emitter()
+_target = client.VideoWidgetGL(lambda m: None, 96, 64, 0, 0, "127.0.0.1")
+
+
+def _record(payload):
+    # Runs in the GUI thread: prove it by comparing against the emitter thread.
+    _received.append((payload, QThread.currentThread()))
+
+
+_emitter.ready.connect(_record, Qt.QueuedConnection)
+_emitter.start()
+_gui_thread = QThread.currentThread()
+_deadline = time.time() + 5
+while not _received and time.time() < _deadline:
+    _app.processEvents()
+    time.sleep(0.01)
+_emitter.wait(2000)
+assert _received, "a queued frame never arrived"
+_payload, _thread = _received[0]
+assert _payload[0] == "rgb" and _payload[2] == 4
+assert _thread is _gui_thread, "updateFrame-style slots must run on the GUI thread"
+ok("decoder frames reach the GUI thread through a queued connection")
+
 
 # ── 3. hwaccel factory: only offers what this PyAV/FFmpeg can actually do ──
 from av.codec.hwaccel import hwdevices_available          # noqa: E402
@@ -274,4 +326,7 @@ assert (_map_native.desktop_width, _map_native.desktop_height) == (2560, 1440)
 ok("native stream: mapping unchanged (desktop size defaults to the stream size)")
 
 
-print(f"\nALL {len(PASS)} CLIENT A/V TESTS PASSED")
+print(f"\nALL {len(PASS)} CLIENT A/V TESTS PASSED"
+      + (f" ({len(SKIPPED)} skipped)" if SKIPPED else ""))
+if SKIPPED:
+    sys.exit(77)

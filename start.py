@@ -8,8 +8,10 @@ import logging
 import subprocess
 import platform
 import threading
-import uuid
 import shutil
+
+import hostcmd
+import hostlock
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
@@ -631,7 +633,7 @@ class HostTab(QWidget):
 
     def _on_host_exited(self, proc, rc):
         """GUI-thread handler for a finished host process."""
-        if proc is not self.host_process:
+        if self.host_process is not None and proc is not self.host_process:
             return                       # a newer launch already owns the slot
         self.host_process = None
         self._update_buttons()
@@ -647,20 +649,70 @@ class HostTab(QWidget):
                else "No output was captured."),
         )
 
+    def _external_host(self):
+        """(info, pids) for a host this window did not start, or (None, []).
+
+        The lock is authoritative; the port probe catches a host started by a
+        version that had no lock file yet.
+        """
+        try:
+            return hostlock.running_host()
+        except Exception:
+            return None, []
+
     def _update_buttons(self):
         running_host = _proc_is_running(self.host_process)
         running_ffmpeg = _ffmpeg_running_for_us()
-        can_start = not (running_host or running_ffmpeg)
+        external, _ext_pids = (None, []) if running_host else self._external_host()
+        # A host running elsewhere can be taken over — we stop it first. A stray
+        # LinuxPlay ffmpeg with no host to stop would just double-encode.
+        can_start = not (running_host or (running_ffmpeg and not external))
         self.startButton.setEnabled(can_start)
         if running_host:
             self.startButton.setToolTip("Disabled: Host is running.")
             self.statusLabel.setText("Host running…")
+        elif external:
+            self.startButton.setToolTip("Stop that host and start this one with the settings above.")
+            self.statusLabel.setText(f"Host running elsewhere ({hostlock.format_holder(external)})")
         elif running_ffmpeg:
             self.startButton.setToolTip("Disabled: LinuxPlay FFmpeg still running.")
             self.statusLabel.setText("LinuxPlay ffmpeg still running…")
         else:
             self.startButton.setToolTip("Start the host.")
             self.statusLabel.setText("Ready")
+
+    def _confirm_takeover(self, other, pids) -> bool:
+        """Ask before stopping a host that is already running (autostart at login)."""
+        answer = QMessageBox.question(
+            self,
+            "A LinuxPlay host is already running",
+            f"A LinuxPlay host is already running:\n\n"
+            f"    {hostlock.format_holder(other)}\n\n"
+            "It was not started from this window — most likely by the login autostart.\n\n"
+            "Stop it and start this host with the settings above?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return False
+        if not pids:
+            QMessageBox.warning(
+                self,
+                "Could not identify the running host",
+                f"{hostlock.format_holder(other)}, but no LinuxPlay host process owns it.\n\n"
+                "Stop whatever holds that port and start the host again.",
+            )
+            return False
+        if not hostlock.shutdown_host(pids, hostlock.released_predicate(other), timeout=5.0):
+            QMessageBox.warning(
+                self,
+                "Could not stop the running host",
+                f"The running host ({hostlock.format_holder(other)}) did not stop.\n\n"
+                "Stop it by hand — close its window, or run `./run.sh autostart stop` — "
+                "and start the host again.",
+            )
+            return False
+        return True
 
     def start_host(self):
         if not IS_LINUX:
@@ -686,12 +738,6 @@ class HostTab(QWidget):
             self._update_buttons()
             return
 
-        framerate = self.framerateCombo.currentText()
-        bitrate = self.bitrateCombo.currentText()
-        audio = self.audioCombo.currentText()
-        adaptive = self.adaptiveCheck.isChecked()
-        display = self.displayCombo.currentText()
-
         resolution = self.resolutionCombo.currentText().strip()
         if resolution.lower() in ("", "native", "native (desktop)", "auto", "desktop"):
             resolution = "native"
@@ -706,73 +752,22 @@ class HostTab(QWidget):
             self._update_buttons()
             return
 
-        preset = "" if self.presetCombo.currentText() in ("Default", "None") else self.presetCombo.currentText()
-        gop = self.gopCombo.currentText()
-        qp_val = self.qpCombo.currentText()
-        qp = "" if qp_val in ("None", "", None) else qp_val
-        tune_val = self.tuneCombo.currentText()
-        tune = "" if tune_val in ("None", "", None) else tune_val
-        pix_fmt = self.pixFmtCombo.currentText()
-        debug = self.debugCheck.isChecked()
-        hwenc = self.hwencCombo.currentData() or "auto"
-    
-        cmd = [
-            sys.executable,
-            os.path.join(HERE, "host.py"),
-            "--gui",
-            "--encoder", encoder,
-            "--framerate", framerate,
-            "--resolution", resolution,
-            "--bitrate", bitrate,
-            "--audio", audio,
-            "--pix_fmt", pix_fmt,
-            "--hwenc", hwenc,
-        ]
+        cfg = self._current_cfg()
 
-        if adaptive:
-            cmd.append("--adaptive")
-        if preset:
-            cmd.extend(["--preset", preset])
-        if qp:
-            cmd.extend(["--qp", qp])
-        if tune:
-            cmd.extend(["--tune", tune])
-        if debug:
-            cmd.append("--debug")
-        cmd.extend(["--display", display])
-
-        try:
-            _gop_i = int(gop)
-        except Exception:
-            _gop_i = 0
-        if _gop_i > 0:
-            cmd.extend(["--gop", str(_gop_i)])
-        elif preset.lower() in ("llhp", "zerolatency", "ultra-low-latency", "ull"):
-            cmd.extend(["--gop", "1"])
+        # One host per user (see hostlock): a host started elsewhere — the login
+        # autostart, most likely — is holding the ports, so it has to go first.
+        other, other_pids = self._external_host()
+        if other and not self._confirm_takeover(other, other_pids):
+            self._update_buttons()
+            return
 
         self._save_current()
 
-        env = os.environ.copy()
-        env["LINUXPLAY_MARKER"] = LINUXPLAY_MARKER
-        env["LINUXPLAY_SID"] = env.get("LINUXPLAY_SID") or str(uuid.uuid4())
-
-        _am = self.audioModeCombo.currentText().lower()
-        if "music" in _am:
-            env["LP_OPUS_APP"] = "audio"
-            env["LP_OPUS_FD"] = "20"
-        else:
-            env["LP_OPUS_APP"] = "voip"
-            env["LP_OPUS_FD"] = "10"
-
-        cap_mode = getattr(self, "linuxCaptureCombo", None)
-        cap_val = cap_mode.currentData() if cap_mode else "auto"
-        env["LINUXPLAY_CAPTURE"] = cap_val or "auto"
-
-        kms_dev = getattr(self, "kmsDeviceEdit", None)
-        if kms_dev and hasattr(kms_dev, "text"):
-            val = kms_dev.text().strip()
-            if val:
-                env["LINUXPLAY_KMS_DEVICE"] = val
+        # hostcmd is shared with autostart_host.py, so the line started at login is
+        # this same line.
+        cmd = hostcmd.build_host_argv(sys.executable, os.path.join(HERE, "host.py"),
+                                     cfg, gui=True)
+        env = hostcmd.build_host_env(cfg)
 
         log_path = _launch_log_path("host-launch.log")
         self._host_log_path = log_path
@@ -780,7 +775,11 @@ class HostTab(QWidget):
         try:
             self.host_process = subprocess.Popen(
                 cmd,
-                preexec_fn=os.setsid,
+                # start_new_session replaces preexec_fn=os.setsid: preexec_fn is
+                # documented as unsafe in a multithreaded process (a lock held
+                # by another thread at fork can deadlock the child before exec,
+                # and the host then never starts).
+                start_new_session=True,
                 stdout=log_file or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
                 env=env,
@@ -795,13 +794,18 @@ class HostTab(QWidget):
             if log_file:
                 log_file.close()
 
+        proc = self.host_process
+
         def _watch():
             try:
-                rc = self.host_process.wait()
-            except Exception:
-                rc = None
+                rc = proc.wait()
+            except Exception as e:
+                # Emitting None here would read as "exited cleanly" in the
+                # handler, so report the failure explicitly instead.
+                logging.error("Host exit watcher failed: %s", e)
+                rc = "unknown"
             try:
-                launch_emitter.host_exited.emit(self.host_process, rc)
+                launch_emitter.host_exited.emit(proc, rc)
             except Exception:
                 pass
 
@@ -811,9 +815,9 @@ class HostTab(QWidget):
         self._exit_watcher_thread.start()
         self._update_buttons()
 
-    def _save_current(self):
-        data = load_cfg()
-        data["host"] = {
+    def _current_cfg(self):
+        """The Host tab as a settings dict — the same shape autostart_host.py reads."""
+        return {
             "profile": self.profileCombo.currentText(),
             "encoder": self.encoderCombo.currentText(),
             "hwenc": self.hwencCombo.currentData() or "auto",
@@ -829,8 +833,22 @@ class HostTab(QWidget):
             "qp": self.qpCombo.currentText(),
             "tune": self.tuneCombo.currentText(),
             "pix_fmt": self.pixFmtCombo.currentText(),
+            "debug": self.debugCheck.isChecked(),
             "capture": (self.linuxCaptureCombo.currentData() if hasattr(self, "linuxCaptureCombo") else "auto")
         }
+        kms_dev = getattr(self, "kmsDeviceEdit", None)
+        if kms_dev is not None and hasattr(kms_dev, "text"):
+            try:
+                val = kms_dev.text().strip()
+                if val:
+                    cfg["kms_device"] = val
+            except Exception:
+                pass
+        return cfg
+
+    def _save_current(self):
+        data = load_cfg()
+        data["host"] = self._current_cfg()
         save_cfg(data)
 
     def _load_saved(self):
@@ -864,6 +882,7 @@ class HostTab(QWidget):
         set_combo(self.qpCombo, cfg.get("qp"))
         set_combo(self.tuneCombo, cfg.get("tune"))
         set_combo(self.pixFmtCombo, cfg.get("pix_fmt"))
+        self.debugCheck.setChecked(bool(cfg.get("debug", False)))
         if IS_LINUX and hasattr(self, "linuxCaptureCombo"):
             cap_val = cfg.get("capture", "auto")
             for i in range(self.linuxCaptureCombo.count()):
@@ -953,10 +972,26 @@ class ClientTab(QWidget):
         self.startButton.clicked.connect(self.start_client)
         button_layout.addWidget(self.startButton)
 
+        # Track the client this window started: without the slot and the poll
+        # timer every click launched another full client.
+        self.client_process = None
+        self.clientTimer = QTimer(self)
+        self.clientTimer.timeout.connect(self._poll_client_state)
+        self.clientTimer.start(1000)
+
         main_layout.addWidget(form_group)
         main_layout.addLayout(button_layout)
         main_layout.addStretch()
         self.setLayout(main_layout)
+
+    def _poll_client_state(self):
+        if self.client_process is not None and self.client_process.poll() is not None:
+            self.client_process = None
+        running = _proc_is_running(self.client_process)
+        self.startButton.setEnabled(not running)
+        self.startButton.setToolTip(
+            "Disabled: a client started here is still running." if running
+            else "Start the client.")
 
     def _apply_cert_ui_state(self, has_cert: bool):
         if has_cert:
@@ -1003,6 +1038,11 @@ class ClientTab(QWidget):
     def start_client(self):
         if not ffmpeg_ok():
             _warn_ffmpeg(self)
+            return
+        if _proc_is_running(self.client_process):
+            QMessageBox.information(
+                self, "Client already running",
+                "A client started from this window is still running.")
             return
 
         decoder = self.decoderCombo.currentText()
@@ -1066,8 +1106,9 @@ class ClientTab(QWidget):
         log_path = _launch_log_path("client-launch.log")
         self._client_log_path = log_path
         log_file = _open_launch_log(log_path)
+        self.client_process = None
         try:
-            client_proc = subprocess.Popen(
+            self.client_process = subprocess.Popen(
                 cmd,
                 stdout=log_file or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
@@ -1075,17 +1116,20 @@ class ClientTab(QWidget):
         except Exception as e:
             logging.error(f"Failed to start client: {e}")
             QMessageBox.critical(self, "Start Client Failed", str(e))
-            client_proc = None
+            self.client_process = None
         finally:
             if log_file:
                 log_file.close()
 
-        if client_proc is not None:
-            def _watch_client(proc=client_proc):
+        if self.client_process is not None:
+            proc = self.client_process
+
+            def _watch_client(proc=proc):
                 try:
                     rc = proc.wait()
-                except Exception:
-                    return
+                except Exception as e:
+                    logging.error("Client exit watcher failed: %s", e)
+                    rc = "unknown"
                 if rc in (0, None):
                     return
                 try:
@@ -1095,6 +1139,7 @@ class ClientTab(QWidget):
 
             threading.Thread(target=_watch_client, name="ClientExitWatcher",
                              daemon=True).start()
+            self._poll_client_state()
 
     def _on_client_exited(self, proc, rc):
         """GUI-thread handler for a finished client process."""

@@ -29,12 +29,21 @@ Usage:
   ./run.sh start [args...]    # Run start.py (GUI launcher)
   ./run.sh host  [args...]    # Run host.py
   ./run.sh client [args...]   # Run client.py
+  ./run.sh test [name...]     # Run the test_*.py scripts (all, or those matching a name)
+  ./run.sh autostart <cmd>    # Start the host at login (see below)
+
+Autostart commands:
+  ./run.sh autostart enable [--headless]   # install the login autostart entry
+  ./run.sh autostart disable               # remove it
+  ./run.sh autostart status                # entry, running host, portal token
+  ./run.sh autostart stop                  # stop a running host
 
 Behavior:
   - Host: Linux only (X11 or Wayland). Clients: Linux, Windows, macOS
   - Uses a local .venv in this repo (no global pip installs)
   - Installs only missing system deps (where supported)
   - Installs only missing Python deps into .venv
+  - The autostart entry re-reads the launcher's saved Host settings each login
 
   PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperclip psutil evdev cryptography jeepney
   (pynput/evdev are skipped on macOS — client-only platform)
@@ -134,7 +143,7 @@ pkg_for() {
         ffmpeg|ffplay)          echo "ffmpeg" ;;
         xdotool)                echo "xdotool" ;;
         xclip)                  echo "xclip" ;;
-        pactl)                  echo "" ;;
+        pactl)                  echo "pulseaudio-utils" ;;
         setcap)                 echo "libcap-utils" ;;
         wg)                     echo "wireguard-tools" ;;
         qrencode)               echo "qrencode" ;;
@@ -210,7 +219,9 @@ check_python_version() {
   local want="3.9.0"
   local got
   got="$("$PY" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || echo "0")"
-  if printf '%s\n' "$want" "$got" | sort -V -C 2>/dev/null; then
+  # Compare with Python itself: BusyBox sort has no -V, so on Alpine the old
+  # `sort -V -C` check always failed and reported a bogus version error.
+  if "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:3] >= (3, 9, 0) else 1)' 2>/dev/null; then
     printf "OK:    Python3 %s >= %s\n" "$got" "$want"
     return 0
   else
@@ -373,15 +384,37 @@ EOF
   local to_install=""
   if [ $status -ne 0 ]; then
     to_install="$(printf "%s\n" "$missing" | awk '/^MISSING_PKGS /{ $1=""; sub(/^ /,""); print }')"
+    if [ -z "$to_install" ]; then
+      # The probe itself failed (a broken venv python prints no MISSING_PKGS
+      # line). Reporting "all packages available" here used to hand the user a
+      # launcher that immediately died on an import.
+      err "The .venv Python could not run the dependency probe:"
+      printf "%s\n" "$missing" | sed 's/^/  /'
+      bail "The environment is broken — recreate it: rm -rf .venv && ./run.sh check"
+    fi
   fi
 
   if [ -n "$to_install" ]; then
+    # The names come from the probe's hardcoded module list; whitelist them so
+    # a tampered probe cannot smuggle pip options into the install line.
+    local pkgs=()
+    local tok
+    for tok in $to_install; do
+      case "$tok" in
+        PyQt5|PyOpenGL|PyOpenGL_accelerate|av|numpy|jeepney|pyperclip|psutil|cryptography|pynput|evdev)
+          pkgs+=("$tok") ;;
+        *)
+          warn "Ignoring unexpected package token from the dependency probe: '$tok'" ;;
+      esac
+    done
+    [ "${#pkgs[@]}" -eq 0 ] && bail "No valid Python packages to install."
+
     echo
     msg "Installing missing Python packages into .venv:"
-    echo "  $to_install"
+    echo "  ${pkgs[*]}"
     python -m pip install -U pip wheel setuptools
-    python -m pip install $to_install || {
-      err "pip install failed for: $to_install"
+    python -m pip install --no-input "${pkgs[@]}" || {
+      err "pip install failed for: ${pkgs[*]}"
       warn "If 'av' failed to build, ensure FFmpeg dev libraries are installed (see README)."
       exit 1
     }
@@ -395,6 +428,115 @@ bootstrap() {
   check_system_deps || bail "System dependency check failed."
   ensure_venv
   ensure_pydeps
+}
+
+# ── autostart: run the host at login ─────────────────────────────────────────
+# The entry is an XDG autostart .desktop file, so it runs inside the desktop
+# session (portal capture needs the session bus; x11grab/kmsgrab need the
+# display). Every one of these subcommands stays off bootstrap(): enabling an
+# autostart entry must not try to install system packages.
+
+AUTOSTART_NAME="linuxplay-host.desktop"
+
+autostart_target() {
+  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$AUTOSTART_NAME"
+}
+
+# Desktop Entry Exec values are not shell words: quote only when needed.
+exec_field() {
+  case "$1" in
+    *[[:space:]]*) printf '"%s"' "$1" ;;
+    *)             printf '%s' "$1" ;;
+  esac
+}
+
+autostart_enable() {
+  local headless=0
+  for a in "$@"; do
+    case "$a" in
+      --headless) headless=1 ;;
+      *) err "autostart enable: unknown option '$a'"; return 2 ;;
+    esac
+  done
+
+  local py="$SCRIPT_DIR/.venv/bin/python"
+  local runner="$SCRIPT_DIR/autostart_host.py"
+  local target; target="$(autostart_target)"
+  local extra=""
+  if [ "$headless" -eq 1 ]; then extra=" --headless"; fi
+
+  if [ ! -x "$py" ]; then
+    warn "No Python at $py — run ./run.sh check first, or the entry cannot start the host."
+  fi
+
+  mkdir -p "$(dirname "$target")" || bail "Could not create $(dirname "$target")"
+  cat > "$target" <<EOF
+[Desktop Entry]
+Type=Application
+Name=LinuxPlay Host
+Comment=Start the LinuxPlay host at login with the launcher's saved Host settings
+Exec=$(exec_field "$py") $(exec_field "$runner")$extra
+Path=$SCRIPT_DIR
+Terminal=false
+StartupNotify=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+EOF
+  chmod 0644 "$target"
+
+  msg "Autostart entry written: $target"
+  echo "  $(grep -m1 '^Exec=' "$target" || true)"
+  echo "  Settings come from ~/.linuxplay_start_cfg.json (the launcher's Host tab)."
+  echo
+  echo "Test it without logging out:"
+  echo "  $(exec_field "$py") $(exec_field "$runner")$extra"
+  echo
+  echo "One-time portal grant: connect a client once and tick 'remember' in the"
+  echo "screen-share dialog. After that the host captures prompt-free at login,"
+  echo "which is what makes it usable while you are away from the machine."
+  echo
+  echo "Turn it off again in System Settings > Autostart, or: ./run.sh autostart disable"
+}
+
+autostart_disable() {
+  local target; target="$(autostart_target)"
+  if [ -f "$target" ]; then
+    rm -f "$target" && msg "Removed $target"
+    echo "Note: KDE may keep its own copy of the entry's enabled/disabled state;"
+    echo "      System Settings > Autostart should no longer list it."
+  else
+    warn "Nothing to remove (no $target)"
+  fi
+}
+
+autostart_status() {
+  local target; target="$(autostart_target)"
+
+  section "Autostart entry"
+  if [ ! -f "$target" ]; then
+    warn "Not installed — run: ./run.sh autostart enable"
+  elif grep -qi '^[[:space:]]*Hidden=true' "$target"; then
+    warn "Installed but disabled (Hidden=true): $target"
+    warn "  Re-enable it in System Settings > Autostart, or run: ./run.sh autostart enable"
+  else
+    msg "Installed: $target"
+    grep -m1 '^Exec=' "$target" | sed 's/^/  /' || true
+  fi
+
+  section "Host state"
+  local py="$SCRIPT_DIR/.venv/bin/python"
+  if [ -x "$py" ]; then
+    "$py" "$SCRIPT_DIR/autostart_host.py" --status || true
+  else
+    warn "No Python at $py — run ./run.sh check"
+  fi
+}
+
+autostart_stop() {
+  local py="$SCRIPT_DIR/.venv/bin/python"
+  [ -x "$py" ] || bail "No Python at $py (run ./run.sh check)."
+  "$py" "$SCRIPT_DIR/autostart_host.py" --stop
 }
 
 run_mode() {
@@ -421,6 +563,29 @@ run_mode() {
     client)
       bootstrap
       exec python3 client.py "$@"
+      ;;
+    test)
+      # Runs the standalone test_*.py scripts through the runner; a bare
+      # `./run.sh test` runs all of them.
+      if [ ! -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+        bootstrap
+      fi
+      exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/test_all.py" "$@"
+      ;;
+    autostart)
+      local cmd="${1:-status}"; shift || true
+      case "$cmd" in
+        enable)  autostart_enable "$@" ;;
+        disable) autostart_disable ;;
+        status)  autostart_status ;;
+        stop)    autostart_stop ;;
+        ""|-h|--help|help) usage ;;
+        *)
+          err "Unknown autostart command: $cmd"
+          usage
+          exit 1
+          ;;
+      esac
       ;;
     ""|-h|--help|help)
       usage

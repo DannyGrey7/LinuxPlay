@@ -172,6 +172,10 @@ chmod +x run.sh
 # Or directly:
 ./run.sh host --gui --encoder h.264 --hwenc auto --bitrate 8M --audio enable
 ./run.sh client --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto
+
+# Run the test scripts (all of them, or those matching a name)
+./run.sh test
+./run.sh test host parsers
 ```
 
 - Uses a local `.venv` inside the repo.
@@ -263,6 +267,46 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
 
 ---
 
+## Run the host at login (autostart)
+
+```bash
+./run.sh autostart enable              # install it (host window at login)
+./run.sh autostart enable --headless   # ...or with no window
+./run.sh autostart status              # entry, running host, portal state
+./run.sh autostart stop                # stop a running host
+./run.sh autostart disable             # remove it
+```
+
+It writes `~/.config/autostart/linuxplay-host.desktop`, so it runs **inside your desktop
+session** — that is not a limitation to work around: Wayland capture goes through
+xdg-desktop-portal on the session bus, and the X11/KMS paths need `DISPLAY` or `/dev/dri`.
+There is no boot-time (root) variant, because there is nothing to capture before login.
+The entry also shows up in **System Settings → Autostart**, where it can be toggled off.
+
+- **Settings**: the command line is rebuilt at every login from the launcher's saved Host
+  tab (`~/.linuxplay_start_cfg.json`), so what starts is what you last picked in the GUI.
+  No saved settings yet? The Default profile is used (h.264, auto backend, 30 fps, 8M).
+- **Working directory**: the entry pins it to the repo, because `host_ca.pem`,
+  `host_ca.key` and `trusted_clients.json` are relative paths. Starting the host from
+  another directory would create a *new* CA and forget every paired device.
+- **One host per user**: the host holds a lock (`~/.local/state/linuxplay/host.lock`).
+  A second start exits with a message instead of failing on the port bind, and the
+  launcher notices a host it did not start — press **Start Host** and it offers to stop
+  that one and take over. `./run.sh autostart stop` does the same from the shell.
+- **Portal capture is a one-time grant**: the screen-share dialog appears when the *first
+  client connects*, not at login. Approve it once and tick **remember** — the host stores a
+  restore token (`~/.config/linuxplay/portal_restore.json`) and later logins capture without
+  a prompt. Without that grant, a client connecting while you are away waits on a dialog
+  nobody can click and gives up after two minutes. `./run.sh autostart status` says whether
+  the token is there. Changing monitor layout can invalidate it, so re-grant when you rearrange.
+- **Stopping**: closing the host window stops the host (it waits for encoders and the portal
+  session to close). Logging out does the same via SIGTERM. A host started from this launcher
+  keeps its own Stop button.
+- **Logs**: `~/.local/state/linuxplay/autostart.log` records what the entry did (command line,
+  waits, refusals to double-start); the host itself keeps logging to `host.log`.
+
+---
+
 ## Network Modes
 
 - Client auto-detects Wi-Fi vs Ethernet vs VPN tunnel and sends `NET WIFI` / `NET LAN` / `NET VPN`.
@@ -322,6 +366,8 @@ Note: with host and client on the **same** machine the two processes collide on 
   dies overnight leaves evidence instead of nothing.
 - Launcher: `host-launch.log` / `client-launch.log` in the same directory. If a host or
   client exits with a non-zero code, the launcher shows the last lines in a dialog.
+- Autostart: `autostart.log` in the same directory — what the login entry did (the exact
+  command line, session waits, refusal to start a second host).
 - Override the directory anywhere with `LINUXPLAY_STATE_DIR`.
 
 ---
@@ -412,6 +458,31 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
 
 ---
 
+## Tests
+
+The tests are standalone self-checking scripts (`test_*.py`), tied together by
+`test_all.py`:
+
+```bash
+./run.sh test               # everything
+./run.sh test host parsers  # only files whose name matches a substring
+```
+
+- Exit 0 = pass, exit 77 = **skipped** (this machine cannot run that section:
+  no Wayland session, no `/dev/uinput`, an occupied port because a host is
+  running, …), anything else = fail. `test_all.py` exits non-zero only on
+  failures, so it can gate a commit.
+- `test_portal.py` drives the real portal and needs you to approve the share
+  dialog; run it explicitly rather than as part of a quick check. The portal is
+  damage-driven, so on an idle desktop it produces no frames — the test reports
+  that as SKIP instead of pretending to have verified capture.
+- A few tests need a port that a running host/client owns (7003 uploads,
+  7004 heartbeat, 6001 audio). Stop the host first, or expect SKIP.
+- Nothing in the suite injects input into your session: the uinput tests only
+  create the virtual devices, check their capability bitmaps and remove them.
+
+---
+
 ## Security (Please Read!!)
 
 - **LinuxPlay does not encrypt media/control traffic itself.**
@@ -434,6 +505,15 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
 - To revoke:
   - Edit or remove entries in `trusted_clients.json` on the host (read at handshake time),
     or set `"status": "revoked"` on the record.
+- Trust boundary, stated plainly: the session token travels in **cleartext UDP**
+  (every PONG carries it). Both ends pin the peer address — the client answers
+  heartbeat/STATS only from the host it negotiated with, the host accepts
+  control/upload only from the authenticated client IP — so an off-path peer
+  cannot ask for the token or inject input, but a passive sniffer sees it, and
+  one-way UDP source spoofing needs no reply. At the same time FFmpeg's
+  video/audio *receive* ports accept datagrams from any source. That is the
+  home-LAN trust model; anything you would not run an unencrypted stream on
+  needs the VPN/tunnel.
 - If a client asks for the PIN even though it was paired:
   - Enter the PIN — the client asks the host for a replacement certificate during that
     pairing, so the next connection skips the PIN again. A replaced pair is kept on the
