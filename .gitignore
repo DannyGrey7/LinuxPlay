@@ -11,3 +11,8 @@ issued_clients/
 client_cert.pem
 client_key.pem
 *.log
+
+# Local working notes (handoff docs, agent state) — not part of the project
+HANDOFF.md
+.commandcode/
+.zcode/
