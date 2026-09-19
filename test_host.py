@@ -177,6 +177,28 @@ assert native_cmd[native_cmd.index("-video_size") + 1] == "1707x1067", native_cm
 assert stream_cmd[stream_cmd.index("-vf") + 1] == "format=nv12,hwupload", stream_cmd
 ok("portal capture leaves the scaling to the feeder (no double scale)")
 
+# A scaled output makes the two size sources disagree by a pixel: 3840x2160 at
+# 175% is 2194.29x1234.29, which kscreen-doctor rounds up to 2195x1235 while
+# the portal reports 2194x1234. The feeder writes the portal's size into the
+# pipe, so -video_size must say the same — otherwise every frame starts
+# mid-row and the picture shears and rolls.
+_portal_frac = {"node": 68, "w": 2194, "h": 1234}
+with patched(host, ffmpeg_has_encoder=lambda n: True, has_vaapi=lambda: True):
+    old_ip = host.host_state.client_ip
+    host.host_state.client_ip = "127.0.0.1"
+    try:
+        frac_cmd = host.build_video_cmd(_scaled, "30M", (2195, 1235, 0, 0), 5000,
+                                        portal_stream=_portal_frac)
+    finally:
+        host.host_state.client_ip = old_ip
+assert frac_cmd[frac_cmd.index("-video_size") + 1] == "2194x1234", frac_cmd
+assert host._portal_stream_size(_portal_frac) == (2194, 1234)
+assert host._portal_stream_size(_portal_frac, (1280, 720)) == (1280, 720)
+assert "size=_portal_stream_size(ps, stream_size)" in \
+    inspect.getsource(host.start_streams_for_current_client), \
+    "the feeder must be told the same size the encoder reads"
+ok("portal: encoder reads the size the feeder writes when the probe disagrees")
+
 # ── 1d. x11grab keeps the full-monitor region; --resolution scales in ffmpeg ──
 os.environ["LINUXPLAY_CAPTURE"] = "x11grab"
 try:

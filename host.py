@@ -1665,6 +1665,23 @@ def _parse_resolution(value):
     return None
 
 
+def _portal_stream_size(portal_stream, stream_size=None):
+    """The size the portal feeder writes into the pipe — and the encoder reads.
+
+    The portal reports the stream's own size, which is not always what the
+    monitor probe reports: a scaled output is rounded somewhere (a 3840x2160
+    panel at 175% is 2194.29x1234.29, and kscreen-doctor says 2195x1235 while
+    the portal says 2194x1234). The feeder scales the capture to exactly these
+    numbers, and ffmpeg reads raw BGRx frames back off that same pipe, so both
+    must ask for the same size: a -video_size one pixel off makes every decoded
+    frame start mid-row, which shears the picture and rolls it a couple of rows
+    per frame.
+    """
+    if stream_size:
+        return (int(stream_size[0]), int(stream_size[1]))
+    return (int(portal_stream["w"]), int(portal_stream["h"]))
+
+
 def _normalise_codec(value) -> str:
     """Map placeholder encoder values to a real codec name.
 
@@ -1690,7 +1707,12 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
     w, h, ox, oy = monitor_info
     # cap_* is what the encoder is fed: the monitor's own size unless the user
     # asked for a fixed stream size, in which case the capture is rescaled.
-    cap_w, cap_h = stream_size or (w, h)
+    # The portal is the exception: its feeder writes its own size into the pipe,
+    # and that probe-independent size is what -video_size must say.
+    if portal_stream:
+        cap_w, cap_h = _portal_stream_size(portal_stream, stream_size)
+    else:
+        cap_w, cap_h = stream_size or (w, h)
     if (cap_w, cap_h) != (w, h) and abs((cap_w / cap_h) - (w / h)) / (w / h) > 0.02:
         logging.warning(
             "Stream size %dx%d has a different aspect ratio than the %dx%d monitor — "
@@ -2599,15 +2621,17 @@ def start_streams_for_current_client(args):
                     return
             for i, mon in enumerate(host_state.monitors):
                 ps = portal.match_stream(i, mon) if portal else None
+                stream_size = getattr(host_state, "stream_size", None)
                 cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
-                                      portal_stream=ps,
-                                      stream_size=getattr(host_state, "stream_size", None))
+                                      portal_stream=ps, stream_size=stream_size)
                 if not cmd:
                     logging.error(f"Failed to build video cmd for monitor {i}; skipping.")
                     continue
+                # build_video_cmd's -video_size comes from the same call: what
+                # the feeder writes into the pipe is what the encoder reads.
                 feeder = portal_capture.build_feeder_cmd(
                     ps, fps=args.framerate,
-                    size=getattr(host_state, "stream_size", None)) if (portal and ps) else None
+                    size=_portal_stream_size(ps, stream_size)) if (portal and ps) else None
                 t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder)
                 t.start()
                 host_state.video_threads[i] = t
