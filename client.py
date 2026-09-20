@@ -1302,6 +1302,12 @@ class DecoderThread(QThread):
                     if not self._running:
                         break
                     if not frame or frame.is_corrupt:
+                        if frame is not None:
+                            # Counted for the renderer's pacing report: a corrupt
+                            # frame is dropped silently, which otherwise looks
+                            # exactly like "the host sent nothing".
+                            CLIENT_STATE["corrupt_frames"] = \
+                                CLIENT_STATE.get("corrupt_frames", 0) + 1
                         continue
 
                     t0 = time.perf_counter()
@@ -1426,6 +1432,7 @@ class VideoWidgetGL(QOpenGLWidget):
         self._pacing_frames = 0
         self._pacing_max_gap = 0.0
         self._pacing_bursts = 0
+        self._pacing_corrupt_seen = 0
 
         if not logging.getLogger().hasHandlers():
             logging.basicConfig(level=logging.DEBUG,
@@ -1674,10 +1681,22 @@ class VideoWidgetGL(QOpenGLWidget):
             self._pacing_bursts += 1
         window = now - self._pacing_start
         if window >= PACING_WINDOW_SECS:
+            # The host's own encoder rate next to ours is what separates a lossy
+            # link (host sends what it says, frames arrive damaged) from a client
+            # that cannot drain its socket in time (host outruns us, the kernel
+            # drops, and the decoder conceals the holes).
+            stats = CLIENT_STATE.get("host_stats") or {}
+            corrupt = CLIENT_STATE.get("corrupt_frames", 0) - self._pacing_corrupt_seen
+            self._pacing_corrupt_seen += corrupt
+            host_txt = ""
+            if stats.get("fps") is not None:
+                host_txt = f", host {stats['fps']:.0f} fps"
+                if stats.get("enc_kbps"):
+                    host_txt += f" / {stats['enc_kbps'] / 1000.0:.1f} Mb/s"
             logging.info("Frame pacing: %d frames in %.1fs (%.1f fps), max gap %.0f ms, "
-                         "%d arriving under 5 ms", self._pacing_frames, window,
+                         "%d under 5 ms, %d corrupt%s", self._pacing_frames, window,
                          self._pacing_frames / window, self._pacing_max_gap * 1000.0,
-                         self._pacing_bursts)
+                         self._pacing_bursts, corrupt, host_txt)
             self._pacing_start = now
             self._pacing_frames = 0
             self._pacing_max_gap = 0.0
