@@ -1349,6 +1349,9 @@ class DecoderThread(QThread):
         self._running = False
         time.sleep(0.05)
 
+# How often the renderer reports its frame-arrival pacing (see updateFrame).
+PACING_WINDOW_SECS = 5.0
+
 class VideoWidgetGL(QOpenGLWidget):
     def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip,
                  parent=None, toggle_overlay=None, desktop_size=None):
@@ -1387,6 +1390,14 @@ class VideoWidgetGL(QOpenGLWidget):
         self._last_frame_recv = time.time()
         self._last_mouse_ts = 0.0
         self._mouse_throttle = 0.0025
+        # Frame-arrival pacing window, reported once per PACING_WINDOW_SECS:
+        # a hitch the user sees is either a gap (the link or the decoder
+        # stalled) or a burst of near-zero deltas (a stale backlog draining).
+        self._pacing_start = time.time()
+        self._pacing_last = 0.0
+        self._pacing_frames = 0
+        self._pacing_max_gap = 0.0
+        self._pacing_bursts = 0
 
         if not logging.getLogger().hasHandlers():
             logging.basicConfig(level=logging.DEBUG,
@@ -1626,6 +1637,24 @@ class VideoWidgetGL(QOpenGLWidget):
         self._last_frame_recv = time.time()
 
         now = time.time()
+        gap = now - self._pacing_last if self._pacing_last else 0.0
+        self._pacing_last = now
+        self._pacing_frames += 1
+        if gap > self._pacing_max_gap:
+            self._pacing_max_gap = gap
+        if 0.0 < gap < 0.005:
+            self._pacing_bursts += 1
+        window = now - self._pacing_start
+        if window >= PACING_WINDOW_SECS:
+            logging.info("Frame pacing: %d frames in %.1fs (%.1f fps), max gap %.0f ms, "
+                         "%d arriving under 5 ms", self._pacing_frames, window,
+                         self._pacing_frames / window, self._pacing_max_gap * 1000.0,
+                         self._pacing_bursts)
+            self._pacing_start = now
+            self._pacing_frames = 0
+            self._pacing_max_gap = 0.0
+            self._pacing_bursts = 0
+
         if not hasattr(self, "_frame_times"):
             self._frame_times = []
         self._frame_times.append(now)
@@ -2223,23 +2252,27 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        try:
-            for card in os.listdir("/sys/class/drm"):
-                busy_path = f"/sys/class/drm/{card}/device/gpu_busy_percent"
-                if os.path.exists(busy_path):
-                    with open(busy_path, "r") as f:
-                        return float(f.read().strip()), "VAAPI"
-        except Exception:
-            pass
+        if IS_LINUX:
+            # sysfs and GNU timeout + intel_gpu_top exist only on Linux; on
+            # macOS/Windows these two probes can only fail, and they run on the
+            # GUI thread once a second (twice with the overlay up).
+            try:
+                for card in os.listdir("/sys/class/drm"):
+                    busy_path = f"/sys/class/drm/{card}/device/gpu_busy_percent"
+                    if os.path.exists(busy_path):
+                        with open(busy_path, "r") as f:
+                            return float(f.read().strip()), "VAAPI"
+            except Exception:
+                pass
 
-        try:
-            cmd = ["timeout", "0.5", "intel_gpu_top", "-J"]
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-            if '"Busy"' in out:
-                j = json.loads(out)
-                return float(j["engines"]["Render/3D/0"]["busy"]), "iGPU"
-        except Exception:
-            pass
+            try:
+                cmd = ["timeout", "0.5", "intel_gpu_top", "-J"]
+                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
+                if '"Busy"' in out:
+                    j = json.loads(out)
+                    return float(j["engines"]["Render/3D/0"]["busy"]), "iGPU"
+            except Exception:
+                pass
 
         return None, ""
 
@@ -2523,11 +2556,19 @@ def main():
         os.environ["QT_ANGLE_PLATFORM"] = "d3d11"
     else:
         os.environ.setdefault("QT_OPENGL", "desktop")
-        os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_egl")
+        if IS_LINUX:
+            # XCB-only integration hint: it is what drops the compositor's
+            # vblank wait on X11. macOS runs the Cocoa platform plugin.
+            os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_egl")
 
     fmt = QSurfaceFormat()
     fmt.setSwapInterval(0)
-    fmt.setSwapBehavior(QSurfaceFormat.SingleBuffer)
+    # Single buffering skips the swap wait on X11, but Cocoa composites the
+    # window through the WindowServer, so there a single-buffered surface is
+    # drawn straight to screen and flickers (QSurfaceFormat docs); macOS keeps
+    # the platform's double-buffered default and the swap interval of 0.
+    if not IS_MAC:
+        fmt.setSwapBehavior(QSurfaceFormat.SingleBuffer)
     QSurfaceFormat.setDefaultFormat(fmt)
 
     sys.stdout.reconfigure(line_buffering=True)
