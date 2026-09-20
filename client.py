@@ -682,8 +682,11 @@ def heartbeat_responder(host_ip):
     def loop():
         first_ping = True
         first_stats = True
-        last_stats = 0.0
-        last_stats_warn = 0.0
+        # Seeded with the wall clock: starting at 0.0 made the "no STATS"
+        # warning below fire on every startup, reporting an age of ~1.8e9 s
+        # before the host's first datagram had a chance to arrive.
+        last_stats = time.time()
+        last_stats_warn = time.time()
         last_reject_warn = 0.0
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1196,7 +1199,6 @@ class DecoderThread(QThread):
                     continue
                     
                 cc = vstream.codec_context
-                cc.thread_count = 1 if self.ultra else 2
 
                 for attr, value in (
                     ("low_delay", True),
@@ -1216,8 +1218,20 @@ class DecoderThread(QThread):
                 except Exception:
                     pass
 
+                # PyAV 18 does not expose codec_context.hw_device_ctx at all, so
+                # probing it reported "no hardware device" even when the HWAccel
+                # handed to av.open() had attached — the next pass then tore the
+                # accel down and labelled a working hardware decoder as CPU. Ask
+                # the codec context itself instead.
+                hw_attached = bool(getattr(cc, "is_hwaccel", False))
+                if hw_attached and self._hw_name != self.decoder_opts.get("hwaccel"):
+                    self._hw_name = self.decoder_opts.get("hwaccel") or self._hw_name
+                    logging.info("DecoderThread: %s hardware decode attached.",
+                                 self._hw_name)
+
                 hw_device = getattr(cc, "hw_device_ctx", None)
-                if hw_device is None and "hwaccel" in self.decoder_opts:
+                if (not hw_attached and hw_device is None
+                        and "hwaccel" in self.decoder_opts):
                     hw_type = self.decoder_opts["hwaccel"]
                     dev = self.decoder_opts.get("hwaccel_device", None)
 
@@ -1265,8 +1279,22 @@ class DecoderThread(QThread):
                             continue
                         logging.warning(f"Hardware decode init failed for {hw_type_norm}: {e}")
                         self._hw_name = "CPU"
+                        # A reopen already showed this accel does not attach, so
+                        # stop handing it to av.open() on every reconnect.
+                        self._hwaccel = None
                         self.decoder_opts.pop("hwaccel", None)
                         self.decoder_opts.pop("hwaccel_device", None)
+
+                # Software HEVC 4:4:4 at 2.5 MP does not reach the host's ~50 fps
+                # on the tuned two threads — the M1 client logged a ~35 fps
+                # ceiling and 1-3 s gaps — so let FFmpeg size the pool whenever
+                # the decoder is software. With a hardware decoder attached the
+                # count costs nothing, and --ultra keeps its deliberate 1.
+                if self.ultra or hw_attached:
+                    cc.thread_count = 1 if self.ultra else 2
+                else:
+                    cc.thread_count = 0
+                    logging.debug("DecoderThread: software decode, thread count auto.")
 
                 t_decode = []
 
