@@ -1164,6 +1164,8 @@ class DecoderThread(QThread):
         self.ultra = ultra
         self._emit_interval = 0.0
         self._last_emit = 0.0
+        self._rate_t = 0.0
+        self._rate_bytes = 0
         self._frame_count = 0
         self._avg_decode_time = 0.0
         self._restart_delay = 0.5
@@ -1347,6 +1349,17 @@ class DecoderThread(QThread):
                         if elapsed < self._emit_interval:
                             continue
                     self._last_emit = time.time()
+                    # Once a second, publish what actually arrived on the wire.
+                    # The host reports what it sent, so the two rates side by
+                    # side are a direct read on packet loss (the same comparison
+                    # the overlay makes with its video-in / encoder-out graphs).
+                    if self._last_emit - self._rate_t >= 1.0:
+                        total = self.counters.bytes
+                        if self._rate_t:
+                            CLIENT_STATE["recv_mbps"] = (
+                                (total - self._rate_bytes) * 8.0
+                                / (self._last_emit - self._rate_t) / 1e6)
+                        self._rate_t, self._rate_bytes = self._last_emit, total
 
                 if self._running:
                     if not self._has_first_frame:
@@ -1385,6 +1398,54 @@ class DecoderThread(QThread):
 
 # How often the renderer reports its frame-arrival pacing (see updateFrame).
 PACING_WINDOW_SECS = 5.0
+
+class _TSLogCounter(logging.Handler):
+    """Count FFmpeg's transport-stream complaints and keep them out of the log.
+
+    Every "Continuity check failed" is one or more datagrams that never arrived
+    — the only direct evidence of loss available to the client, since a frame the
+    decoder conceals is decoded and displayed without raising anything. A lossy
+    link repeats them for as long as it lasts, so they are tallied for the pacing
+    report rather than printed; anything else FFmpeg says is passed on.
+    """
+
+    _PATTERNS = ("Continuity check failed", "Packet corrupt",
+                 "corrupt input packet", "Invalid data found")
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if any(pattern in message for pattern in self._PATTERNS):
+            CLIENT_STATE["ts_errors"] = CLIENT_STATE.get("ts_errors", 0) + 1
+            return
+        # Not ours to swallow: hand it to the root handlers directly. Going
+        # through a logger here would come straight back to this handler.
+        for handler in logging.getLogger().handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+
+
+_TS_ERROR_COUNTER = _TSLogCounter()
+
+
+def _enable_libav_logging():
+    """Let FFmpeg's own warnings reach Python (PyAV drops them by default)."""
+    try:
+        import av.logging
+        av.logging.set_level(av.logging.WARNING)
+        libav_logger = logging.getLogger("libav")
+        # Handlers see child-logger records ("libav.mpegts"); a filter on this
+        # logger would not. Propagation off so the tally is the only copy.
+        libav_logger.propagate = False
+        if not any(isinstance(h, _TSLogCounter) for h in libav_logger.handlers):
+            libav_logger.addHandler(_TS_ERROR_COUNTER)
+        return True
+    except Exception as e:
+        logging.debug("Could not enable FFmpeg logging: %s", e)
+        return False
+
 
 class VideoWidgetGL(QOpenGLWidget):
     def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip,
@@ -1433,6 +1494,7 @@ class VideoWidgetGL(QOpenGLWidget):
         self._pacing_max_gap = 0.0
         self._pacing_bursts = 0
         self._pacing_corrupt_seen = 0
+        self._pacing_ts_seen = 0
 
         if not logging.getLogger().hasHandlers():
             logging.basicConfig(level=logging.DEBUG,
@@ -1688,15 +1750,23 @@ class VideoWidgetGL(QOpenGLWidget):
             stats = CLIENT_STATE.get("host_stats") or {}
             corrupt = CLIENT_STATE.get("corrupt_frames", 0) - self._pacing_corrupt_seen
             self._pacing_corrupt_seen += corrupt
-            host_txt = ""
+            ts_errors = CLIENT_STATE.get("ts_errors", 0) - self._pacing_ts_seen
+            self._pacing_ts_seen += ts_errors
+            rate_txt = ""
             if stats.get("fps") is not None:
-                host_txt = f", host {stats['fps']:.0f} fps"
+                rate_txt = f", host {stats['fps']:.0f} fps"
                 if stats.get("enc_kbps"):
-                    host_txt += f" / {stats['enc_kbps'] / 1000.0:.1f} Mb/s"
+                    rate_txt += f" / {stats['enc_kbps'] / 1000.0:.1f} Mb/s"
+            recv = CLIENT_STATE.get("recv_mbps")
+            if recv is not None:
+                # Below the host's own figure by more than a rounding error means
+                # datagrams never arrived — loss in flight, not a slow decoder.
+                rate_txt += f", recv {recv:.1f} Mb/s"
             logging.info("Frame pacing: %d frames in %.1fs (%.1f fps), max gap %.0f ms, "
-                         "%d under 5 ms, %d corrupt%s", self._pacing_frames, window,
-                         self._pacing_frames / window, self._pacing_max_gap * 1000.0,
-                         self._pacing_bursts, corrupt, host_txt)
+                         "%d under 5 ms, %d corrupt, %d ts-errors%s", self._pacing_frames,
+                         window, self._pacing_frames / window,
+                         self._pacing_max_gap * 1000.0, self._pacing_bursts, corrupt,
+                         ts_errors, rate_txt)
             self._pacing_start = now
             self._pacing_frames = 0
             self._pacing_max_gap = 0.0
@@ -2647,6 +2717,10 @@ def main():
         root_logger.addHandler(file_handler)
     except Exception:
         pass
+
+    # FFmpeg's own transport-stream complaints are the only direct evidence of
+    # packets lost in flight; PyAV hides them unless asked.
+    _enable_libav_logging()
 
     logging.info("────────────────────────────────────────────")
     logging.info("LinuxPlay Client starting up")
