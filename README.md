@@ -9,6 +9,8 @@
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-Required-critical)
 [![GitHub stars](https://img.shields.io/github/stars/Techlm77/LinuxPlay?style=flat)](https://github.com/Techlm77/LinuxPlay/stargazers)
 
+**Personal fork of [Techlm77/LinuxPlay](https://github.com/Techlm77/LinuxPlay), targeting a KDE Plasma host and a macOS client.** Upstream is the general-purpose project — start there if your setup differs.
+
 ---
 
 ## Project Status: Experimental & Power User Focused
@@ -35,23 +37,18 @@ For fast, safe usage:
 
 Hey everyone,
 
-LinuxPlay has been a **one-person journey for over a year**. Every feature, every bug fix, every idea has been hand-built in my spare time. There’s no team, no funding, no auto-generated codebase behind it, just me learning, experimenting, and building because I love Linux and wanted to see how far open tools like FFmpeg, UDP, and Qt could go.
+First, the thing I should say up front: **this is a personal fork.** It is not the upstream LinuxPlay project, and it isn’t trying to be a general-purpose, distro-agnostic streaming stack. It’s a working copy I tune, patch and occasionally break for **exactly one setup**:
 
-What started as a fun experiment has grown into something people actually use and enjoy. That genuinely means a lot. ❤️
+- **Host:** my Linux desktop running **KDE Plasma** (Wayland session — xdg-desktop-portal/PipeWire capture, `kscreen-doctor` for monitor layout).
+- **Client:** **macOS**.
 
-I know not everything is perfect yet, and that’s fine. That’s what open source is about:
-**progress, not perfection.** If you’ve got ideas, improvements, or features you’d love to see, please share them in
-[GitHub Discussions](https://github.com/Techlm77/LinuxPlay/discussions). Constructive feedback and collaboration are what keep LinuxPlay moving in the right direction.
+Everything else this codebase can do — X11 hosts, GNOME/wlroots capture, Windows clients, the various hardware encoders — is upstream’s work that I kept, not something I test or maintain. If your setup looks different from mine, go to [upstream](https://github.com/Techlm77/LinuxPlay) instead; it’s a one-person project that has earned the stars, and this fork exists only because of it.
 
-## Community Shoutout
+The changes here are the ones my own setup demanded: KDE-specific capture fixes, macOS client work (VideoToolbox decode, audio, certificate auth), and the sort of logging and hardening you only add after your own machine has annoyed you enough times. None of it is validated against other people’s hardware.
 
-If you make a YouTube video, blog post, benchmark, setup tour, or wild experiment with LinuxPlay, use the hashtag **#LinuxPlay**.
+So: read the code, take what’s useful, but assume anything described as “tested” was tested on one Plasma desktop and one Mac.
 
-I’d love to see what you’re doing with it and highlight cool community setups in future updates. That kind of stuff keeps the motivation alive more than anything else.
-
-For now, I’m taking a short break to recharge, but **LinuxPlay isn’t going anywhere.** It’ll keep improving, step by step, just like it has since the first line of code.
-
-Thanks for believing in something made by one person, from scratch, with actual curiosity and passion.
+Thanks to the upstream author for building the thing in the first place — without it there would be nothing here to fork.
 
 ---
 
@@ -217,7 +214,7 @@ python3 -m pip install PyQt5 PyOpenGL PyOpenGL_accelerate av numpy pynput pyperc
 
 ### Option 3: macOS client (Homebrew)
 
-The host is Linux-only, but macOS can run the **client**:
+The host is Linux-only. macOS runs the **client** — and on this fork that is the primary client, not a side path:
 
 ```bash
 brew install ffmpeg python
@@ -525,7 +522,7 @@ The tests are standalone self-checking scripts (`test_*.py`), tied together by
 
 ---
 
-## Support LinuxPlay
+## Support Upstream
 
 LinuxPlay is:
 
@@ -533,11 +530,11 @@ LinuxPlay is:
 - built from scratch,
 - maintained in spare time by a solo developer.
 
-If you like it and want to see it grow:
+**This fork earns nothing and takes no donations.** If you like it enough to want to say thanks, sponsor the project it is built on:
 
 [Sponsor @Techlm77](https://github.com/sponsors/Techlm77)
 
-Support helps cover hardware, testing, and makes it easier for others to join in and help turn this into a stronger ecosystem project.
+Support helps cover upstream's hardware and testing, and makes it easier for others to join in and help turn this into a stronger ecosystem project.
 
 ---
 
