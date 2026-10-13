@@ -919,9 +919,16 @@ def audio_listener(host_ip, enabled=True):
             if audio_stop.is_set():
                 break
             restarts += 1
-            log = logging.warning if restarts <= 2 else logging.debug
-            log("Audio player exited — restarting in 1s (glitch recovery, restart #%d).",
-                restarts)
+            # Audio deaths must leave a trail: report the exit code and stay
+            # visible at the default log level. (This used to drop to debug
+            # after the second restart, hiding long-running trouble.)
+            try:
+                rc = proc.poll() if proc else None
+            except Exception:
+                rc = None
+            lvl = logging.warning if restarts <= 5 else logging.info
+            lvl("Audio player exited (rc=%s) — restarting in 1s (glitch recovery, restart #%d).",
+                rc, restarts)
             audio_stop.wait(1.0)
 
     t = threading.Thread(target=loop, daemon=True)
