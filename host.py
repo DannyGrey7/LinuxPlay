@@ -2,6 +2,7 @@
 import os
 import subprocess
 import argparse
+import collections
 import sys
 import logging
 import json
@@ -850,18 +851,56 @@ def _handle_pong(msg: str, peer_ip: str, now: float) -> bool:
                                              + 0.2 * abs(rtt - prev))
     return True
 
+STATS_WINDOW_SECS = 5.0
+
+def _windowed_rates(store, now=None):
+    """(fps, kbit/s, seconds) over the last ~STATS_WINDOW_SECS, or None.
+
+    ffmpeg's own -progress fps and bitrate are averages over the encoder's
+    whole life — after two days they barely move, which is why "host 24 fps"
+    sat next to the client's 29 fps for a 5 s window. Rates here come from
+    the progress counters' deltas, and decay to 0 when no frames are coming
+    (a static desktop) instead of repeating the last figure.
+    """
+    now = time.time() if now is None else now
+    hist = store.get("_hist")
+    if not hist:
+        return None
+    t_last, f_last, b_last = hist[-1]
+    base = hist[0]
+    for h in hist:
+        if now - h[0] >= STATS_WINDOW_SECS:
+            base = h
+        else:
+            break
+    dt = now - base[0]
+    if dt < 1.0:
+        return None
+    return ((f_last - base[1]) / dt, (b_last - base[2]) * 8.0 / dt / 1000.0, dt)
+
 def _stats_payload(cpu: float, gpu: float, mem: float) -> str:
     """The STATS datagram the client's overlay reads.
 
+    STATS <cpu%> <gpu%> <mem MB> <encode fps> <rtt ms> <jitter ms>
+          <encoder kbit/s> <dropped frames> <encoded frames> <window s>
+    The window field says the fps/kbit/s figures cover the last that many
+    seconds; 0 (or absent, from older hosts) means encoder-lifetime averages.
     Kept separate from the sender so the wire format is testable on its own.
     """
     enc = _video_encoder_stats()
+    fps = float(enc.get('fps') or 0.0)
+    kbps = float(enc.get('bitrate_kbps') or 0.0)
+    window = 0.0
+    rates = _windowed_rates(enc)
+    if rates is not None:
+        fps, kbps, window = rates
     return (f"STATS {cpu:.1f} {gpu:.1f} {mem:.1f} "
-            f"{float(enc.get('fps') or 0.0):.1f} "
+            f"{fps:.1f} "
             f"{host_state.last_rtt_ms:.1f} {host_state.last_jitter_ms:.1f} "
-            f"{float(enc.get('bitrate_kbps') or 0.0):.0f} "
+            f"{kbps:.0f} "
             f"{float(enc.get('drop_frames') or 0.0):.0f} "
-            f"{float(enc.get('frame') or 0.0):.0f}")
+            f"{float(enc.get('frame') or 0.0):.0f} "
+            f"{window:.0f}")
 
 _PROGRESS_KEYS = {"frame", "fps", "bitrate", "total_size", "out_time_ms",
                   "out_time_us", "speed", "drop_frames", "dup_frames"}
@@ -872,10 +911,24 @@ _PROGRESS_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # level+info (for silencedetect); they say nothing about the stream's health.
 _BENIGN_ENCODER_LINES = ("Guessed Channel Layout", "frame size not set")
 
+def _progress_sample(store: dict, now=None):
+    """End of one -progress block: remember (time, frames, bytes) for rates."""
+    frame, size = store.get("frame"), store.get("total_size")
+    if not isinstance(frame, float) or not isinstance(size, float):
+        return
+    now = time.time() if now is None else now
+    hist = store.setdefault("_hist", collections.deque(maxlen=80))
+    if hist and frame < hist[-1][1]:
+        hist.clear()                      # a restarted encoder counts from zero
+    hist.append((now, frame, size + store.get("total_banked", 0.0)))
+
 def _progress_update(store: dict, line: str) -> bool:
     """Fold one ffmpeg -progress line into store. Returns True if it was progress."""
     key, sep, val = line.partition("=")
     key = key.strip()
+    if sep and key == "progress":
+        _progress_sample(store)
+        return True
     if not sep or key not in _PROGRESS_KEYS:
         return False
     val = val.strip()

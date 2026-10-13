@@ -1482,14 +1482,16 @@ def _parse_host_stats(msg):
     """Parse the host's STATS datagram into a dict.
 
     STATS <cpu%> <gpu%> <mem MB> <encode fps> <rtt ms> <jitter ms>
-          <encoder kbit/s> <dropped frames> <encoded frames>
+          <encoder kbit/s> <dropped frames> <encoded frames> <window s>
+    window > 0: fps and kbit/s cover that many recent seconds; absent or 0
+    (older hosts) they are averages over the encoder's whole life.
     Older hosts send fewer fields; missing ones are simply absent.
     """
     parts = msg.split()
     if len(parts) < 3 or parts[0] != "STATS":
         return None
     names = ("cpu", "gpu", "mem", "fps", "rtt", "jitter",
-             "enc_kbps", "drops", "frame")
+             "enc_kbps", "drops", "frame", "window")
     out = {}
     for name, raw in zip(names, parts[1:]):
         try:
@@ -3059,7 +3061,8 @@ class MainWindow(QMainWindow):
             f"link {CLIENT_STATE.get('net_mode', 'lan')} · {status} · "
             f"{uptime // 60:02d}:{uptime % 60:02d} up · {restarts} reconnects",
             f"decode {hw} · render {backend}",
-            f"host encode {enc_txt} @ {host_stats.get('fps', 0):.0f} fps · "
+            f"host encode {enc_txt} @ {host_stats.get('fps', 0):.0f} fps"
+        f"{'' if host_stats.get('window') else ' (session avg)'} · "
             f"cpu {host_stats.get('cpu', 0):.0f}% gpu {host_stats.get('gpu', 0):.0f}%",
             f"received {self._total_bytes / 1e6:.0f} MB · keyframes {kf_txt}",
         ]

@@ -24,7 +24,8 @@ host.host_state.encoder_stats = {
 }
 payload = host._stats_payload(13.4, 88.0, 2048.5)
 stats = client._parse_host_stats(payload)
-assert len(payload.split()) == 10, payload
+assert len(payload.split()) == 11, payload
+assert stats["window"] == 0.0, "no progress history yet: lifetime figures, said so"
 assert stats["cpu"] == 13.4 and stats["gpu"] == 88.0 and stats["mem"] == 2048.5
 assert abs(stats["fps"] - 59.9) < 0.1, stats
 assert abs(stats["rtt"] - 4.2) < 0.1 and abs(stats["jitter"] - 0.75) < 0.1, stats
@@ -32,6 +33,28 @@ assert stats["enc_kbps"] == 6211.0 and stats["drops"] == 7.0 and stats["frame"] 
 # the lowest-indexed video stream wins; audio never leaks in
 assert host._video_encoder_stats()["stream"] == "Video 0"
 ok("host STATS payload round-trips into the client's parser")
+
+# The host's fps / kbit/s cover the last ~5 s, not the encoder's lifetime
+# (after two days the lifetime average barely moved, so "host 24 fps" sat
+# beside the client's 29 fps); a static desktop decays to 0.
+store = {}
+for i, t in enumerate(range(0, 11)):                  # one progress block per second
+    host._progress_update(store, f"frame={30 * t}")
+    host._progress_update(store, f"total_size={500_000 * t}")
+    store_t = 1000.0 + t
+    host._progress_sample(store, now=store_t)
+fps, kbps, win = host._windowed_rates(store, now=1010.0)
+assert abs(fps - 30.0) < 0.01 and abs(kbps - 4000.0) < 0.1 and abs(win - 5.0) < 0.01, (fps, kbps, win)
+fps, kbps, win = host._windowed_rates(store, now=1040.0)   # 30 s with no new frames
+assert fps == 0.0 and kbps == 0.0, (fps, kbps)
+host._progress_update(store, "frame=5")                   # encoder restarted
+host._progress_update(store, "total_size=1000")
+host._progress_sample(store, now=1041.0)
+assert len(store["_hist"]) == 1, "a restarted encoder starts a fresh history"
+host.host_state.encoder_stats = {"Video 0": {"fps": 24.0, "bitrate_kbps": 3000.0,
+                                             "frame": 300.0, "_hist": store["_hist"]}}
+host._progress_update(host.host_state.encoder_stats["Video 0"], "frame=300")
+ok("host STATS rates are windowed, decay on a static desktop, survive a restart")
 
 
 # ── 2. parser tolerance: old hosts, junk fields, short lines ──
