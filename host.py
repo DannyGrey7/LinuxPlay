@@ -426,6 +426,14 @@ def _resolve_capture_mode():
 
 _warn_throttle = {}
 _warn_throttle_lock = threading.Lock()
+_info_once_keys = set()
+
+def _info_once(key: str, msg: str, *args):
+    """Log something worth knowing once per host process, not per stream start."""
+    if key in _info_once_keys:
+        return
+    _info_once_keys.add(key)
+    logging.info(msg, *args)
 
 def _warn_throttled(key: str, msg: str, interval: float = 30.0, exc_info: bool = False):
     """Log a recurring non-fatal error at most once per interval (per key)."""
@@ -550,7 +558,7 @@ def _vaapi_fmt_for_pix_fmt(pix_fmt: str, codec: str) -> str:
     }
 
     if pf in valid_vaapi_fmts:
-        logging.info("Using requested VAAPI pix_fmt '%s' for codec %s.", pf, codec)
+        logging.debug("Using requested VAAPI pix_fmt '%s' for codec %s.", pf, codec)
         return pf
 
     if pf in ("yuv420", "420p"):
@@ -1930,6 +1938,16 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
         if any(x in encode for x in ("h264_vaapi", "hevc_vaapi")):
             extra_filters = ["-vf", "format=nv12,hwupload",
                              "-vaapi_device", "/dev/dri/renderD128"]
+            # The encoder takes VAAPI surfaces uploaded from nv12: the stream is
+            # 4:2:0 whatever --pix_fmt says. ffmpeg used to ignore the flag with
+            # a warning that -loglevel error hid; say it once and drop it.
+            if "-pix_fmt" in encode:
+                i = encode.index("-pix_fmt")
+                encode = encode[:i] + encode[i + 2:]
+            if (pix_fmt or "").lower() not in ("", "nv12", "yuv420p"):
+                _info_once("vaapi-pix-fmt",
+                           "VAAPI encodes 4:2:0 from nv12 surfaces — --pix_fmt %s has no "
+                           "effect on the portal path.", pix_fmt)
         else:
             extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
         output_side = _output_sync_flags()

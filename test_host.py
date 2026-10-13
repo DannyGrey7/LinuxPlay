@@ -176,6 +176,10 @@ assert stream_cmd[stream_cmd.index("-video_size") + 1] == "1280x720", stream_cmd
 assert native_cmd[native_cmd.index("-video_size") + 1] == "1707x1067", native_cmd
 assert stream_cmd[stream_cmd.index("-vf") + 1] == "format=nv12,hwupload", stream_cmd
 ok("portal capture leaves the scaling to the feeder (no double scale)")
+# hevc_vaapi only takes VAAPI surfaces (uploaded from nv12): --pix_fmt yuv444p
+# was silently ignored by ffmpeg. The command no longer pretends otherwise.
+assert "-pix_fmt" not in native_cmd and "hevc_vaapi" in native_cmd, native_cmd
+ok("portal + VAAPI: no -pix_fmt the encoder would ignore")
 
 # A scaled output makes the two size sources disagree by a pixel: 3840x2160 at
 # 175% is 2194.29x1234.29, which kscreen-doctor rounds up to 2195x1235 while
