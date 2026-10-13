@@ -1273,7 +1273,11 @@ def _output_sync_flags():
     return ["-fps_mode","passthrough"]
 
 def _mpegts_ll_mux_flags():
-    return ["-flush_packets","1","-max_interleave_delta","0","-muxdelay","0","-muxpreload","0","-mpegts_flags","resend_headers"]
+    # -omit_video_pes_length 0: write the PES length for every frame that fits
+    # (< 64 KB, i.e. all but large keyframes). Without it the client's demuxer
+    # cannot tell a frame has ended until the next one starts, and holds it.
+    return ["-flush_packets","1","-max_interleave_delta","0","-muxdelay","0","-muxpreload","0",
+            "-mpegts_flags","resend_headers","-omit_video_pes_length","0"]
 
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     if mtu_guess <= 0:
