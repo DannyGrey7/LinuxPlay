@@ -787,8 +787,103 @@ def clipboard_listener():
 
 audio_stop = threading.Event()
 _audio_listener_started = False
+# Set by set_audio_muted(): the player is being restarted on purpose (new
+# volume), which is not a glitch and must not be counted as one.
+_audio_mute_restart = threading.Event()
 
-def audio_listener(host_ip, enabled=True):
+AUDIO_SILENCE_DB = -60          # quieter than this for …
+AUDIO_SILENCE_SECS = 10         # … this long is "silent" (the clock keeps running)
+
+AUDIO_STATE = {
+    "started": None, "restarts": 0, "stalls": 0, "last_glitch": 0.0,
+    "muted": False, "muted_since": None, "muted_total": 0.0,
+    "silent_since": None, "silence_total": 0.0, "silence_longest": 0.0,
+}
+
+
+def _fmt_secs(secs):
+    secs = int(max(0, secs))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def _audio_silence_line(line, now=None):
+    """Fold one silencedetect line from the player into AUDIO_STATE."""
+    now = time.time() if now is None else now
+    st = AUDIO_STATE
+    if "silence_start:" in line:
+        if st["silent_since"] is None:
+            st["silent_since"] = now - AUDIO_SILENCE_SECS
+            logging.info("Audio: stream silent for %ds+ while the playout clock runs "
+                         "(nothing playing on the host, or it captures an idle source).",
+                         AUDIO_SILENCE_SECS)
+        return True
+    if "silence_end:" in line:
+        m = re.search(r"silence_duration:\s*([\d.]+)", line)
+        dur = float(m.group(1)) if m else (now - (st["silent_since"] or now))
+        st["silent_since"] = None
+        st["silence_total"] += dur
+        st["silence_longest"] = max(st["silence_longest"], dur)
+        logging.info("Audio: sound again after %s of silence.", _fmt_secs(dur))
+        return True
+    return False
+
+
+def _audio_end_silence(now=None):
+    """A player ending mid-silence: bank the silence so far."""
+    now = time.time() if now is None else now
+    st = AUDIO_STATE
+    if st["silent_since"] is not None:
+        dur = now - st["silent_since"]
+        st["silence_total"] += dur
+        st["silence_longest"] = max(st["silence_longest"], dur)
+        st["silent_since"] = None
+
+
+def audio_report(now=None):
+    """One line on what this session's audio did (logged when the client closes)."""
+    now = time.time() if now is None else now
+    st = AUDIO_STATE
+    if not st["started"]:
+        return None
+    span = max(1.0, now - st["started"])
+    silent, longest = st["silence_total"], st["silence_longest"]
+    if st["silent_since"] is not None:
+        cur = now - st["silent_since"]
+        silent, longest = silent + cur, max(longest, cur)
+    muted = st["muted_total"] + ((now - st["muted_since"]) if st["muted_since"] else 0.0)
+    return (f"Audio report: {_fmt_secs(span)}, {st['restarts']} player restarts "
+            f"({st['stalls']} stalls), silent {100.0 * silent / span:.0f}% "
+            f"(longest {_fmt_secs(longest)}), muted {_fmt_secs(muted)}.")
+
+
+def set_audio_muted(muted):
+    """Mute or unmute the host's audio here; the stream keeps flowing and is
+    still watched (silence, stalls) — only the playback volume changes."""
+    global audio_proc
+    st = AUDIO_STATE
+    muted = bool(muted)
+    if st["muted"] == muted:
+        return
+    now = time.time()
+    st["muted"] = muted
+    if muted:
+        st["muted_since"] = now
+    elif st["muted_since"]:
+        st["muted_total"] += now - st["muted_since"]
+        st["muted_since"] = None
+    logging.info("Audio %s.", "muted (the stream keeps playing silently)" if muted else "unmuted")
+    proc = audio_proc
+    if proc is not None:
+        _audio_mute_restart.set()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def audio_listener(host_ip, enabled=True, muted=False):
     """Decode the host's Opus stream with ffplay, restarting it whenever it dies.
 
     After heavy packet loss the mpegts demuxer can lose sync and stay silent
@@ -802,6 +897,9 @@ def audio_listener(host_ip, enabled=True):
     if _audio_listener_started:
         return None   # one listener process for all windows (port 6001)
     _audio_listener_started = True
+    AUDIO_STATE["started"] = time.time()
+    if muted:
+        set_audio_muted(True)
 
     max_channels = 2
     try:
@@ -825,6 +923,9 @@ def audio_listener(host_ip, enabled=True):
         afilter = ("aresample=matrix_encoding=none,"
                    "pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC")
         logging.info("Stereo-only output detected — downmixing surround audio.")
+    # The stall watchdog only sees a stopped clock; a stream of digital
+    # silence (the host capturing an idle sink) keeps the clock running.
+    afilter += f",silencedetect=noise={AUDIO_SILENCE_DB}dB:duration={AUDIO_SILENCE_SECS}"
 
     def loop():
         global audio_proc
@@ -835,11 +936,18 @@ def audio_listener(host_ip, enabled=True):
                 "ffplay",
                 "-hide_banner", "-loglevel", "info",
                 "-nodisp", "-autoexit",
+                "-volume", "0" if AUDIO_STATE["muted"] else "100",
+                # ffplay's default 5 s stream analysis meant ~4.8 s of nothing
+                # after every (re)start — each stall recovery, glitch restart
+                # and mute toggle. The TS descriptors already carry what the
+                # Opus decoder needs: measured 0.2 s to first sound.
+                "-probesize", "32", "-analyzeduration", "0",
                 "-fflags", "nobuffer+discardcorrupt",
                 "-af", afilter,
                 "-f", "mpegts",
                 url,
             ]
+            tail = []                    # last few non-clock lines, for the exit report
             proc = None
             try:
                 logging.debug("Audio listener command: %s", " ".join(cmd))
@@ -876,6 +984,7 @@ def audio_listener(host_ip, enabled=True):
                             logging.warning(
                                 "Audio stalled for %.0fs (clock stuck at %.1fs) — restarting the player.",
                                 AUDIO_STALL_SECS, last_clock)
+                            AUDIO_STATE["stalls"] += 1
                             try:
                                 # Release UDP 6001 before the restart, or the
                                 # replacement player would receive nothing.
@@ -903,8 +1012,13 @@ def audio_listener(host_ip, enabled=True):
                             if last_clock is None:
                                 logging.info("Audio stream detected — playout clock running.")
                             last_clock, last_progress = clock, time.time()
-                        elif "Audio:" in line:
-                            logging.info(line)
+                        elif _audio_silence_line(line):
+                            pass
+                        else:
+                            if "Audio:" in line:
+                                logging.info(line)
+                            tail.append(line[:160])
+                            del tail[:-4]
                     if buf and len(buf) > 8192:      # runaway line: drop it
                         buf = b""
                 try:
@@ -916,9 +1030,15 @@ def audio_listener(host_ip, enabled=True):
             finally:
                 if audio_proc is proc:
                     audio_proc = None
+                _audio_end_silence()
             if audio_stop.is_set():
                 break
+            if _audio_mute_restart.is_set():
+                _audio_mute_restart.clear()      # volume change, not a glitch
+                continue
             restarts += 1
+            AUDIO_STATE["restarts"] = restarts
+            AUDIO_STATE["last_glitch"] = time.time()
             # Audio deaths must leave a trail: report the exit code and stay
             # visible at the default log level. (This used to drop to debug
             # after the second restart, hiding long-running trouble.)
@@ -927,8 +1047,8 @@ def audio_listener(host_ip, enabled=True):
             except Exception:
                 rc = None
             lvl = logging.warning if restarts <= 5 else logging.info
-            lvl("Audio player exited (rc=%s) — restarting in 1s (glitch recovery, restart #%d).",
-                rc, restarts)
+            lvl("Audio player exited (rc=%s) — restarting in 1s (glitch recovery, restart #%d).%s",
+                rc, restarts, f" Last output: {' | '.join(tail)}" if tail else "")
             audio_stop.wait(1.0)
 
     t = threading.Thread(target=loop, daemon=True)
@@ -1434,6 +1554,8 @@ class DecoderThread(QThread):
         self._hw_failures = []            # timestamps of recent hardware failures
         self._hw_retry_at = 0.0
         self.hw_resets = 0
+        self.hw_fallback_at = 0.0         # when decoding last fell back to the CPU
+        self.gate = None                  # the current container's keyframe gate
 
     def _open_container(self):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
@@ -1467,6 +1589,7 @@ class DecoderThread(QThread):
                             err, self._hw_name or self._hw_wanted, self.hw_resets,
                             self._hw_frames)
             return True
+        self.hw_fallback_at = now
         if not self._hw_frames:
             # Never decoded a frame of this stream: a real incompatibility,
             # so retrying later would only flap.
@@ -1599,7 +1722,7 @@ class DecoderThread(QThread):
 
                 t_decode = []
 
-                gate = _KeyframeGate(self.counters, codec=cc.name)
+                gate = self.gate = _KeyframeGate(self.counters, codec=cc.name)
                 for frame in _counted_decode(container, self.counters, gate=gate, video=0):
                     if not self._running:
                         break
@@ -2586,13 +2709,14 @@ class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
                  gamepad="disable", gamepad_dev=None, pin=None, audio=True,
-                 stats_visible=False, desktop_size=None):
+                 stats_visible=False, desktop_size=None, muted=False):
         super().__init__(parent)
 
         self.window_id = SESSION.register()
         self.monitor_index = udp_port - DEFAULT_UDP_PORT
         self._pin = pin
         self._audio_enabled = audio
+        self._audio_muted = muted
         self.setWindowTitle("LinuxPlay")
         self.texture_width, self.texture_height = rwidth, rheight
         self.offset_x, self.offset_y = offset_x, offset_y
@@ -2661,7 +2785,8 @@ class MainWindow(QMainWindow):
             self._heartbeat_thread = None
 
         try:
-            self._audio_thread = audio_listener(self.host_ip, enabled=self._audio_enabled)
+            self._audio_thread = audio_listener(self.host_ip, enabled=self._audio_enabled,
+                                                muted=self._audio_muted)
         except Exception as e:
             logging.error(f"Audio listener failed: {e}")
             self._audio_thread = None
@@ -3007,6 +3132,9 @@ class MainWindow(QMainWindow):
             # One ffplay serves every monitor window, so only the last window
             # may stop it — closing one of several must not kill audio for all.
             global audio_proc
+            report = audio_report()
+            if report:
+                logging.info(report)
             audio_stop.set()
             if audio_proc:
                 try:
@@ -3034,6 +3162,8 @@ def main():
     p.add_argument("--host_ip", required=True)
     p.add_argument("--pin", default=None, help="6-digit host PIN (optional; will prompt if required)")
     p.add_argument("--audio", choices=["enable", "disable"], default="disable")
+    p.add_argument("--mute", action="store_true",
+                   help="Start with the host's audio muted (Audio ▸ Mute Host Audio toggles it).")
     p.add_argument("--monitor", default="0", help="Index or 'all'")
     p.add_argument("--hwaccel", choices=["auto", "cpu", "cuda", "qsv", "d3d11va", "dxva2", "vaapi", "videotoolbox"], default="auto")
     p.add_argument("--debug", action="store_true")
@@ -3190,7 +3320,7 @@ def main():
                              ox, oy, net_mode, ultra=ultra_active,
                              gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
                              audio=(args.audio == "enable"), stats_visible=args.stats,
-                             desktop_size=(w, h))
+                             desktop_size=(w, h), muted=args.mute)
             win.setWindowTitle(f"LinuxPlay — Monitor {i}")
             win.show()
             windows.append(win)
@@ -3207,7 +3337,7 @@ def main():
                          ox, oy, net_mode, ultra=ultra_active,
                          gamepad=args.gamepad, gamepad_dev=args.gamepad_dev, pin=args.pin,
                          audio=(args.audio == "enable"), stats_visible=args.stats,
-                         desktop_size=(w, h))
+                         desktop_size=(w, h), muted=args.mute)
         win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
         win.show()
         windows.append(win)
