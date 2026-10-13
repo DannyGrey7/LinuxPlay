@@ -936,7 +936,19 @@ def audio_listener(host_ip, enabled=True):
     return t
 
 class StreamCounters:
-    """Byte/frame counters filled by the decode loop, read by the stats overlay."""
+    """Counters filled by the decode loop, read by the overlay and the pacing report.
+
+    What each one means (all cumulative; readers take deltas):
+      damaged  frames that arrived with a hole — the demuxer saw a gap in the
+               transport stream (one or more datagrams lost in flight)
+      skipped  frames not decoded because they were damaged or predicted from
+               a damaged one (held back until the next keyframe)
+      refused  frames the decoder was given but returned nothing for (a loss
+               the transport could not see, e.g. a whole frame vanished)
+      corrupt  frames the decoder returned but flagged as corrupt
+      freezes / freeze_ms  how often, and for how long, the picture stood
+               still waiting for a keyframe after a loss
+    """
 
     def __init__(self):
         self.bytes = 0
@@ -944,28 +956,171 @@ class StreamCounters:
         self.keyframes = 0
         self.frames = 0
         self.errors = 0
+        self.damaged = 0
+        self.skipped = 0
+        self.refused = 0
+        self.corrupt = 0
+        self.freezes = 0
+        self.freeze_ms = 0.0
+        self.freeze_max_ms = 0.0          # longest since the last take_freeze_max()
 
     def snapshot(self):
         return (self.bytes, self.packets, self.keyframes, self.frames)
 
+    def note_freeze(self, ms):
+        self.freezes += 1
+        self.freeze_ms += ms
+        self.freeze_max_ms = max(self.freeze_max_ms, ms)
 
-def _counted_decode(container, counters, **kwargs):
-    """container.decode(), but counting demuxed bytes/packets/keyframes.
+    def take_freeze_max(self):
+        ms, self.freeze_max_ms = self.freeze_max_ms, 0.0
+        return ms
+
+
+def _is_keyframe(packet, codec=None):
+    """Does this access unit start a GOP? The flag first, then the NAL units.
+
+    The client demuxes without FFmpeg's parser (see DecoderThread), and the
+    parser is what sets the keyframe flag on transport-stream video. So look
+    at the first NAL units ourselves: an IRAP slice (HEVC 16-23) or IDR slice
+    (H.264 5), or parameter sets ahead of the first slice — encoders only
+    send those with a keyframe. The scan window covers x265's ~2 KB SEI.
+    """
+    if getattr(packet, "is_keyframe", False):
+        return True
+    if codec not in ("hevc", "h264"):
+        return False
+    try:
+        head = bytes(memoryview(packet)[:4096])
+    except Exception:
+        return False
+    i = head.find(b"\x00\x00\x01")
+    while 0 <= i < len(head) - 3:
+        b = head[i + 3]
+        if codec == "hevc":
+            t = (b >> 1) & 0x3F
+            if t < 32:
+                return 16 <= t <= 23
+            if t in (32, 33):                   # VPS, SPS
+                return True
+        else:
+            t = b & 0x1F
+            if 1 <= t <= 5:
+                return t == 5
+            if t == 7:                          # SPS
+                return True
+        i = head.find(b"\x00\x00\x01", i + 3)
+    return False
+
+
+class _KeyframeGate:
+    """Hold the decoder back from a damaged stretch until the next keyframe.
+
+    A frame that arrived with a hole — or anything predicted from it — can only
+    decode to garbage. FFmpeg's HEVC decoder refuses every P-frame after a lost
+    reference (logging ~9 lines for each), and VideoToolbox fails outright on
+    broken slice data, after which the codec is wedged until it is reopened.
+    So damaged packets stop here and decoding resumes at the next keyframe;
+    the wait is reported as a freeze, which is what the viewer actually saw.
+    A fresh stream starts closed as well: it joins mid-GOP, and the slices
+    before the first keyframe are undecodable noise.
+    """
+
+    # Upstream encoders that never flag keyframes must not mean a black screen.
+    NO_KEYFRAME_GIVEUP_SECS = 10.0
+
+    def __init__(self, counters, codec=None):
+        self.counters = counters
+        self.codec = codec
+        self.waiting = True
+        self.reason = "join"
+        self.since = time.time()
+        self.held = 0
+        self.keyframes_seen = 0
+        self.disabled = False
+
+    def is_key(self, packet):
+        return _is_keyframe(packet, self.codec)
+
+    def close(self, reason="loss"):
+        """Stop decoding until the next keyframe (a loss the demuxer missed)."""
+        if not self.waiting:
+            self.waiting, self.reason, self.since, self.held = True, reason, time.time(), 0
+
+    def admit(self, packet, key=None):
+        """True if this packet should go to the decoder."""
+        if self.disabled:
+            return True
+        now = time.time()
+        if getattr(packet, "is_corrupt", False):
+            self.counters.damaged += 1
+            if not self.waiting or self.reason == "join":
+                self.waiting, self.reason, self.since, self.held = True, "loss", now, 0
+            self._hold()
+            return False
+        if not self.waiting:
+            return True
+        if key is None:
+            key = self.is_key(packet)
+        if key:
+            self.keyframes_seen += 1
+            waited_ms = (now - self.since) * 1000.0
+            if self.reason == "loss":
+                self.counters.note_freeze(waited_ms)
+                logging.debug("Resumed at a keyframe after %.0f ms (%d frames held back).",
+                              waited_ms, self.held)
+            else:
+                logging.info("Joined the stream at its first keyframe (%.0f ms, %d "
+                             "frames before it skipped).", waited_ms, self.held)
+            self.waiting = False
+            return True
+        if not self.keyframes_seen and now - self.since > self.NO_KEYFRAME_GIVEUP_SECS:
+            logging.warning("No keyframe flagged in %.0fs — decoding without the "
+                            "keyframe gate (expect artefacts after losses).",
+                            self.NO_KEYFRAME_GIVEUP_SECS)
+            self.disabled = True
+            return True
+        self._hold()
+        return False
+
+    def _hold(self):
+        self.held += 1
+        if self.reason == "loss":
+            self.counters.skipped += 1
+
+
+def _counted_decode(container, counters, gate=None, **kwargs):
+    """container.decode(), but counting what arrived and what became a frame.
 
     PyAV's decode() is literally demux+decode, so this yields the same frames
-    while giving the overlay real receive-rate numbers.
+    while giving the overlay real receive-rate numbers. With a gate, damaged
+    stretches never reach the decoder (see _KeyframeGate).
     """
     for packet in container.demux(**kwargs):
+        size, key = 0, False
         try:
-            counters.bytes += int(packet.size or 0)
+            size = int(packet.size or 0)
+            counters.bytes += size
             counters.packets += 1
-            if packet.is_keyframe:
+            key = gate.is_key(packet) if gate is not None else bool(packet.is_keyframe)
+            if key:
                 counters.keyframes += 1
         except Exception:
             counters.errors += 1
+        if gate is not None and size and not gate.admit(packet, key):
+            continue
+        produced = 0
         for frame in packet.decode():
+            produced += 1
             counters.frames += 1
             yield frame
+        if size and not produced and gate is not None and not gate.waiting:
+            # Slice threading returns a frame per packet, so nothing back
+            # means the decoder refused it — a whole frame lost without a
+            # transport gap to show for it. Everything predicted from it
+            # would be refused too: hold until the next keyframe.
+            counters.refused += 1
+            gate.close("loss")
 
 
 # ── YUV plane payload: lets the GPU do the YUV→RGB conversion ─────────
@@ -1160,7 +1315,15 @@ class DecoderThread(QThread):
         self.decoder_opts.setdefault("probesize", "32")
         self.decoder_opts.setdefault("analyzeduration", "0")
         self.decoder_opts.setdefault("scan_all_pmts", "1")
-        self.decoder_opts.setdefault("fflags", "nobuffer")
+        # noparse: FFmpeg's HEVC/H.264 parser releases an access unit only when
+        # it sees the start of the next one, and the transport-stream demuxer
+        # adds another frame when the PES length is not written — measured at
+        # two whole frame intervals between arrival and decode, which on a
+        # damage-driven desktop stream is unbounded (a keystroke on a quiet
+        # screen waited for two more screen changes). The host writes one
+        # access unit per PES, so the parser has nothing to do; it also moved
+        # the corrupt flag onto the frame *before* the damaged one.
+        self.decoder_opts.setdefault("fflags", "nobuffer+noparse+nofillin")
         self.decoder_opts.setdefault("flags", "low_delay")
         self.decoder_opts.setdefault("reorder_queue_size", "0")
         self.decoder_opts.setdefault("rtbufsize", "2M")
@@ -1169,10 +1332,6 @@ class DecoderThread(QThread):
         self._running = True
         self._sw_fallback_done = False
         self.ultra = ultra
-        self._emit_interval = 0.0
-        self._last_emit = 0.0
-        self._rate_t = 0.0
-        self._rate_bytes = 0
         self._frame_count = 0
         self._avg_decode_time = 0.0
         self._restart_delay = 0.5
@@ -1182,6 +1341,17 @@ class DecoderThread(QThread):
         self.counters = StreamCounters()
         self._hwaccel = None
         self.reconnects = 0
+        # Hardware decode bookkeeping. A hardware error after the hardware has
+        # been decoding this stream means bad input (a frame damaged in
+        # flight), not an unsupported stream: reopen with hardware again, and
+        # fall back to the CPU only when it keeps failing — then retry later
+        # rather than never. One damaged packet used to cost hardware decode
+        # for the rest of a 51-hour session.
+        self._hw_wanted = self.decoder_opts.get("hwaccel")
+        self._hw_frames = 0
+        self._hw_failures = []            # timestamps of recent hardware failures
+        self._hw_retry_at = 0.0
+        self.hw_resets = 0
 
     def _open_container(self):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
@@ -1190,6 +1360,45 @@ class DecoderThread(QThread):
                            options=self.decoder_opts, hwaccel=self._hwaccel)
         return av.open(self.input_url, format="mpegts", options=self.decoder_opts)
 
+    HW_RESET_WINDOW_SECS = 60.0      # this many failures inside the window …
+    HW_RESET_LIMIT = 3               # … send decoding to the CPU
+    HW_RETRY_SECS = 600.0            # how long the CPU fallback lasts
+
+    def _maybe_restore_hw(self):
+        if (self._sw_fallback_done and self._hw_wanted and self._hw_retry_at
+                and time.time() >= self._hw_retry_at):
+            logging.info("Retrying %s hardware decode.", self._hw_wanted)
+            self.decoder_opts["hwaccel"] = self._hw_wanted
+            self._sw_fallback_done = False
+            self._hw_retry_at = 0.0
+            self._hw_failures = []
+
+    def _hw_failed(self, err):
+        """A decode error with hardware active: True = reopen with hardware."""
+        now = time.time()
+        self._hw_failures = [t for t in self._hw_failures
+                             if now - t < self.HW_RESET_WINDOW_SECS] + [now]
+        if self._hw_frames and len(self._hw_failures) < self.HW_RESET_LIMIT:
+            self.hw_resets += 1
+            logging.warning("Hardware decoder rejected the stream (%s) — reopening it "
+                            "on %s (reset #%d; it had decoded %d frames).",
+                            err, self._hw_name or self._hw_wanted, self.hw_resets,
+                            self._hw_frames)
+            return True
+        if not self._hw_frames:
+            # Never decoded a frame of this stream: a real incompatibility,
+            # so retrying later would only flap.
+            logging.warning("HW decode failed (%s) — switching to CPU for this "
+                            "session (the hardware never produced a frame).", err)
+            self._hw_retry_at = 0.0
+            return False
+        logging.warning("HW decode failed (%s) — switching to CPU (%d failures in "
+                        "%.0fs); retrying hardware in %.0f min.", err,
+                        len(self._hw_failures), self.HW_RESET_WINDOW_SECS,
+                        self.HW_RETRY_SECS / 60)
+        self._hw_retry_at = now + self.HW_RETRY_SECS
+        return False
+
     def run(self):
         first_attempt = True
         while self._running:
@@ -1197,6 +1406,7 @@ class DecoderThread(QThread):
             if not first_attempt:
                 self.reconnects += 1
             first_attempt = False
+            self._maybe_restore_hw()
             try:
                 if self._url_provider is not None:
                     self.input_url = self._url_provider()
@@ -1307,7 +1517,8 @@ class DecoderThread(QThread):
 
                 t_decode = []
 
-                for frame in _counted_decode(container, self.counters, video=0):
+                gate = _KeyframeGate(self.counters, codec=cc.name)
+                for frame in _counted_decode(container, self.counters, gate=gate, video=0):
                     if not self._running:
                         break
                     if not frame or frame.is_corrupt:
@@ -1315,9 +1526,15 @@ class DecoderThread(QThread):
                             # Counted for the renderer's pacing report: a corrupt
                             # frame is dropped silently, which otherwise looks
                             # exactly like "the host sent nothing".
-                            CLIENT_STATE["corrupt_frames"] = \
-                                CLIENT_STATE.get("corrupt_frames", 0) + 1
+                            self.counters.corrupt += 1
                         continue
+                    if hw_attached:
+                        self._hw_frames += 1
+                    elif self._hw_retry_at and time.time() >= self._hw_retry_at:
+                        # Time to give the hardware another go; the reopened
+                        # decoder picks up at the next keyframe.
+                        self._retry_hw_now = True
+                        break
 
                     t0 = time.perf_counter()
 
@@ -1351,23 +1568,10 @@ class DecoderThread(QThread):
                         logging.debug(f"Avg decode time: {avg:.2f} ms ({self._hw_name or 'CPU'})")
                         t_decode.clear()
 
-                    if self._emit_interval > 0:
-                        elapsed = time.time() - self._last_emit
-                        if elapsed < self._emit_interval:
-                            continue
-                    self._last_emit = time.time()
-                    # Once a second, publish what actually arrived on the wire.
-                    # The host reports what it sent, so the two rates side by
-                    # side are a direct read on packet loss (the same comparison
-                    # the overlay makes with its video-in / encoder-out graphs).
-                    if self._last_emit - self._rate_t >= 1.0:
-                        total = self.counters.bytes
-                        if self._rate_t:
-                            CLIENT_STATE["recv_mbps"] = (
-                                (total - self._rate_bytes) * 8.0
-                                / (self._last_emit - self._rate_t) / 1e6)
-                        self._rate_t, self._rate_bytes = self._last_emit, total
 
+                if getattr(self, "_retry_hw_now", False):
+                    self._retry_hw_now = False
+                    continue
                 if self._running:
                     if not self._has_first_frame:
                         logging.info("Still waiting for video data...")
@@ -1382,7 +1586,8 @@ class DecoderThread(QThread):
                     self._last_error = err
 
                 if not self._sw_fallback_done and "hwaccel" in self.decoder_opts:
-                    logging.warning("HW decode failed (%s) — switching to CPU.", err)
+                    if self._hw_failed(err):
+                        continue                      # same accel, fresh decoder
                     self._hwaccel = None
                     self.decoder_opts.pop("hwaccel", None)
                     self.decoder_opts.pop("hwaccel_device", None)
@@ -1406,35 +1611,90 @@ class DecoderThread(QThread):
 # How often the renderer reports its frame-arrival pacing (see updateFrame).
 PACING_WINDOW_SECS = 5.0
 
-class _TSLogCounter(logging.Handler):
-    """Count FFmpeg's transport-stream complaints and keep them out of the log.
+class _LibavLogFilter(logging.Handler):
+    """Sort FFmpeg's messages: count the expected ones, pass the rest on.
 
-    Every "Continuity check failed" is one or more datagrams that never arrived
-    — the only direct evidence of loss available to the client, since a frame the
-    decoder conceals is decoded and displayed without raising anything. A lossy
-    link repeats them for as long as it lasts, so they are tallied for the pacing
-    report rather than printed; anything else FFmpeg says is passed on.
+    Three families are expected and repeat for as long as a cause lasts, so
+    they are tallied instead of printed (one lost datagram used to cost up to
+    ~130 log lines):
+      - transport damage ("Packet corrupt" …): already counted per packet by
+        the decode loop, from the packet's own corrupt flag;
+      - decoder complaints about missing references or slices — the echo of a
+        loss the transport could not see; first one of each kind is printed,
+        then a per-minute summary;
+      - stream-probe chatter at connect ("not enough frames to estimate rate",
+        "Could not find codec parameters"), inherent to probesize=32: debug.
+    Anything else FFmpeg says reaches the log unchanged.
     """
 
-    _PATTERNS = ("Continuity check failed", "Packet corrupt",
-                 "corrupt input packet", "Invalid data found")
+    _TRANSPORT = ("Continuity check failed", "Packet corrupt",
+                  "corrupt input packet", "Invalid data found",
+                  "PES packet size mismatch")
+    _DECODER = (
+        ("First slice in a frame missing", "slice without frame"),
+        ("Skipping invalid undecodable NALU", "undecodable NALU"),
+        ("Could not find ref with POC", "missing reference"),
+        ("Error constructing the frame RPS", "missing reference"),
+        ("PPS id out of range", "no parameter set"),
+        ("Ignoring POC change between slices", "mixed frames"),
+        ("Non-matching NAL types of the VCL NALUs", "mixed frames"),
+        ("CABAC_MAX_BIN", "damaged slice data"),
+        ("cu_qp_delta", "damaged slice data"),
+    )
+    _PROBE = ("not enough frames to estimate rate", "Could not find codec parameters",
+              "Consider increasing the value", "start time for stream",
+              "no TS found at start of file")
+    SUMMARY_SECS = 60.0
+
+    def __init__(self):
+        super().__init__()
+        self.decoder_msgs = 0                 # cumulative, for the pacing report
+        self._seen = set()
+        self._pending = {}
+        self._last_summary = time.time()
 
     def emit(self, record):
         try:
             message = record.getMessage()
         except Exception:
             return
-        if any(pattern in message for pattern in self._PATTERNS):
-            CLIENT_STATE["ts_errors"] = CLIENT_STATE.get("ts_errors", 0) + 1
+        if any(p in message for p in self._TRANSPORT):
             return
-        # Not ours to swallow: hand it to the root handlers directly. Going
-        # through a logger here would come straight back to this handler.
+        if any(p in message for p in self._PROBE):
+            if record.levelno > logging.DEBUG:
+                logging.debug("FFmpeg (stream probe): %s", message.splitlines()[0])
+            return
+        for pattern, family in self._DECODER:
+            if pattern in message:
+                self._decoder(record, family)
+                return
+        self._forward(record)
+
+    def _decoder(self, record, family):
+        self.decoder_msgs += 1
+        if family not in self._seen:
+            self._seen.add(family)
+            self._forward(record)
+            return
+        self._pending[family] = self._pending.get(family, 0) + 1
+        now = time.time()
+        if now - self._last_summary >= self.SUMMARY_SECS:
+            self._last_summary = now
+            parts = ", ".join(f"{n} {f}" for f, n in sorted(
+                self._pending.items(), key=lambda kv: -kv[1]))
+            self._pending = {}
+            logging.warning("Decoder: %s in the last minute (after stream losses).", parts)
+
+    @staticmethod
+    def _forward(record):
+        # Hand it to the root handlers directly. Going through a logger here
+        # would come straight back to this handler.
         for handler in logging.getLogger().handlers:
             if record.levelno >= handler.level:
                 handler.handle(record)
 
 
-_TS_ERROR_COUNTER = _TSLogCounter()
+_LIBAV_LOG = _LibavLogFilter()
 
 
 def _enable_libav_logging():
@@ -1446,8 +1706,8 @@ def _enable_libav_logging():
         # Handlers see child-logger records ("libav.mpegts"); a filter on this
         # logger would not. Propagation off so the tally is the only copy.
         libav_logger.propagate = False
-        if not any(isinstance(h, _TSLogCounter) for h in libav_logger.handlers):
-            libav_logger.addHandler(_TS_ERROR_COUNTER)
+        if not any(isinstance(h, _LibavLogFilter) for h in libav_logger.handlers):
+            libav_logger.addHandler(_LIBAV_LOG)
         return True
     except Exception as e:
         logging.debug("Could not enable FFmpeg logging: %s", e)
@@ -1500,8 +1760,10 @@ class VideoWidgetGL(QOpenGLWidget):
         self._pacing_frames = 0
         self._pacing_max_gap = 0.0
         self._pacing_bursts = 0
-        self._pacing_corrupt_seen = 0
-        self._pacing_ts_seen = 0
+        # Set by MainWindow to the decoder's StreamCounters; the report shows
+        # deltas over its own window, so every figure on the line shares it.
+        self.stream_counters = None
+        self._pacing_seen = {}
 
         if not logging.getLogger().hasHandlers():
             logging.basicConfig(level=logging.DEBUG,
@@ -1750,30 +2012,10 @@ class VideoWidgetGL(QOpenGLWidget):
             self._pacing_bursts += 1
         window = now - self._pacing_start
         if window >= PACING_WINDOW_SECS:
-            # The host's own encoder rate next to ours is what separates a lossy
-            # link (host sends what it says, frames arrive damaged) from a client
-            # that cannot drain its socket in time (host outruns us, the kernel
-            # drops, and the decoder conceals the holes).
-            stats = CLIENT_STATE.get("host_stats") or {}
-            corrupt = CLIENT_STATE.get("corrupt_frames", 0) - self._pacing_corrupt_seen
-            self._pacing_corrupt_seen += corrupt
-            ts_errors = CLIENT_STATE.get("ts_errors", 0) - self._pacing_ts_seen
-            self._pacing_ts_seen += ts_errors
-            rate_txt = ""
-            if stats.get("fps") is not None:
-                rate_txt = f", host {stats['fps']:.0f} fps"
-                if stats.get("enc_kbps"):
-                    rate_txt += f" / {stats['enc_kbps'] / 1000.0:.1f} Mb/s"
-            recv = CLIENT_STATE.get("recv_mbps")
-            if recv is not None:
-                # Below the host's own figure by more than a rounding error means
-                # datagrams never arrived — loss in flight, not a slow decoder.
-                rate_txt += f", recv {recv:.1f} Mb/s"
             logging.info("Frame pacing: %d frames in %.1fs (%.1f fps), max gap %.0f ms, "
-                         "%d under 5 ms, %d corrupt, %d ts-errors%s", self._pacing_frames,
-                         window, self._pacing_frames / window,
-                         self._pacing_max_gap * 1000.0, self._pacing_bursts, corrupt,
-                         ts_errors, rate_txt)
+                         "%d under 5 ms%s", self._pacing_frames, window,
+                         self._pacing_frames / window, self._pacing_max_gap * 1000.0,
+                         self._pacing_bursts, self._pacing_details(window))
             self._pacing_start = now
             self._pacing_frames = 0
             self._pacing_max_gap = 0.0
@@ -1794,6 +2036,55 @@ class VideoWidgetGL(QOpenGLWidget):
             if not hasattr(self, "_last_draw") or (t - getattr(self, "_last_draw", 0)) > (1/240):
                 self._last_draw = t
                 self.update()
+
+    def _delta(self, key, value):
+        d = value - self._pacing_seen.get(key, value if key == "bytes" else 0)
+        self._pacing_seen[key] = value
+        return d
+
+    def _pacing_details(self, window):
+        """The loss and rate half of the pacing line, all over the same window.
+
+        loss: damaged = frames that arrived with a hole; held = frames not
+        decoded until the next keyframe because of one; refused = frames the
+        decoder dropped on its own; corrupt = frames it returned flagged;
+        frozen = time the picture waited for that keyframe. The host's rate
+        next to ours separates a lossy link (host sent it, it never arrived)
+        from a slow client.
+        """
+        out = ""
+        c = self.stream_counters
+        if c is not None:
+            damaged = self._delta("damaged", c.damaged)
+            held = self._delta("skipped", c.skipped)
+            refused = self._delta("refused", c.refused)
+            corrupt = self._delta("corrupt", c.corrupt)
+            frozen = self._delta("freeze_ms", c.freeze_ms)
+            longest = c.take_freeze_max()
+            msgs = self._delta("decoder_msgs", _LIBAV_LOG.decoder_msgs)
+            out += (f" | loss: {damaged} damaged, {held} held, {refused} refused, "
+                    f"{corrupt} corrupt, frozen {frozen:.0f} ms")
+            if longest and longest < frozen:
+                out += f" (longest {longest:.0f})"
+            if msgs:
+                out += f", {msgs} decoder msgs"
+        stats = CLIENT_STATE.get("host_stats") or {}
+        rates = []
+        if stats.get("fps") is not None:
+            host = f"host {stats['fps']:.0f} fps"
+            if stats.get("enc_kbps"):
+                host += f" / {stats['enc_kbps'] / 1000.0:.1f} Mb/s"
+            # Hosts before the stats window field report encoder-lifetime
+            # averages; say so instead of setting them beside a 5 s figure.
+            if not stats.get("window"):
+                host += " (session avg)"
+            rates.append(host)
+        if c is not None:
+            got = self._delta("bytes", c.bytes)
+            rates.append(f"recv {got * 8.0 / window / 1e6:.1f} Mb/s")
+        if rates:
+            out += " | " + ", ".join(rates)
+        return out
 
     def _flush_pending_mouse(self):
         if not hasattr(self, "_pending_mouse") or self._pending_mouse is None:
@@ -2346,6 +2637,7 @@ class MainWindow(QMainWindow):
         # update, texture bookkeeping) that must stay on the GUI thread.
         self.decoder_thread.frame_ready.connect(self.video_widget.updateFrame,
                                                 Qt.QueuedConnection)
+        self.video_widget.stream_counters = self.decoder_thread.counters
         self.decoder_thread.start()
         logging.info("Decoder thread started")
 
@@ -2798,7 +3090,7 @@ def main():
 
     if ultra_active:
         decoder_opts.update({
-            "fflags": "nobuffer",
+            "fflags": "nobuffer+noparse+nofillin",
             "flags": "low_delay",
             "flags2": "+fast",
             "probesize": "32",
