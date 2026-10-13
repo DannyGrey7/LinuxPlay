@@ -283,6 +283,122 @@ host.host_state.should_terminate = False
 assert elapsed < 3.0, f"stop_all blocked on a held lock for {elapsed:.1f}s"
 ok("stop_all(lock_timeout) gives up instead of deadlocking shutdown")
 
+# ── 1g. session teardown never restarts streams for a departed client ──
+class _FakeStream:
+    """Stands in for StreamThread: records starts, never spawns ffmpeg."""
+    started = []
+
+    def __init__(self, cmd, name, feeder_cmd=None):
+        self.name = name
+
+    def start(self):
+        _FakeStream.started.append(self.name)
+
+    def stop(self):
+        time.sleep(0.3)                     # a real encoder takes a while to die
+
+    def join(self, timeout=None):
+        pass
+
+
+def _fresh_session(ip="127.0.0.1"):
+    hs = host.host_state
+    hs.video_threads, hs.audio_thread = {}, None
+    hs.last_disconnect_ts = 0.0
+    hs.capture_mode = "x11grab"
+    hs.monitors = [(1920, 1080, 0, 0)]
+    with hs.pin_lock:
+        reply = host._begin_session_locked(ip, "h.265")
+    return reply.split("TOKEN ", 1)[1].split()[0]
+
+
+_args = argparse.Namespace(audio="enable")
+_quiet = dict(set_status=lambda *_: None, set_pin_display=lambda *_: None)
+with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
+             build_video_cmd=lambda *a, **k: ["ffmpeg"], HOST_ARGS=_args,
+             RECONNECT_COOLDOWN=0.2, **_quiet):
+    # end_session forgets the client before it stops anything, exactly once.
+    _fresh_session()
+    seen = {}
+    with patched(host, stop_streams_only=lambda: seen.update(
+            ip=host.host_state.client_ip, active=host.host_state.session_active)):
+        epoch = host.host_state.session_epoch
+        assert host.end_session("test") is True
+        assert host.end_session("test again") is False, "teardown must be idempotent"
+    assert seen == {"ip": None, "active": False}, seen
+    assert host.host_state.session_epoch == epoch + 1
+    ok("end_session clears the client before stopping streams, and only once")
+
+    # A start that outlives its session (portal prompt answered after the
+    # client left) must not spawn encoders, and is not a failed start.
+    _fresh_session()
+    _FakeStream.started = []
+
+    class _SlowPortal:
+        def ensure(self, multiple=True):
+            host.end_session("left during the prompt")
+
+        def match_stream(self, i, mon):
+            return None
+
+    host.host_state.capture_mode = "portal"
+    host.host_state.portal = _SlowPortal()
+    st = {"epoch": host.host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
+    host._session_tick(_args, st)
+    assert _FakeStream.started == [], _FakeStream.started
+    assert st["failures"] == 0, "a departed client is not a failed start"
+    host.host_state.portal = None
+    host.host_state.capture_mode = "x11grab"
+    ok("a start interrupted by the session ending spawns nothing and arms no retry")
+
+    # The real race: the client's last window sends WINDOW_CLOSE then GOODBYE,
+    # while the session manager ticks. Nothing may start after the first start.
+    token = _fresh_session()
+    _FakeStream.started = []
+    st = {"epoch": host.host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
+    host._session_tick(_args, st)
+    assert _FakeStream.started == ["Video 0", "Audio"], _FakeStream.started
+
+    ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctl.bind(("127.0.0.1", 0))
+    listener = threading.Thread(target=host.control_listener, args=(ctl,), daemon=True)
+    listener.start()
+    stop_ticks = threading.Event()
+
+    def _ticker():
+        while not stop_ticks.is_set():
+            host._session_tick(_args, st)
+            time.sleep(0.01)
+
+    ticker = threading.Thread(target=_ticker, daemon=True)
+    ticker.start()
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.sendto(f"AUTH {token} WINDOW_CLOSE 0".encode(), ctl.getsockname())
+    tx.sendto(f"AUTH {token} GOODBYE".encode(), ctl.getsockname())
+    deadline = time.time() + 5
+    while host.host_state.session_active and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)                          # let the ticker run past the teardown
+    stop_ticks.set()
+    ticker.join(2)
+    ctl.close()
+    tx.close()
+    assert not host.host_state.session_active and host.host_state.client_ip is None
+    assert _FakeStream.started == ["Video 0", "Audio"], \
+        f"streams started during teardown: {_FakeStream.started}"
+    assert st["failures"] == 0, "teardown must not arm a 'did not start' retry"
+    ok("WINDOW_CLOSE + GOODBYE: no encoder restart and no retry during teardown")
+
+    # Closing one window must not get that monitor restarted mid-session.
+    _fresh_session()
+    _FakeStream.started = []
+    st = {"epoch": host.host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
+    host.host_state.closed_monitors.add(0)
+    host._session_tick(_args, st)
+    assert _FakeStream.started == [], _FakeStream.started
+    host.end_session("cleanup")
+    ok("a monitor the client closed stays closed for the rest of the session")
+
 # ── 2. session/monitor detection on this machine ─────────────────────
 st = host._session_type()
 print(f"session_type = {st!r}  (XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE')!r})")

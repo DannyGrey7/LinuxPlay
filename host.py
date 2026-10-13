@@ -477,6 +477,9 @@ class HostState:
         self.gui_window = None     # set by HostWindow: enables pairing prompts
         self.log_path = None
         self.session_epoch = 0     # bumped on connect/disconnect to clear backoff
+        # Monitors whose window the client closed this session: the session
+        # manager must not restart them (it restarts whatever is not running).
+        self.closed_monitors = set()
         self.last_rtt_ms = 0.0
         self.last_jitter_ms = 0.0
         self.encoder_stats = {}    # stream name -> latest ffmpeg -progress values
@@ -659,6 +662,32 @@ def stop_streams_only():
         host_state.starting_streams = False
         host_state.last_disconnect_ts = time.time()
         logging.info("All streams stopped and cooldown set.")
+
+def end_session(reason: str) -> bool:
+    """Tear the current session down exactly once; False if there was none.
+
+    The client is forgotten *before* the streams stop. The session manager
+    starts streams whenever a client is set and no video runs, so stopping
+    first left a window in which it started a fresh encoder for a client
+    that had already said goodbye. Idempotent, so a GOODBYE racing a
+    heartbeat timeout tears down once.
+    """
+    with host_state.pin_lock:
+        if not host_state.session_active and host_state.client_ip is None:
+            return False
+        peer = host_state.client_ip or host_state.authed_client_ip
+        host_state.session_active = False
+        host_state.client_ip = None
+        host_state.authed_client_ip = None
+        host_state.session_token = None
+        host_state.starting_streams = False
+        host_state.session_epoch += 1
+    logging.info("Session with %s ended (%s).", peer, reason)
+    stop_streams_only()
+    set_status("Client disconnected — waiting for connection…")
+    pin_rotate_if_needed(force=True)
+    logging.info("[AUTH] Client disconnected — PIN rotation resumed.")
+    return True
 
 def cleanup():
     stop_all()
@@ -2417,6 +2446,7 @@ def _begin_session_locked(peer_ip, encoder_str):
     host_state.session_token = token
     host_state.client_ip = peer_ip
     host_state.session_epoch += 1
+    host_state.closed_monitors = set()
     stream = _stream_payload()
     stream_line = f"\nSTREAM {stream}" if stream else ""
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
@@ -2584,11 +2614,17 @@ def tcp_handshake_server(sock, encoder_str, args):
             daemon=True, name=f"Handshake-{peer_ip}",
         ).start()
 
+def _session_still(epoch, ip) -> bool:
+    """Is the session that asked for streams still the live one?"""
+    return (host_state.session_active and host_state.client_ip == ip
+            and host_state.session_epoch == epoch)
+
 def start_streams_for_current_client(args):
     ip = getattr(host_state, "client_ip", None)
     if not ip:
         logging.warning("start_streams_for_current_client: no valid client IP — waiting for handshake.")
         return
+    epoch = host_state.session_epoch
 
     with host_state.video_thread_lock:
         if host_state.starting_streams:
@@ -2620,6 +2656,14 @@ def start_streams_for_current_client(args):
                     set_status("Portal capture failed or declined")
                     return
             for i, mon in enumerate(host_state.monitors):
+                if i in host_state.closed_monitors:
+                    continue
+                # A portal prompt can take minutes: the client may have left
+                # while it was up, and an encoder started now would stream to
+                # nobody until the teardown caught up with it.
+                if not _session_still(epoch, ip):
+                    logging.info("Session ended while streams were starting — not starting them.")
+                    break
                 ps = portal.match_stream(i, mon) if portal else None
                 stream_size = getattr(host_state, "stream_size", None)
                 cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
@@ -2636,7 +2680,8 @@ def start_streams_for_current_client(args):
                 t.start()
                 host_state.video_threads[i] = t
 
-            if args.audio == "enable" and not host_state.audio_thread:
+            if (args.audio == "enable" and not host_state.audio_thread
+                    and _session_still(epoch, ip)):
                 ac = build_audio_cmd()
                 if ac:
                     host_state.audio_thread = StreamThread(ac, "Audio")
@@ -2696,10 +2741,11 @@ def control_listener(sock):
                             stop_streams_only()
                             # stop_streams_only() arms the reconnect cooldown, but
                             # this restart is deliberate: clear it so the switch
-                            # does not black out the screen for two seconds.
+                            # does not black out the screen for two seconds. The
+                            # session manager restarts the streams (with the new
+                            # buffers) on its next tick — one start path, and this
+                            # thread never blocks on a portal prompt.
                             host_state.last_disconnect_ts = 0.0
-                            if HOST_ARGS:
-                                start_streams_for_current_client(HOST_ARGS)
                         except Exception as e:
                             logging.error(f"Restart after NET failed: {e}")
                 continue
@@ -2707,19 +2753,7 @@ def control_listener(sock):
             elif cmd == "GOODBYE":
                 logging.info(f"Client at {peer_ip} disconnected cleanly.")
                 try:
-                    stop_streams_only()
-                    host_state.client_ip = None
-                    host_state.starting_streams = False
-                    host_state.session_active = False
-                    host_state.authed_client_ip = None
-                    host_state.session_token = None
-                    host_state.session_epoch += 1
-                    set_status("Client disconnected — waiting for connection…")
-                    logging.debug("All streams stopped after GOODBYE.")
-
-                    pin_rotate_if_needed(force=True)
-                    logging.info("[AUTH] Client disconnected — PIN rotation resumed.")
-
+                    end_session("goodbye")
                     time.sleep(RECONNECT_COOLDOWN)
                 except Exception as e:
                     logging.error(f"Error handling GOODBYE cleanup: {e}")
@@ -2729,9 +2763,15 @@ def control_listener(sock):
                     idx = int(tokens[1]) if len(tokens) >= 2 else -1
                 except Exception:
                     idx = -1
-                if isinstance(host_state.video_threads, dict) and idx in host_state.video_threads:
+                # Marked closed under the lock, before the (slow) stop: closing
+                # the last window empties video_threads, and the session
+                # manager would otherwise restart the stream in that gap.
+                with host_state.video_thread_lock:
+                    t = host_state.video_threads.pop(idx, None)
+                    if idx >= 0:
+                        host_state.closed_monitors.add(idx)
+                if t is not None:
                     try:
-                        t = host_state.video_threads.pop(idx)
                         t.stop()
                         t.join(timeout=2)
                         logging.info(f"Stopped video stream for monitor {idx} on client request.")
@@ -3084,13 +3124,15 @@ def heartbeat_manager(args):
     while not host_state.should_terminate:
         now = time.time()
 
-        if host_state.client_ip:
+        # Read once: end_session() may clear it between a check and a send.
+        ip = host_state.client_ip
+        if ip:
             if now - last_ping >= HEARTBEAT_INTERVAL:
                 try:
                     # The timestamp comes back in the PONG, which is how the
                     # client's overlay gets a real round-trip time.
                     s.sendto(f"PING {time.time():.6f}".encode("ascii"),
-                             (host_state.client_ip, UDP_HEARTBEAT_PORT))
+                             (ip, UDP_HEARTBEAT_PORT))
                     last_ping = now
                 except Exception as e:
                     logging.warning("Heartbeat send error: %s", e)
@@ -3112,18 +3154,9 @@ def heartbeat_manager(args):
                         host_state.client_ip
                     )
                     try:
-                        stop_streams_only()
+                        end_session("heartbeat timeout")
                     except Exception as e:
                         logging.error("Error stopping streams after timeout: %s", e)
-
-                    host_state.client_ip = None
-                    host_state.starting_streams = False
-                    set_status("Client disconnected — waiting for connection…")
-                    host_state.session_active = False
-                    host_state.authed_client_ip = None
-                    host_state.session_token = None
-                    host_state.session_epoch += 1
-                    pin_rotate_if_needed(force=True)
 
                     time.sleep(RECONNECT_COOLDOWN)
 
@@ -3210,7 +3243,8 @@ def stats_broadcast():
         return total / (1024 * 1024)
 
     while not host_state.should_terminate:
-        if host_state.client_ip:
+        ip = host_state.client_ip
+        if ip:
             try:
                 cpu = psutil.cpu_percent(interval=None)
                 mem = get_host_memory_mb()
@@ -3233,11 +3267,11 @@ def stats_broadcast():
                         gpu = 0.0
 
                 msg = _stats_payload(cpu, gpu, mem)
-                sock.sendto(msg.encode("utf-8"), (host_state.client_ip, UDP_HEARTBEAT_PORT))
+                sock.sendto(msg.encode("utf-8"), (ip, UDP_HEARTBEAT_PORT))
                 if not started_log_done:
                     started_log_done = True
                     logging.info("Stats broadcast to %s started (%d bytes, UDP %d).",
-                                 host_state.client_ip, len(msg), UDP_HEARTBEAT_PORT)
+                                 ip, len(msg), UDP_HEARTBEAT_PORT)
             except Exception as e:
                 # Silent failure here is indistinguishable from a client-side
                 # bug: the overlay just reads zeros.
@@ -3423,47 +3457,59 @@ class GamepadServer(threading.Thread):
         except Exception:
             pass
 
+def _session_tick(args, st):
+    """One pass of the session manager; st carries backoff between passes.
+
+    Returns after at most one start attempt. Kept separate from the loop so
+    the teardown races can be driven step by step in tests.
+    """
+    # A new session (or a disconnect) clears accumulated backoff: the next
+    # client must not stare at a black screen because a previous one hit a
+    # bad patch.
+    if host_state.session_epoch != st["epoch"]:
+        st["epoch"] = host_state.session_epoch
+        st["failures"] = 0
+        st["next_attempt"] = 0.0
+
+    if time.time() - host_state.last_disconnect_ts < RECONNECT_COOLDOWN:
+        return
+
+    ip = host_state.client_ip
+    live = bool(ip and host_state.session_active)
+    wanted = [i for i in range(len(host_state.monitors or [None]))
+              if i not in host_state.closed_monitors]
+    if live and wanted and not host_state.video_threads:
+        if time.time() < st["next_attempt"]:
+            return
+        epoch = host_state.session_epoch
+        set_status(f"Client: {ip}")
+        start_streams_for_current_client(args)
+        if host_state.video_threads:
+            st["failures"] = 0
+        elif not _session_still(epoch, ip):
+            # The client left while we were starting (GOODBYE, timeout): that
+            # is not a failed start, and there is nothing to retry.
+            logging.debug("Session ended during stream start; no retry.")
+        else:
+            st["failures"] += 1
+            delay = min(2.0 * (2 ** (st["failures"] - 1)), 30.0)
+            st["next_attempt"] = time.time() + delay
+            logging.error("Streams did not start (attempt %d) — retrying in %.0fs.",
+                          st["failures"], delay)
+            set_status(f"Streams failed to start — retrying in {int(delay)}s…")
+    elif (live and host_state.video_threads
+          and args.audio == "enable" and not host_state.audio_thread):
+        # Video is healthy but the audio stream gave up: bring back audio only.
+        ac = build_audio_cmd()
+        if ac:
+            logging.info("Restarting the audio stream.")
+            host_state.audio_thread = StreamThread(ac, "Audio")
+            host_state.audio_thread.start()
+
 def session_manager(args):
-    consecutive_failures = 0
-    next_attempt_ts = 0.0
-    seen_epoch = host_state.session_epoch
-
+    st = {"epoch": host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
     while not host_state.should_terminate:
-        # A new session (or a disconnect) clears accumulated backoff: the next
-        # client must not stare at a black screen because a previous one hit a
-        # bad patch.
-        if host_state.session_epoch != seen_epoch:
-            seen_epoch = host_state.session_epoch
-            consecutive_failures = 0
-            next_attempt_ts = 0.0
-
-        if time.time() - host_state.last_disconnect_ts < RECONNECT_COOLDOWN:
-            time.sleep(0.5)
-            continue
-
-        if host_state.client_ip and not host_state.video_threads:
-            if time.time() < next_attempt_ts:
-                time.sleep(0.5)
-                continue
-            set_status(f"Client: {host_state.client_ip}")
-            start_streams_for_current_client(args)
-            if host_state.video_threads:
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                delay = min(2.0 * (2 ** (consecutive_failures - 1)), 30.0)
-                next_attempt_ts = time.time() + delay
-                logging.error("Streams did not start (attempt %d) — retrying in %.0fs.",
-                              consecutive_failures, delay)
-                set_status(f"Streams failed to start — retrying in {int(delay)}s…")
-        elif (host_state.client_ip and host_state.video_threads
-              and args.audio == "enable" and not host_state.audio_thread):
-            # Video is healthy but the audio stream gave up: bring back audio only.
-            ac = build_audio_cmd()
-            if ac:
-                logging.info("Restarting the audio stream.")
-                host_state.audio_thread = StreamThread(ac, "Audio")
-                host_state.audio_thread.start()
+        _session_tick(args, st)
         time.sleep(0.5)
 
 def _signal_handler(signum, frame):
