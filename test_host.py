@@ -553,6 +553,10 @@ with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["f
     assert store["total_banked"] == 3000.0
     hs.encoder_stats.pop("Audio", None)
     host.end_session("cleanup")
+    hs.encoder_stats["Audio"] = {"total_size": 9e9, "total_banked": 9e9}
+    host._begin_session_locked("127.0.0.1", "h.265")
+    assert "Audio" not in hs.encoder_stats, "a new session starts its totals from zero"
+    host.end_session("cleanup")
     ok("audio report: sources, switches, bytes across restarts, restarts, silence")
 
     # The command captures the picked source and listens for silence.

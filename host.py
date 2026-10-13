@@ -2720,6 +2720,9 @@ def _begin_session_locked(peer_ip, encoder_str):
     host_state.closed_monitors = set()
     host_state.audio_stats = _new_audio_stats()
     host_state.stream_restarts = {}
+    # Per-session encoder numbers: the report's byte totals and the STATS
+    # rate history must not carry over from the previous client.
+    host_state.encoder_stats = {}
     stream = _stream_payload()
     stream_line = f"\nSTREAM {stream}" if stream else ""
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
