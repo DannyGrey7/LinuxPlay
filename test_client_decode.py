@@ -252,6 +252,29 @@ else:
     else:
         skip("VideoToolbox under loss", "no videotoolbox in this PyAV build")
 
+    # Keyframes bigger than the demuxer's 200 KB PES cap arrive in pieces once
+    # FFmpeg's parser is off; the decode loop must put them back together.
+    # (A live desktop at 2194x1234 has them; the first run of this change hit
+    # "No start code is found" on every one and reconnected in a loop.)
+    big = os.path.join(tmp, "big.ts")
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=1920x1080:rate=30,noise=alls=40:allf=t", "-t", "0.5",
+         "-c:v", "libx265", "-preset", "ultrafast",
+         "-x265-params", "qp=8:keyint=15:bframes=0:slices=4:log-level=error",
+         "-pix_fmt", "yuv420p", *mux, "-f", "mpegts", big], check=True)
+    for hw in [None] + (["videotoolbox"] if "videotoolbox" in (hwdevices_available() or ())
+                        else []):
+        kw = {"hwaccel": client._make_hwaccel(hw)} if hw else {}
+        box = av.open(io.BytesIO(open(big, "rb").read()), format="mpegts",
+                      options=_client_opts(), **kw)
+        vs = next(st for st in box.streams if st.type == "video")
+        c = client.StreamCounters()
+        g = client._KeyframeGate(c, codec=vs.codec_context.name)
+        n = sum(1 for _ in client._counted_decode(box, c, gate=g, video=0))
+        assert n >= 14 and c.damaged == 0, (hw, n, c.damaged)
+    ok(f"keyframes over the 200 KB PES cap are reassembled and decode ({n} frames)")
+
     # Latency: one frame at a time over real UDP, 300 ms apart. Before, every
     # frame reached the decoder only when the frame after next arrived.
     def frames_of(ts):

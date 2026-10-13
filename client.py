@@ -977,6 +977,82 @@ class StreamCounters:
         return ms
 
 
+# FFmpeg's mpegts demuxer cuts a PES of unknown length into pieces of this
+# size (MAX_PES_PAYLOAD). Without its parser behind it, a keyframe bigger
+# than 200 KB — common at 2194x1234 — reaches us in pieces, and every piece
+# after the first starts mid-NAL ("No start code is found").
+_MAX_PES_PAYLOAD = 200 * 1024
+_SPLIT_PIECE = _MAX_PES_PAYLOAD - 188          # a piece this big may be continued
+
+
+def _packet_head(packet, n):
+    head = getattr(packet, "head", None)
+    if head is not None:
+        return head(n)
+    return bytes(memoryview(packet)[:n])
+
+
+def _starts_access_unit(packet):
+    try:
+        head = _packet_head(packet, 4)
+    except Exception:
+        return True
+    return head[:3] == b"\x00\x00\x01" or head == b"\x00\x00\x00\x01"
+
+
+class _AccessUnit:
+    """A frame the demuxer handed over in pieces, put back together.
+
+    Built from a single piece with orphan=True, it is a fragment whose head
+    never arrived (lost in flight): undecodable, so it reports as damaged.
+    """
+
+    def __init__(self, pieces, orphan=False):
+        first = pieces[0]
+        self._stream = first.stream
+        self._data = b"".join(bytes(p) for p in pieces)
+        self.size = len(self._data)
+        self.pts, self.dts, self.time_base = first.pts, first.dts, first.time_base
+        self.is_corrupt = orphan or any(p.is_corrupt for p in pieces)
+        self.is_keyframe = bool(first.is_keyframe) and not orphan
+        self.pieces = len(pieces)
+
+    def head(self, n):
+        return self._data[:n]
+
+    def decode(self):
+        pkt = av.Packet(self._data)
+        pkt.pts, pkt.dts, pkt.time_base = self.pts, self.dts, self.time_base
+        return self._stream.decode(pkt)
+
+
+def _access_units(packets, counters):
+    """Demuxed packets in, whole access units out (counting bytes on the way)."""
+    pending = []
+    for packet in packets:
+        size = int(packet.size or 0)
+        counters.bytes += size
+        if pending:
+            if size and not _starts_access_unit(packet):
+                pending.append(packet)
+                if size >= _SPLIT_PIECE:
+                    continue
+                yield _AccessUnit(pending)
+                pending = []
+                continue
+            yield _AccessUnit(pending) if len(pending) > 1 else pending[0]
+            pending = []
+        if size >= _SPLIT_PIECE:
+            pending = [packet]
+            continue
+        if size and not _starts_access_unit(packet):
+            yield _AccessUnit([packet], orphan=True)
+            continue
+        yield packet
+    if pending:
+        yield _AccessUnit(pending) if len(pending) > 1 else pending[0]
+
+
 def _is_keyframe(packet, codec=None):
     """Does this access unit start a GOP? The flag first, then the NAL units.
 
@@ -991,7 +1067,7 @@ def _is_keyframe(packet, codec=None):
     if codec not in ("hevc", "h264"):
         return False
     try:
-        head = bytes(memoryview(packet)[:4096])
+        head = _packet_head(packet, 4096)
     except Exception:
         return False
     i = head.find(b"\x00\x00\x01")
@@ -1096,11 +1172,17 @@ def _counted_decode(container, counters, gate=None, **kwargs):
     while giving the overlay real receive-rate numbers. With a gate, damaged
     stretches never reach the decoder (see _KeyframeGate).
     """
-    for packet in container.demux(**kwargs):
+    packets = container.demux(**kwargs)
+    if gate is not None:
+        # The client demuxes without FFmpeg's parser, which used to glue
+        # oversized frames back together; do it here.
+        packets = _access_units(packets, counters)
+    for packet in packets:
         size, key = 0, False
         try:
             size = int(packet.size or 0)
-            counters.bytes += size
+            if gate is None:
+                counters.bytes += size
             counters.packets += 1
             key = gate.is_key(packet) if gate is not None else bool(packet.is_keyframe)
             if key:
