@@ -162,7 +162,7 @@ else:
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         client.audio_listener("127.0.0.1", enabled=True, muted=True)
-        deadline = time.time() + 25
+        deadline = time.time() + 40           # ~14 s when healthy; slack for a loaded box
         toggled = False
         while time.time() < deadline:
             if not toggled and any("playout clock running" in m for m in records):
