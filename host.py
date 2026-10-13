@@ -1102,7 +1102,7 @@ class StreamThread(threading.Thread):
                 if _PROGRESS_LINE_RE.match(line):
                     continue
                 if "silence_start:" in line or "silence_end:" in line:
-                    _audio_silence_event(line)
+                    _audio_silence_event(line, ending=not self._running)
                     continue
                 if "[info]" in line or "[verbose]" in line:
                     continue                  # -loglevel level+info stream dumps
@@ -2149,8 +2149,13 @@ def _fmt_dur(secs):
     m, s = divmod(rem, 60)
     return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
 
-def _audio_silence_event(line):
-    """Fold one silencedetect line from the audio encoder into the session stats."""
+def _audio_silence_event(line, ending=False):
+    """Fold one silencedetect line from the audio encoder into the session stats.
+
+    ending: the encoder is being stopped (session over, or the capture is
+    moving to another sink). silencedetect closes an open silence at end of
+    stream, and that must not read as sound coming back.
+    """
     st = host_state.audio_stats
     src = host_state.audio_source or "?"
     now = time.time()
@@ -2165,6 +2170,9 @@ def _audio_silence_event(line):
     st["silent_since"] = None
     st["silence_total"] += dur
     st["silence_longest"] = max(st["silence_longest"], dur)
+    if ending:
+        logging.debug("Audio: capture stopped after %s of silence.", _fmt_dur(dur))
+        return
     logging.info("Audio: sound on %s again after %s of silence.", src, _fmt_dur(dur))
 
 def _audio_report():

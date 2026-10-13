@@ -532,6 +532,15 @@ with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["f
     assert hs.audio_stats["silent_since"] is not None
     host._audio_silence_event("[silencedetect @ 0x1] [info] silence_end: 45.0 | silence_duration: 40.0")
     assert hs.audio_stats["silence_longest"] == 40.0 and hs.audio_stats["silent_since"] is None
+    # An encoder stopped mid-silence (capture moving) closes the silence at
+    # end of stream: banked, but not reported as sound coming back.
+    _seen = []
+    with patched(host.logging, info=lambda *a, **k: _seen.append(a[0] % a[1:])):
+        host._audio_silence_event("[silencedetect @ 0x1] [info] silence_start: 50.0")
+        host._audio_silence_event("[silencedetect @ 0x1] [info] silence_end: 62.0 | "
+                                  "silence_duration: 12.0", ending=True)
+    assert not any("again after" in m for m in _seen), _seen
+    assert hs.audio_stats["silence_total"] == 52.0
     store = {}
     for line in ("total_size=1000", "total_size=3000", "total_size=500"):   # restart after 3000
         host._progress_update(store, line)
@@ -539,7 +548,7 @@ with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["f
     hs.stream_restarts["Audio"] = 1
     report = host._audio_report()
     assert "a.monitor → b.monitor (1 source switches)" in report, report
-    assert "1 encoder restarts" in report and "silent 40%" in report, report
+    assert "1 encoder restarts" in report and "silent 52%" in report, report
     assert "0.0 MB sent" in report and "longest 40s" in report, report
     assert store["total_banked"] == 3000.0
     hs.encoder_stats.pop("Audio", None)
