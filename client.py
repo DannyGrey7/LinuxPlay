@@ -2653,6 +2653,11 @@ class StatsOverlay(QWidget):
                 series.push(data[key])
         if data.get("info"):
             self.info = data["info"]
+            # The graphs sit below the info lines: grow with them rather
+            # than clip the bottom row (the panel was sized for four).
+            height = 368 + 13 * max(0, len(self.info) - 4)
+            if self.height() != height:
+                self.resize(self.width(), height)
         if data.get("headline"):
             self.headline = data["headline"]
 
@@ -3064,11 +3069,26 @@ class MainWindow(QMainWindow):
         kf_txt = f"{data.get('keyframes', 0):.0f}/s" if "keyframes" in data else "—"
         data["headline"] = (f"LinuxPlay · {self.host_ip}:{self.udp_port} · "
                             f"{self.texture_width}x{self.texture_height}")
-        restarts = getattr(getattr(self, "decoder_thread", None), "reconnects", 0)
+        dt = getattr(self, "decoder_thread", None)
+        restarts = getattr(dt, "reconnects", 0)
+        decode = f"decode {hw}"
+        if dt is not None and dt._sw_fallback_done and dt._hw_wanted:
+            left = (dt._hw_retry_at - now) / 60.0 if dt._hw_retry_at else None
+            decode += (f" (hardware failed; retry in {left:.0f} min)" if left and left > 0
+                       else " (hardware failed)")
+        c = getattr(dt, "counters", None)
+        loss = ""
+        if c is not None:
+            # Session totals of what the viewer lost to the network: frames
+            # that arrived damaged, frames held back until the next keyframe,
+            # and how long the picture stood still waiting for it.
+            loss = (f"loss {c.damaged} damaged · {c.skipped} held · frozen "
+                    f"{c.freeze_ms / 1000.0:.1f}s total, {c.freezes} times")
         data["info"] = [
             f"link {CLIENT_STATE.get('net_mode', 'lan')} · {status} · "
             f"{uptime // 60:02d}:{uptime % 60:02d} up · {restarts} reconnects",
-            f"decode {hw} · render {backend}",
+            f"{decode} · render {backend}",
+            *([loss] if loss else []),
             f"host encode {enc_txt} @ {host_stats.get('fps', 0):.0f} fps"
         f"{'' if host_stats.get('window') else ' (session avg)'} · "
             f"cpu {host_stats.get('cpu', 0):.0f}% gpu {host_stats.get('gpu', 0):.0f}%",

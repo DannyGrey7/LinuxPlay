@@ -488,6 +488,15 @@ class HostTab(QWidget):
         form_layout.addRow("QP:", self.qpCombo)
         form_layout.addRow("Tune:", self.tuneCombo)
         form_layout.addRow("Pixel Format:", self.pixFmtCombo)
+        # VAAPI encodes from nv12 surfaces: whatever is picked here, the
+        # stream is 4:2:0 (yuv444p used to be accepted and silently ignored).
+        self.pixFmtHint = QLabel("")
+        self.pixFmtHint.setWordWrap(True)
+        self.pixFmtHint.setStyleSheet("color: #9a9a9a;")
+        form_layout.addRow("", self.pixFmtHint)
+        self.hwencCombo.currentIndexChanged.connect(self._update_pix_fmt_hint)
+        self.pixFmtCombo.currentIndexChanged.connect(self._update_pix_fmt_hint)
+        self._update_pix_fmt_hint()
         form_layout.addRow("Debug:", self.debugCheck)
         form_layout.addRow("Capture:", self.captureHint)
         form_group.setLayout(form_layout)
@@ -714,6 +723,17 @@ class HostTab(QWidget):
             return False
         return True
 
+    def _update_pix_fmt_hint(self, *_):
+        backend = (self.hwencCombo.currentData() or self.hwencCombo.currentText() or "")
+        backend = str(backend).split(" ", 1)[0].lower()
+        fmt = self.pixFmtCombo.currentText()
+        if backend in ("vaapi", "auto") and fmt not in ("nv12", "yuv420p"):
+            self.pixFmtHint.setText(
+                f"With VAAPI the stream is 4:2:0 (nv12) — {fmt} only applies to "
+                f"CPU/NVENC/QSV encodes.")
+        else:
+            self.pixFmtHint.setText("")
+
     def start_host(self):
         if not IS_LINUX:
             QMessageBox.critical(
@@ -925,7 +945,12 @@ class ClientTab(QWidget):
             self.hostIPEdit.addItem(ip)
 
         self.audioCombo = QComboBox()
-        self.audioCombo.addItems(["enable", "disable"])
+        # muted: the host's audio still arrives and is watched (silence,
+        # dropouts), it just does not play; the client's Audio menu (⌘⇧M on
+        # macOS) toggles it during a session.
+        self.audioCombo.addItems(["enable", "muted", "disable"])
+        self.audioCombo.setToolTip("muted: start with the host's sound off — "
+                                   "Audio ▸ Mute Host Audio (⌘⇧M) toggles it in the session.")
         self.audioModeCombo = QComboBox()
         self.audioModeCombo.addItems(["Voice (low-latency)", "Music (quality)"])
 
@@ -1088,7 +1113,7 @@ class ClientTab(QWidget):
             sys.executable, os.path.join(HERE, "client.py"),
             "--decoder", decoder,
             "--host_ip", host_ip,
-            "--audio", audio,
+            "--audio", "disable" if audio == "disable" else "enable",
             "--monitor", monitor,
             "--hwaccel", hwaccel,
             "--net", net,
@@ -1096,6 +1121,8 @@ class ClientTab(QWidget):
         ]
         if gamepad_dev:
             cmd.extend(["--gamepad_dev", gamepad_dev])
+        if audio == "muted":
+            cmd.append("--mute")
         if ultra:
             cmd.append("--ultra")
         if debug:
