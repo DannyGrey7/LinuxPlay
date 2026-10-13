@@ -145,7 +145,7 @@ for needle in ("Clipboard send error", "Clipboard apply error",
 assert "except socket.timeout as e:" in HOST_SRC, "upload listener must survive a timeout"
 assert "listener continues" in HOST_SRC
 assert "Streams did not start" in HOST_SRC, "stream start needs a backoff path"
-assert "start_streams_for_current_client(args)\n            if host_state.video_threads" in HOST_SRC
+assert "start_streams_for_current_client(args)\n        if host_state.video_threads" in HOST_SRC
 ok("channel and start-up failures log/retry instead of stopping the host")
 
 
@@ -377,10 +377,14 @@ ok("approving the pairing prompt issues the approval (not just the timeout path)
 
 
 # ── 14. a new session/disconnect clears the stream backoff ──
-assert "host_state.session_epoch += 1" in HOST_SRC
-assert HOST_SRC.count("host_state.session_epoch += 1") >= 3, \
-    "connect, GOODBYE and heartbeat-timeout must all bump the epoch"
-assert "if host_state.session_epoch != seen_epoch:" in HOST_SRC, \
+import inspect  # noqa: E402
+assert "host_state.session_epoch += 1" in inspect.getsource(host._begin_session_locked)
+assert "host_state.session_epoch += 1" in inspect.getsource(host.end_session)
+listener = inspect.getsource(host.control_listener)
+assert 'end_session("goodbye")' in listener, "GOODBYE must end the session (and bump the epoch)"
+assert 'end_session("heartbeat timeout")' in inspect.getsource(host.heartbeat_manager), \
+    "a heartbeat timeout must end the session (and bump the epoch)"
+assert 'if host_state.session_epoch != st["epoch"]:' in inspect.getsource(host._session_tick), \
     "the session manager must reset its failure backoff on a new session"
 ok("session changes reset the stream-restart backoff")
 
