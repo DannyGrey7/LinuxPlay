@@ -288,7 +288,7 @@ class _FakeStream:
     """Stands in for StreamThread: records starts, never spawns ffmpeg."""
     started = []
 
-    def __init__(self, cmd, name, feeder_cmd=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None):
         self.name = name
 
     def start(self):
@@ -398,6 +398,117 @@ with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
     assert _FakeStream.started == [], _FakeStream.started
     host.end_session("cleanup")
     ok("a monitor the client closed stays closed for the rest of the session")
+
+# ── 1h. audio follows the default sink and reports what it did ─────────
+_SOURCES = ("53\talsa_output.hdmi.monitor\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n"
+            "98\twivrn.sink.monitor\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"
+            "52\talsa_input.usb.mono\tPipeWire\ts16le 1ch 8000Hz\tSUSPENDED\n")
+
+
+def _fake_pactl(default_sink, sources=_SOURCES):
+    def pactl(*args, timeout=2.0):
+        if args[:3] == ("list", "short", "sources"):
+            return sources
+        if args[:1] == ("get-default-sink",):
+            return default_sink
+        return None
+    return pactl
+
+
+_env_monitor = os.environ.pop("PULSE_MONITOR", None)
+with patched(host, _pactl=_fake_pactl("alsa_output.hdmi\n"),
+             HOST_ARGS=argparse.Namespace(audio_source="auto")):
+    # The old pick took the RUNNING monitor (here the headset's) regardless
+    # of where the host's speakers point.
+    assert host._pick_audio_source() == ("alsa_output.hdmi.monitor", "default sink")
+with patched(host, _pactl=_fake_pactl(None), HOST_ARGS=argparse.Namespace(audio_source="auto")):
+    assert host._pick_audio_source()[0] == "wivrn.sink.monitor", "fallback: the playing monitor"
+with patched(host, _pactl=_fake_pactl("alsa_output.hdmi\n"),
+             HOST_ARGS=argparse.Namespace(audio_source="wivrn.sink")):
+    assert host._pick_audio_source() == ("wivrn.sink.monitor", "pinned")
+with patched(host, _pactl=_fake_pactl("alsa_output.hdmi\n"),
+             HOST_ARGS=argparse.Namespace(audio_source="alsa_input.usb.mono")):
+    assert host._pick_audio_source() == ("alsa_input.usb.mono", "pinned")
+os.environ["PULSE_MONITOR"] = "wivrn.sink.monitor"
+with patched(host, _pactl=_fake_pactl("alsa_output.hdmi\n"),
+             HOST_ARGS=argparse.Namespace(audio_source="auto")):
+    assert host._pick_audio_source() == ("wivrn.sink.monitor", "pinned")
+del os.environ["PULSE_MONITOR"]
+if _env_monitor is not None:
+    os.environ["PULSE_MONITOR"] = _env_monitor
+ok("audio source: default sink's monitor, not whichever was playing at connect")
+
+with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["ffmpeg"],
+             HOST_ARGS=argparse.Namespace(audio_source="auto"),
+             _pactl=_fake_pactl("alsa_output.hdmi\n"), **_quiet):
+    _fresh_session()
+    hs = host.host_state
+    hs.audio_source = "alsa_output.hdmi.monitor"
+    hs.audio_thread = _FakeStream(None, "Audio")
+    hs.audio_watch_ts = 0.0
+    host._audio_watch()
+    assert hs.audio_stats["switches"] == 0, "no move while the default sink is unchanged"
+
+    _FakeStream.started = []
+    with patched(host, _pactl=_fake_pactl("wivrn.sink\n")):
+        host._audio_watch()                  # rate-limited: too soon after the last look
+        assert _FakeStream.started == []
+        hs.audio_watch_ts = 0.0
+        host._audio_watch()
+    assert _FakeStream.started == ["Audio"] and hs.audio_stats["switches"] == 1
+    assert hs.audio_thread.name == "Audio"
+    ok("a default-sink change mid-session moves the audio capture")
+
+    hs.audio_source = "alsa_output.hdmi.monitor"
+    hs.audio_watch_ts = 0.0
+    _FakeStream.started = []
+    with patched(host, _pactl=_fake_pactl("wivrn.sink\n")):
+        hs.session_active = False            # the session ended under the watchdog
+        host._audio_watch()
+    assert _FakeStream.started == [], "no audio for a session that has ended"
+    hs.session_active = True
+    host.end_session("cleanup")
+    ok("the watchdog never starts audio for a session that already ended")
+
+    # Silence bookkeeping and the end-of-session line.
+    host._begin_session_locked("127.0.0.1", "h.265")
+    hs.audio_stats["since"] = time.time() - 100
+    hs.audio_stats["sources"] = [(0, "a.monitor"), (1, "b.monitor")]
+    hs.audio_stats["switches"] = 1
+    hs.audio_source = "b.monitor"
+    host._audio_silence_event("[silencedetect @ 0x1] [info] silence_start: 5.0")
+    assert hs.audio_stats["silent_since"] is not None
+    host._audio_silence_event("[silencedetect @ 0x1] [info] silence_end: 45.0 | silence_duration: 40.0")
+    assert hs.audio_stats["silence_longest"] == 40.0 and hs.audio_stats["silent_since"] is None
+    store = {}
+    for line in ("total_size=1000", "total_size=3000", "total_size=500"):   # restart after 3000
+        host._progress_update(store, line)
+    hs.encoder_stats["Audio"] = store
+    hs.stream_restarts["Audio"] = 1
+    report = host._audio_report()
+    assert "a.monitor → b.monitor (1 source switches)" in report, report
+    assert "1 encoder restarts" in report and "silent 40%" in report, report
+    assert "0.0 MB sent" in report and "longest 40s" in report, report
+    assert store["total_banked"] == 3000.0
+    hs.encoder_stats.pop("Audio", None)
+    host.end_session("cleanup")
+    ok("audio report: sources, switches, bytes across restarts, restarts, silence")
+
+    # The command captures the picked source and listens for silence.
+    with patched(host, _udp_ts_pkt_size=lambda ip: 1128, _path_mtu=lambda ip: 1280):
+        host._begin_session_locked("127.0.0.1", "h.265")
+        cmd = host.build_audio_cmd()
+        host.end_session("cleanup")
+    assert cmd[cmd.index("-i") + 1] == "alsa_output.hdmi.monitor"
+    assert cmd[cmd.index("-loglevel") + 1] == "level+info"
+    assert any(a.startswith("silencedetect=") for a in cmd)
+    assert host.host_state.audio_source == "alsa_output.hdmi.monitor"
+    ok("audio command: picked source, silencedetect, level-tagged log")
+
+_st = host.StreamThread(None, "Audio", cmd_factory=lambda: ["ffmpeg", "-i", "x"])
+_st._refresh_cmd()
+assert _st.cmd == ["ffmpeg", "-i", "x"]
+ok("a stream with a command factory rebuilds its command before each start")
 
 # ── 2. session/monitor detection on this machine ─────────────────────
 st = host._session_type()

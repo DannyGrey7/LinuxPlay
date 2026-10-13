@@ -436,6 +436,12 @@ def _warn_throttled(key: str, msg: str, interval: float = 30.0, exc_info: bool =
     logging.warning(msg, exc_info=exc_info)
 
 
+def _new_audio_stats():
+    """Per-session audio bookkeeping for the end-of-session report."""
+    return {"since": time.time(), "sources": [], "switches": 0,
+            "silent_since": None, "silence_longest": 0.0, "silence_total": 0.0}
+
+
 class HostState:
     def __init__(self):
         self.video_threads = {}
@@ -484,6 +490,10 @@ class HostState:
         self.last_jitter_ms = 0.0
         self.encoder_stats = {}    # stream name -> latest ffmpeg -progress values
         self.current_fps = 0.0
+        self.audio_source = None   # PulseAudio source the audio encoder captures
+        self.audio_watch_ts = 0.0
+        self.audio_stats = _new_audio_stats()
+        self.stream_restarts = {}  # stream name -> encoder restarts this session
 
 host_state = HostState()
 HOST_ARGS = None
@@ -683,6 +693,8 @@ def end_session(reason: str) -> bool:
         host_state.starting_streams = False
         host_state.session_epoch += 1
     logging.info("Session with %s ended (%s).", peer, reason)
+    if host_state.audio_thread is not None or host_state.audio_stats["sources"]:
+        logging.info(_audio_report())
     stop_streams_only()
     set_status("Client disconnected — waiting for connection…")
     pin_rotate_if_needed(force=True)
@@ -856,6 +868,9 @@ _PROGRESS_KEYS = {"frame", "fps", "bitrate", "total_size", "out_time_ms",
 # Any other "name=value" line is still -progress metadata (progress=continue,
 # out_time=…, stream_0_0_q=…), not an encoder error worth logging.
 _PROGRESS_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Warnings the audio encoder prints on every start since it runs at
+# level+info (for silencedetect); they say nothing about the stream's health.
+_BENIGN_ENCODER_LINES = ("Guessed Channel Layout", "frame size not set")
 
 def _progress_update(store: dict, line: str) -> bool:
     """Fold one ffmpeg -progress line into store. Returns True if it was progress."""
@@ -872,9 +887,17 @@ def _progress_update(store: dict, line: str) -> bool:
             pass
         return True
     try:
-        store[key] = float(val)
+        num = float(val)
     except Exception:
         store[key] = val
+        return True
+    if key == "total_size":
+        # A restarted encoder counts from zero again: bank what the last
+        # one sent so session totals survive restarts.
+        prev = store.get("total_size")
+        if isinstance(prev, float) and num < prev:
+            store["total_banked"] = store.get("total_banked", 0.0) + prev
+    store[key] = num
     if key == "fps":
         try:
             host_state.current_fps = float(val)
@@ -906,11 +929,15 @@ class StreamThread(threading.Thread):
     lets the session manager retry the stream later.
     """
 
-    def __init__(self, cmd, name, feeder_cmd=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.name = name
         self.feeder_cmd = feeder_cmd
+        # Called before every (re)start when given: a restart must capture
+        # what is current (the default sink may have moved), not replay a
+        # command built for a device that has since gone quiet or vanished.
+        self.cmd_factory = cmd_factory
         self.feeder = None
         self.process = None
         self._running = True
@@ -1012,6 +1039,14 @@ class StreamThread(threading.Thread):
                     continue
                 if _PROGRESS_LINE_RE.match(line):
                     continue
+                if "silence_start:" in line or "silence_end:" in line:
+                    _audio_silence_event(line)
+                    continue
+                if "[info]" in line or "[verbose]" in line:
+                    continue                  # -loglevel level+info stream dumps
+                if any(b in line for b in _BENIGN_ENCODER_LINES):
+                    logging.debug("%s encoder: %s", self.name, line)
+                    continue
                 tail = getattr(self, "_stderr_tail", None)
                 if tail is None:
                     tail = self._stderr_tail = []
@@ -1061,13 +1096,31 @@ class StreamThread(threading.Thread):
         if host_state.audio_thread is self:
             host_state.audio_thread = None
 
+    def _refresh_cmd(self):
+        if self.cmd_factory is None:
+            return
+        try:
+            cmd = self.cmd_factory()
+        except Exception as e:
+            logging.error("%s: could not build the command: %s", self.name, e)
+            cmd = None
+        if cmd:
+            self.cmd = cmd
+
     def run(self):
+        self._refresh_cmd()
+        if not self.cmd:
+            logging.error("%s has no command to run.", self.name)
+            self._retire()
+            return
         logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
         if self.feeder_cmd:
             logging.info("Starting %s feeder: %s", self.name, " ".join(self.feeder_cmd))
 
         failures = 0
         while self._running and not host_state.should_terminate:
+            if failures:
+                self._refresh_cmd()
             if self._start_children():
                 ret, err = self._wait_for_exit()
                 if not self._running or host_state.should_terminate:
@@ -1081,6 +1134,7 @@ class StreamThread(threading.Thread):
                 logging.error("%s could not be started.", self.name)
 
             failures += 1
+            host_state.stream_restarts[self.name] = host_state.stream_restarts.get(self.name, 0) + 1
             if failures > STREAM_MAX_RESTARTS:
                 logging.error("%s failed %d times in a row — pausing this stream; "
                               "the session manager will retry.", self.name, failures)
@@ -1954,6 +2008,159 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
     full_cmd = input_side + output_side + (extra_filters or []) + encode + out
     return full_cmd
 
+AUDIO_WATCH_SECS = 3.0          # how often a session re-checks the audio source
+AUDIO_SILENCE_DB = -60          # below this for …
+AUDIO_SILENCE_SECS = 10         # … this long counts as silence
+
+def _pactl(*args, timeout=2.0):
+    """pactl's output, or None when PulseAudio/PipeWire-pulse cannot be asked."""
+    if not which("pactl"):
+        return None
+    try:
+        return subprocess.check_output(["pactl", *args], text=True,
+                                       stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception:
+        return None
+
+def _pulse_sources():
+    """{source name: state} from `pactl list short sources` ({} if unknown)."""
+    out = _pactl("list", "short", "sources") or ""
+    sources = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 5:
+            sources[parts[1]] = parts[4].strip().upper()
+    return sources
+
+def _audio_source_setting():
+    """'auto', or the source the user pinned (PULSE_MONITOR, then --audio_source)."""
+    env = os.environ.get("PULSE_MONITOR", "").strip()
+    if env:
+        return env
+    return str(getattr(HOST_ARGS, "audio_source", "auto") or "auto").strip()
+
+def _pick_audio_source(sources=None):
+    """(source, why) for the audio encoder to capture.
+
+    auto follows the default sink, i.e. what the host's own speakers play.
+    The old pick, "the first monitor that is RUNNING at connect", captured
+    whatever happened to be playing then and never moved: a VR headset's
+    sink that later went idle, or HDMI after the headset took over. The
+    stream then carried digital silence with nothing on either end
+    noticing. A pinned name is used as given (a sink name gets .monitor).
+    """
+    if sources is None:
+        sources = _pulse_sources()
+    setting = _audio_source_setting()
+    if setting.lower() not in ("", "auto", "default"):
+        if setting in sources or setting.endswith(".monitor") or setting.startswith("@"):
+            return setting, "pinned"
+        return f"{setting}.monitor", "pinned"
+    sink = (_pactl("get-default-sink") or "").strip()
+    if sink and f"{sink}.monitor" in sources:
+        return f"{sink}.monitor", "default sink"
+    best = None
+    for name, state in sources.items():
+        if name.endswith(".monitor"):
+            if state == "RUNNING":
+                best = name
+                break
+            if state == "IDLE" and not best:
+                best = name
+    if best:
+        return best, "first playing monitor (default sink unknown)"
+    return "@DEFAULT_MONITOR@", "PulseAudio default monitor"
+
+def _fmt_dur(secs):
+    secs = int(max(0, secs))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+def _audio_silence_event(line):
+    """Fold one silencedetect line from the audio encoder into the session stats."""
+    st = host_state.audio_stats
+    src = host_state.audio_source or "?"
+    now = time.time()
+    if "silence_start:" in line:
+        if st["silent_since"] is None:
+            st["silent_since"] = now - AUDIO_SILENCE_SECS
+            logging.info("Audio: %s silent for %ds+ (nothing playing there?).",
+                         src, AUDIO_SILENCE_SECS)
+        return
+    m = re.search(r"silence_duration:\s*([\d.]+)", line)
+    dur = float(m.group(1)) if m else (now - (st["silent_since"] or now))
+    st["silent_since"] = None
+    st["silence_total"] += dur
+    st["silence_longest"] = max(st["silence_longest"], dur)
+    logging.info("Audio: sound on %s again after %s of silence.", src, _fmt_dur(dur))
+
+def _audio_report():
+    """One line on what the session's audio did; logged when the session ends."""
+    st = host_state.audio_stats
+    now = time.time()
+    span = max(1.0, now - st["since"])
+    silent, longest = st["silence_total"], st["silence_longest"]
+    if st["silent_since"] is not None:            # still silent at the end
+        cur = now - st["silent_since"]
+        silent += cur
+        longest = max(longest, cur)
+    store = host_state.encoder_stats.get("Audio") or {}
+    sent = float(store.get("total_banked", 0.0)) + float(store.get("total_size") or 0.0)
+    names = [n for _t, n in st["sources"]] or [host_state.audio_source or "?"]
+    chain = " → ".join(dict.fromkeys(names))
+    return (f"Audio report: {_fmt_dur(span)} from {chain} "
+            f"({st['switches']} source switches), {sent / 1e6:.1f} MB sent, "
+            f"{host_state.stream_restarts.get('Audio', 0)} encoder restarts, "
+            f"silent {100.0 * silent / span:.0f}% (longest {_fmt_dur(longest)}).")
+
+def _audio_watch():
+    """Keep the audio capture on the right source while a session runs.
+
+    Moves to the new default sink when it changes (auto mode), and says so
+    when a pinned source disappears. Called from the session manager.
+    """
+    now = time.time()
+    if now - host_state.audio_watch_ts < AUDIO_WATCH_SECS:
+        return
+    host_state.audio_watch_ts = now
+    sources = _pulse_sources()
+    if not sources:
+        return                                   # pactl unavailable: nothing to compare
+    current = host_state.audio_source
+    if current is None:
+        return                                   # encoder still building its command
+    want, why = _pick_audio_source(sources)
+    if why == "pinned":
+        if current and current not in sources and not current.startswith("@"):
+            _warn_throttled("audio-pinned-gone",
+                            f"Audio: pinned source {current} is gone — the stream carries "
+                            f"nothing until it returns (--audio_source auto follows the "
+                            f"default sink).", interval=300.0)
+        return
+    if not want or want == current:
+        return
+    epoch = host_state.session_epoch
+    with host_state.video_thread_lock:
+        # Under the lock stop_streams_only() holds for a whole teardown, so a
+        # move can never resurrect audio for a session that just ended.
+        if not (host_state.session_active and host_state.session_epoch == epoch):
+            return
+        old = host_state.audio_thread
+        if old is None:
+            return
+        logging.info("Audio: %s — moving capture from %s to %s.",
+                     "default sink changed" if current in sources else
+                     f"{current} disappeared", current, want)
+        host_state.audio_stats["switches"] += 1
+        try:
+            old.stop()
+            old.join(timeout=2)
+        except Exception:
+            pass
+        host_state.audio_thread = StreamThread(None, "Audio", cmd_factory=build_audio_cmd)
+        host_state.audio_thread.start()
+
 def build_audio_cmd():
     opus_app = os.environ.get("LP_OPUS_APP", "voip")
     opus_fd  = os.environ.get("LP_OPUS_FD", "10")
@@ -1964,36 +2171,11 @@ def build_audio_cmd():
     aud_buf = "4194304" if (net_mode in ("wifi", "vpn") or tunneled) else "1048576"
     aud_delay = "150000" if (net_mode in ("wifi", "vpn") or tunneled) else "0"
 
-    mon = os.environ.get("PULSE_MONITOR", "")
-    if not mon and which("pactl"):
-        try:
-            out = subprocess.check_output(
-                ["pactl", "list", "short", "sources"],
-                text=True,
-                stderr=subprocess.DEVNULL
-            )
-            best = None
-            for line in out.splitlines():
-                parts = line.split("\t")
-                if len(parts) >= 5:
-                    name, state = parts[1], parts[4].upper()
-                    if ".monitor" in name:
-                        if state == "RUNNING":
-                            best = name
-                            break
-                        elif state == "IDLE" and not best:
-                            best = name
-            if best:
-                mon = best
-        except Exception as e:
-            logging.warning("PulseAudio monitor detection failed: %s", e)
-
-    if not mon:
-        mon = "default.monitor"
-    elif not mon.endswith(".monitor"):
-        mon += ".monitor"
-
-    logging.info("Using PulseAudio source: %s", mon)
+    mon, why = _pick_audio_source()
+    if mon != host_state.audio_source:
+        host_state.audio_stats["sources"].append((time.time(), mon))
+    host_state.audio_source = mon
+    logging.info("Audio source: %s (%s).", mon, why)
 
     channels = 2
     if which("pactl"):
@@ -2013,8 +2195,12 @@ def build_audio_cmd():
 
     logging.info("Detected %s channel(s): %s", channels, "Surround" if channels > 2 else "Stereo")
 
+    # level+info: silencedetect reports at info level, so let info through
+    # with a level tag and have the stderr reader drop the rest of it.
+    base = _ffmpeg_base_cmd()
+    base[base.index("-loglevel") + 1] = "level+info"
     input_side = [
-        *(_ffmpeg_base_cmd()),
+        *base,
         *(_input_ll_flags()),
         "-f", "pulse",
         "-i", mon,
@@ -2024,6 +2210,7 @@ def build_audio_cmd():
     output_side = _output_sync_flags()
 
     encode = [
+        "-af", f"silencedetect=noise={AUDIO_SILENCE_DB}dB:duration={AUDIO_SILENCE_SECS}",
         "-c:a", "libopus",
         "-b:a", "384k" if channels > 2 else "128k",
         "-application", opus_app,
@@ -2451,6 +2638,8 @@ def _begin_session_locked(peer_ip, encoder_str):
     host_state.client_ip = peer_ip
     host_state.session_epoch += 1
     host_state.closed_monitors = set()
+    host_state.audio_stats = _new_audio_stats()
+    host_state.stream_restarts = {}
     stream = _stream_payload()
     stream_line = f"\nSTREAM {stream}" if stream else ""
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
@@ -2686,10 +2875,9 @@ def start_streams_for_current_client(args):
 
             if (args.audio == "enable" and not host_state.audio_thread
                     and _session_still(epoch, ip)):
-                ac = build_audio_cmd()
-                if ac:
-                    host_state.audio_thread = StreamThread(ac, "Audio")
-                    host_state.audio_thread.start()
+                host_state.audio_thread = StreamThread(None, "Audio",
+                                                       cmd_factory=build_audio_cmd)
+                host_state.audio_thread.start()
         except Exception as e:
             logging.error(f"start_streams_for_current_client: exception while starting — {e}")
         finally:
@@ -3504,11 +3692,11 @@ def _session_tick(args, st):
     elif (live and host_state.video_threads
           and args.audio == "enable" and not host_state.audio_thread):
         # Video is healthy but the audio stream gave up: bring back audio only.
-        ac = build_audio_cmd()
-        if ac:
-            logging.info("Restarting the audio stream.")
-            host_state.audio_thread = StreamThread(ac, "Audio")
-            host_state.audio_thread.start()
+        logging.info("Restarting the audio stream.")
+        host_state.audio_thread = StreamThread(None, "Audio", cmd_factory=build_audio_cmd)
+        host_state.audio_thread.start()
+    elif live and args.audio == "enable" and host_state.audio_thread:
+        _audio_watch()
 
 def session_manager(args):
     st = {"epoch": host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
@@ -3960,6 +4148,9 @@ def parse_args():
                         "before encoding; 'native' streams each monitor at its own size.")
     p.add_argument("--bitrate", default=LEGACY_BITRATE)
     p.add_argument("--audio", choices=["enable","disable"], default="disable")
+    p.add_argument("--audio_source", default="auto",
+                   help="What to capture: 'auto' follows the default sink (what the "
+                        "host's speakers play); a sink or source name pins it.")
     p.add_argument("--adaptive", action="store_true")
     p.add_argument("--display", default=":0")
     p.add_argument("--preset", default="")
