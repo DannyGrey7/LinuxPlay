@@ -21,9 +21,10 @@ import select
 
 from queue import Queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QMessageBox, QOpenGLWidget,
-                             QInputDialog, QWidget)
+                             QInputDialog, QWidget, QLabel, QAction)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QRectF
-from PyQt5.QtGui import QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath
+from PyQt5.QtGui import (QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath,
+                         QKeySequence)
 
 from OpenGL.GL import *
 
@@ -2705,6 +2706,42 @@ class StatsOverlay(QWidget):
         painter.drawPath(path)
 
 
+class StatusBanner(QLabel):
+    """One line of plain-language status across the top of the video.
+
+    Says what the picture and sound cannot: that the client is reconnecting,
+    that the picture is frozen waiting for a keyframe, that the host is
+    waiting for someone to approve screen sharing, that audio dropped out or
+    is muted. Hidden when there is nothing to say; never takes the mouse.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("QLabel { background: rgba(18, 18, 22, 210); color: #f4f4f4;"
+                           " border-radius: 8px; padding: 6px 14px; font-size: 13px; }")
+        self.hide()
+
+    def show_notices(self, notices):
+        text = "   ·   ".join(notices)
+        if not text:
+            if not self.isHidden():
+                self.hide()
+            return
+        if text != self.text():
+            self.setText(text)
+            self.adjustSize()
+        self.place()
+        if self.isHidden():
+            self.show()
+        self.raise_()
+
+    def place(self):
+        parent = self.parentWidget()
+        if parent is not None:
+            self.move(max(8, (parent.width() - self.width()) // 2), 10)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, decoder_opts, rwidth, rheight, host_ip, udp_port,
                  offset_x, offset_y, net_mode='lan', parent=None, ultra=False,
@@ -2763,6 +2800,8 @@ class MainWindow(QMainWindow):
         if self._stats_visible:
             self.overlay.start()
             logging.info("Stats overlay enabled (F1 toggles it off)")
+        self.banner = StatusBanner(self)
+        self._build_menu()
 
     def _start_timers(self):
         self.clip_timer = QTimer(self)
@@ -2848,8 +2887,62 @@ class MainWindow(QMainWindow):
         self.decoder_thread.start()
         logging.info("Decoder thread started")
 
+    def _build_menu(self):
+        """macOS menu bar: Audio ▸ Mute Host Audio (⌘⇧M), View ▸ Stats Overlay.
+
+        The menu bar lives in the system bar on macOS, so it costs the video
+        nothing; other platforms keep upstream's bare window. A menu shortcut
+        is consumed here, never forwarded to the host as a key press.
+        """
+        if not IS_MAC:
+            return
+        bar = self.menuBar()
+        audio = bar.addMenu("Audio")
+        self.mute_action = QAction("Mute Host Audio", self)
+        self.mute_action.setCheckable(True)
+        self.mute_action.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self.mute_action.setChecked(bool(AUDIO_STATE["muted"] or self._audio_muted))
+        self.mute_action.setEnabled(bool(self._audio_enabled))
+        self.mute_action.toggled.connect(set_audio_muted)
+        audio.addAction(self.mute_action)
+        view = bar.addMenu("View")
+        stats = QAction("Toggle Stats Overlay (F1)", self)
+        stats.triggered.connect(self.toggle_stats)
+        view.addAction(stats)
+
+    def _banner_notices(self, now=None):
+        """What the status banner should say right now (most urgent first)."""
+        now = time.time() if now is None else now
+        out = []
+        if CLIENT_STATE.get("reconnecting") or not CLIENT_STATE.get("connected"):
+            out.append("Reconnecting to the host…")
+        note = CLIENT_STATE.get("host_note")
+        if note and now - note[1] < 3.0:
+            out.append({"portal-wait": "The host is waiting for screen-share approval"}
+                       .get(note[0], note[0]))
+        dt = getattr(self, "decoder_thread", None)
+        if dt is not None:
+            gate = getattr(dt, "gate", None)
+            if not dt._has_first_frame and now - self._session_start > 3.0:
+                out.append("Waiting for video…")
+            elif (gate is not None and gate.waiting and gate.reason == "loss"
+                  and now - gate.since > 1.0):
+                out.append("Picture frozen — waiting for a keyframe")
+            if dt.hw_fallback_at and now - dt.hw_fallback_at < 15.0:
+                out.append("Video decoding fell back to the CPU")
+        if self._audio_enabled:
+            if AUDIO_STATE["muted"]:
+                out.append("Muted")
+            elif now - AUDIO_STATE["last_glitch"] < 5.0:
+                out.append("Audio dropped out — restarting")
+        return out
+
     def _poll_connection_state(self):
         now = time.time()
+        try:
+            self.banner.show_notices(self._banner_notices(now))
+        except Exception as e:
+            logging.debug("Status banner update failed: %s", e)
         age = now - CLIENT_STATE.get("last_heartbeat", 0)
         if age > 6 and CLIENT_STATE["connected"]:
             CLIENT_STATE["connected"], CLIENT_STATE["reconnecting"] = False, True
@@ -2987,6 +3080,7 @@ class MainWindow(QMainWindow):
         try:
             self.overlay.move(12, 12)
             self.overlay.raise_()
+            self.banner.place()
         except Exception:
             pass
 
