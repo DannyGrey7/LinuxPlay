@@ -726,6 +726,14 @@ def heartbeat_responder(host_ip):
                         if not CLIENT_STATE["connected"]:
                             CLIENT_STATE["connected"] = True
                             CLIENT_STATE["reconnecting"] = False
+                    elif data.startswith(b"NOTE"):
+                        tag = data[4:].decode("ascii", errors="ignore").strip()[:40]
+                        if tag:
+                            if (CLIENT_STATE.get("host_note") or ("",))[0] != tag:
+                                logging.info("Host says: %s", {
+                                    "portal-wait": "waiting for someone to approve screen "
+                                                   "sharing on the host"}.get(tag, tag))
+                            CLIENT_STATE["host_note"] = (tag, time.time())
                     elif data.startswith(b"STATS"):
                         stats = _parse_host_stats(data.decode("utf-8", errors="ignore"))
                         if stats:

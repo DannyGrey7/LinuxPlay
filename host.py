@@ -2897,6 +2897,11 @@ def start_streams_for_current_client(args):
                     host_state.portal = portal
                 try:
                     portal.ensure(multiple=True)
+                except TimeoutError:
+                    logging.error("Portal: nobody answered the screen-share dialog on the "
+                                  "host in time — it will be shown again on the next try.")
+                    set_status("Screen-share dialog not answered")
+                    return
                 except Exception as e:
                     logging.error("Portal screen capture could not start: %s", e)
                     set_status("Portal capture failed or declined")
@@ -3364,6 +3369,7 @@ def heartbeat_manager(args):
         return
 
     last_ping = 0.0
+    last_note = 0.0
     host_state.last_pong_ts = time.time()
 
     while not host_state.should_terminate:
@@ -3381,6 +3387,16 @@ def heartbeat_manager(args):
                     last_ping = now
                 except Exception as e:
                     logging.warning("Heartbeat send error: %s", e)
+            # A share dialog waiting for someone at the host: tell the client
+            # why its screen is still black. (Restores answer in well under
+            # 1.5 s and never get here; older clients ignore the datagram.)
+            since = getattr(getattr(host_state, "portal", None), "waiting_since", None)
+            if since and now - since > 1.5 and now - last_note >= 1.0:
+                try:
+                    s.sendto(b"NOTE portal-wait", (ip, UDP_HEARTBEAT_PORT))
+                    last_note = now
+                except Exception:
+                    pass
 
             s.settimeout(0.5)
             try:

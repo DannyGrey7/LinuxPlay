@@ -6,10 +6,16 @@ A blank frame means the capture could not be verified (the portal is
 damage-driven, so an idle desktop can legitimately produce none): the test
 reports SKIP (exit 77) instead of claiming success, which is how a black-screen
 regression used to pass.
+
+The live part is opt-in (LINUXPLAY_PORTAL_TEST=1) and uses a throwaway
+restore-token file. It shows the share dialog on the host's screen, and
+restore tokens are single-use: running it against the host's own token
+file spent that token, and the next host start asked "which screen" again.
 """
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -44,6 +50,72 @@ _scaled_feeder = pc.build_feeder_cmd(_stream, fps=60, size=(1280, 720))
 assert "video/x-raw,format=BGRx,width=1280,height=720,framerate=60/1" in _scaled_feeder, _scaled_feeder
 ok("feeder command rescales the node's buffers to the logical size")
 
+# ── negotiation logging, without a portal: what the log says about prompts ──
+import logging  # noqa: E402
+
+_records = []
+
+
+class _Cap(logging.Handler):
+    def emit(self, record):
+        _records.append(record.getMessage())
+
+
+logging.getLogger().addHandler(_Cap())
+logging.getLogger().setLevel(logging.INFO)
+
+
+class _FakeConn:
+    unique_name = ":1.42"
+
+
+class _FakePortal(pc.PortalCapture):
+    """Answers like KDE: SelectSources at once, Start after `start_secs`."""
+
+    def __init__(self, start_secs, start_token="tok-new"):
+        super().__init__()
+        self.conn = _FakeConn()
+        self.start_secs, self.start_token = start_secs, start_token
+        self.seen_waiting = None
+
+    def _request(self, method, signature, body, timeout, path, dialog_timeout):
+        self.last_request_secs = 0.05
+        if method == "CreateSession":
+            return 0, {"session_handle": "/org/freedesktop/portal/desktop/session/1_1/x"}
+        if method == "SelectSources":
+            return 0, {}
+        self.seen_waiting = self.waiting_since
+        self.last_request_secs = self.start_secs
+        res = {"streams": [(100, {"size": (2194, 1234), "position": (0, 0)})]}
+        if self.start_token:
+            res["restore_token"] = self.start_token
+        return 0, res
+
+
+pc.RESTORE_PATH = os.path.join(tempfile.mkdtemp(prefix="lp_portal_"), "portal_restore.json")
+fp = _FakePortal(start_secs=19.8)
+assert fp._negotiate("tok-old", True, 120) is True
+assert fp.seen_waiting is not None and fp.waiting_since is None, "waiting flag spans the prompt"
+assert any("share dialog was shown and answered after 20s — the saved restore token was "
+           "not honoured" in m for m in _records), _records[-4:]
+assert not any("did not issue" in m for m in _records), "KDE issues the token with Start"
+assert pc._load_restore_token() == "tok-new"
+_records.clear()
+assert _FakePortal(start_secs=0.1)._negotiate("tok-new", True, 120) is True
+assert any("restore token accepted — no dialog" in m for m in _records), _records[-4:]
+_records.clear()
+assert _FakePortal(start_secs=8.0, start_token=None)._negotiate(None, True, 120) is True
+assert any("did not issue a restore token" in m for m in _records), _records[-4:]
+ok("portal log tells a restored session from a prompt, and the token from no token")
+
+if os.environ.get("LINUXPLAY_PORTAL_TEST") != "1":
+    skip("live portal negotiation", "shows the share dialog on this screen; "
+         "set LINUXPLAY_PORTAL_TEST=1 to run it")
+    print(f"\nPORTAL CAPTURE TEST PASSED ({len(PASS)} checks, {len(SKIPPED)} skipped)")
+    sys.exit(77)
+
+# Never the host's own token: a run that times out would spend it.
+pc.RESTORE_PATH = os.path.join(tempfile.mkdtemp(prefix="lp_portal_"), "portal_restore.json")
 p = pc.PortalCapture()
 try:
     p.ensure(multiple=True)

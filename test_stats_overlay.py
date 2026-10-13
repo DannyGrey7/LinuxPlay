@@ -235,6 +235,12 @@ try:
         _time.sleep(0.05)
     stats = CLIENT_STATE["host_stats"]
     assert stats.get("enc_kbps") == 5000.0 and stats.get("rtt") == 3.5, stats
+    probe.sendto(b"NOTE portal-wait", ("127.0.0.1", client.UDP_HEARTBEAT_PORT))
+    for _ in range(40):
+        if CLIENT_STATE.get("host_note"):
+            break
+        _time.sleep(0.05)
+    assert (CLIENT_STATE.get("host_note") or ("",))[0] == "portal-wait", CLIENT_STATE.get("host_note")
     assert CLIENT_STATE["last_heartbeat"] > 0.0, "PING must refresh the heartbeat clock"
 finally:
     probe.close()

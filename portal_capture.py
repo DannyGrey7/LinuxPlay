@@ -34,6 +34,12 @@ MONITOR = 1          # source type bitmask
 CURSOR_EMBEDDED = 2  # cursor is drawn into the buffers
 PERSISTENT = 2       # persist_mode: portal may store a restore token
 
+# A portal request answered slower than this had a person in the loop: the
+# share dialog was on screen. KDE never rejects an unusable restore token —
+# per the spec it "is ignored and the user will be prompted normally" — so
+# the time it took is the only sign that a prompt happened.
+DIALOG_SECS = 3.0
+
 
 def gst_pipewiresrc_available() -> bool:
     import shutil, subprocess
@@ -99,6 +105,10 @@ class PortalCapture:
         self.conn = None
         self.session = None
         self.streams = []   # [{"node", "w", "h", "x", "y"}]
+        # Set while a request that may show the share dialog is pending, so
+        # the host can tell its client why the screen is still black.
+        self.waiting_since = None
+        self.last_request_secs = 0.0
 
     # ── low-level helpers ────────────────────────────────────────────
     def _portal_obj(self):
@@ -109,7 +119,7 @@ class PortalCapture:
         return self.conn.send_and_get_reply(msg, timeout=timeout)
 
     def _request(self, method, signature, body, timeout, path, dialog_timeout):
-        """Make a request and wait for its Response signal.
+        """Make a request and wait for its Response signal (timed, for the log).
 
         The jeepney filter is registered *before* the method call: a blocking
         connection routes inbound messages only to matching filters while it
@@ -119,9 +129,13 @@ class PortalCapture:
         """
         rule = MatchRule(type="signal", interface=REQUEST_IFACE,
                          member="Response", path=path)
-        with self.conn.filter(rule) as queue:
-            self._call(method, signature, body, timeout)
-            return self._wait_response(path, queue, dialog_timeout)
+        t0 = time.monotonic()
+        try:
+            with self.conn.filter(rule) as queue:
+                self._call(method, signature, body, timeout)
+                return self._wait_response(path, queue, dialog_timeout)
+        finally:
+            self.last_request_secs = time.monotonic() - t0
 
     def _wait_response(self, request_path, queue, timeout):
         """Wait for the portal Response signal on a specific request path."""
@@ -185,6 +199,11 @@ class PortalCapture:
         self._reset_session()
         self._open_connection()
         restore_token = _load_restore_token()
+        if restore_token:
+            logging.info("Portal: reusing the saved restore token — no share dialog expected.")
+        else:
+            logging.info("Portal: no saved restore token — the share dialog will appear "
+                         "on the host; someone has to approve it there.")
         if restore_token:
             try:
                 return self._negotiate(restore_token, multiple, timeout_dialog)
@@ -250,42 +269,55 @@ class PortalCapture:
             return self._request("SelectSources", "oa{sv}", (self.session, options),
                                  timeout=15, path=path, dialog_timeout=timeout_dialog)
 
-        if restore_token:
-            logging.debug("Reusing portal restore token (should skip the share dialog).")
-        code, results = _select_sources(restore_token)
-        if code != 0 and restore_token:
-            logging.info("Portal restore token no longer valid (code %s) — asking again.", code)
-            _clear_restore_token()
-            code, results = _select_sources(None)
-        if code != 0:
-            raise RuntimeError(f"Screen selection declined (code {code})")
+        self.waiting_since = time.time()
+        try:
+            code, results = _select_sources(restore_token)
+            prompt_secs = self.last_request_secs
+            if code != 0 and restore_token:
+                logging.info("Portal restore token no longer valid (code %s) — asking again.", code)
+                _clear_restore_token()
+                code, results = _select_sources(None)
+                prompt_secs = self.last_request_secs
+            if code != 0:
+                raise RuntimeError(f"Screen selection declined (code {code})")
 
-        new_token = results.get("restore_token")
-        if new_token:
-            _save_restore_token(new_token)
+            new_token = results.get("restore_token")
+            if new_token:
+                _save_restore_token(new_token)
+
+            # 3. Start (KDE shows its dialog here, GNOME during SelectSources)
+            tok, path = request_path()
+            code, results = self._request(
+                "Start", "osa{sv}", (self.session, "", {"handle_token": ("s", tok)}),
+                timeout=15, path=path, dialog_timeout=timeout_dialog,
+            )
+            prompt_secs = max(prompt_secs, self.last_request_secs)
+        finally:
+            self.waiting_since = None
+        if code != 0:
+            if restore_token:
+                raise _RestoreTokenRejected(f"code {code}")
+            raise RuntimeError(f"ScreenCast start declined (code {code})")
+
+        if prompt_secs >= DIALOG_SECS:
+            logging.info("Portal: the share dialog was shown and answered after %.0fs%s.",
+                         prompt_secs, " — the saved restore token was not honoured"
+                         if restore_token else "")
+        elif restore_token:
+            logging.info("Portal: restore token accepted — no dialog (answered in %.1fs).",
+                         prompt_secs)
+
+        # Some backends only hand out the restore token with the Start response.
+        late_token = results.get("restore_token")
+        if late_token and not new_token:
+            _save_restore_token(late_token)
+        if new_token or late_token:
             logging.info("Portal restore token saved — the share dialog should not appear again.")
         else:
             logging.info(
                 "Portal did not issue a restore token; if the share dialog has a "
                 "'remember' option, enable it to avoid future prompts."
             )
-
-        # 3. Start
-        tok, path = request_path()
-        code, results = self._request(
-            "Start", "osa{sv}", (self.session, "", {"handle_token": ("s", tok)}),
-            timeout=15, path=path, dialog_timeout=timeout_dialog,
-        )
-        if code != 0:
-            if restore_token:
-                raise _RestoreTokenRejected(f"code {code}")
-            raise RuntimeError(f"ScreenCast start declined (code {code})")
-
-        # Some backends only hand out the restore token with the Start response.
-        late_token = results.get("restore_token")
-        if late_token and not new_token:
-            _save_restore_token(late_token)
-            logging.info("Portal restore token saved — the share dialog should not appear again.")
 
         # 4. Parse streams
         streams = results.get("streams") or []
