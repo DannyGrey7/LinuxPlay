@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--minutes", type=float, default=30.0)
     ap.add_argument("--log", default="probe_client.log")
     ap.add_argument("--audio", action="store_true", help="also run the audio player")
+    ap.add_argument("--mute", action="store_true",
+                    help="with --audio: play at volume 0 (the stream is still decoded and watched)")
     ap.add_argument("--hwaccel", default="auto")
     ap.add_argument("--net", default="auto")
     a = ap.parse_args()
@@ -105,10 +107,11 @@ def main():
     logging.info("Probe: host %s, desktop %s, net %s, hwaccel %s",
                  host_encoder, monitor_info_str, net_mode, hw)
 
+    extra = {"muted": True} if a.mute else {}      # older clients have no mute
     win = client.MainWindow(decoder_opts, *(stream_size or (w, h)), a.host_ip,
                             client.DEFAULT_UDP_PORT, int(ox), int(oy), net_mode,
                             ultra=False, gamepad="disable", audio=a.audio,
-                            desktop_size=(w, h))
+                            desktop_size=(w, h), **extra)
 
     def finish():
         if getattr(finish, "done", False):
