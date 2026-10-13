@@ -22,12 +22,17 @@ PY = os.path.join(HERE, ".venv", "bin", "python")
 HOST_SRC = open(os.path.join(HERE, "host.py"), encoding="utf-8").read()
 START_SRC = open(os.path.join(HERE, "start.py"), encoding="utf-8").read()
 
-PASS = []
+PASS, SKIPPED = [], []
 
 
 def ok(name):
     PASS.append(name)
     print(f"  PASS: {name}")
+
+
+def skip(name, why):
+    SKIPPED.append(name)
+    print(f"  SKIP: {name} — {why}")
 
 
 def value_of(argv, flag):
@@ -192,11 +197,16 @@ try:
 
     # A recycled PID must not be signalled: this test process is not a host.
     # (released stays False on purpose, so a refusal is what ends the call.)
-    assert hostlock._looks_like_host(os.getpid()) is False
-    assert hostlock.shutdown_host([os.getpid()], released=lambda: False, timeout=0.1) is False, \
-        "refuse to kill something that is not host.py"
-    os.kill(os.getpid(), 0)          # and we are still here
-    ok("stopping refuses a PID that is not a LinuxPlay host")
+    # The check reads /proc/<pid>/cmdline, so it only exists on Linux — the
+    # only place a host runs; elsewhere it trusts the lock file.
+    if os.path.exists(f"/proc/{os.getpid()}/cmdline"):
+        assert hostlock._looks_like_host(os.getpid()) is False
+        assert hostlock.shutdown_host([os.getpid()], released=lambda: False, timeout=0.1) is False, \
+            "refuse to kill something that is not host.py"
+        os.kill(os.getpid(), 0)          # and we are still here
+        ok("stopping refuses a PID that is not a LinuxPlay host")
+    else:
+        skip("stopping refuses a PID that is not a LinuxPlay host", "no /proc (not Linux)")
 
     # ── 5b. a host that predates the lock is found by its port instead ──
     # Uses a private port so a live host on the real one cannot confuse the test.
@@ -292,4 +302,7 @@ assert not os.path.exists(entry), "disable removes the entry"
 ok("autostart disable removes the entry")
 
 
-print(f"\nALL {len(PASS)} AUTOSTART TESTS PASSED")
+print(f"\nALL {len(PASS)} AUTOSTART TESTS PASSED"
+      + (f" ({len(SKIPPED)} skipped)" if SKIPPED else ""))
+if SKIPPED:
+    sys.exit(77)

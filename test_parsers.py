@@ -64,6 +64,7 @@ assert run_probe(host._detect_monitors_kscreen, KSCREEN_ANSI) == [(2560, 1440, 1
 ok("kscreen parser: ANSI codes stripped, disabled output skipped, geometry exact")
 
 # _session_type env-var precedence
+session_before = host._session_type()
 saved = {k: os.environ.pop(k, None) for k in ("XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "DISPLAY")}
 try:
     os.environ["XDG_SESSION_TYPE"] = "x11";  assert host._session_type() == "x11"
@@ -80,7 +81,7 @@ finally:
         if v is not None:
             os.environ[k] = v
 
-assert host._session_type() == "wayland"   # env restored
+assert host._session_type() == session_before   # env restored (not every runner is in Wayland)
 
 # CPU preset/tune sanitization (GUI offers mixed-backend names)
 assert host._safe_x264_preset("llhp") == "ultrafast"
