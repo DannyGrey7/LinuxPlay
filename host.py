@@ -495,6 +495,7 @@ class HostState:
         # Monitors whose window the client closed this session: the session
         # manager must not restart them (it restarts whatever is not running).
         self.closed_monitors = set()
+        self.streams_net_mode = None   # net_mode the running streams were built for
         self.last_rtt_ms = 0.0
         self.last_jitter_ms = 0.0
         self.encoder_stats = {}    # stream name -> latest ffmpeg -progress values
@@ -2934,6 +2935,9 @@ def start_streams_for_current_client(args):
                     logging.info("Session ended while streams were starting — not starting them.")
                     break
                 ps = portal.match_stream(i, mon) if portal else None
+                # The mode these commands are built for (after any portal
+                # prompt): the session manager restarts them if it changes.
+                host_state.streams_net_mode = host_state.net_mode
                 stream_size = getattr(host_state, "stream_size", None)
                 cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
                                       portal_stream=ps, stream_size=stream_size)
@@ -3003,19 +3007,14 @@ def control_listener(sock):
                 if mode in ("wifi", "lan", "vpn"):
                     old = getattr(host_state, "net_mode", "lan")
                     if mode != old:
+                        # Only record it: the session manager restarts streams
+                        # built for another mode (and a start in progress picks
+                        # the new one up). Stopping here meant waiting on the
+                        # stream lock, which a start holds across a portal
+                        # prompt — this thread then read no input and no
+                        # GOODBYE for up to two minutes.
                         logging.info(f"Network mode switch requested: {old} → {mode}")
                         host_state.net_mode = mode
-                        try:
-                            stop_streams_only()
-                            # stop_streams_only() arms the reconnect cooldown, but
-                            # this restart is deliberate: clear it so the switch
-                            # does not black out the screen for two seconds. The
-                            # session manager restarts the streams (with the new
-                            # buffers) on its next tick — one start path, and this
-                            # thread never blocks on a portal prompt.
-                            host_state.last_disconnect_ts = 0.0
-                        except Exception as e:
-                            logging.error(f"Restart after NET failed: {e}")
                 continue
 
             elif cmd == "GOODBYE":
@@ -3755,6 +3754,13 @@ def _session_tick(args, st):
 
     ip = host_state.client_ip
     live = bool(ip and host_state.session_active)
+    if (live and host_state.video_threads and host_state.streams_net_mode
+            and host_state.streams_net_mode != host_state.net_mode):
+        logging.info("Restarting streams for network mode %s.", host_state.net_mode)
+        stop_streams_only()
+        # Deliberate restart, not a disconnect: no cooldown black-out.
+        host_state.last_disconnect_ts = 0.0
+        return
     wanted = [i for i in range(len(host_state.monitors or [None]))
               if i not in host_state.closed_monitors]
     if live and wanted and not host_state.video_threads:

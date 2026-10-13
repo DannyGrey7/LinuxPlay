@@ -393,6 +393,54 @@ with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
     assert st["failures"] == 0, "teardown must not arm a 'did not start' retry"
     ok("WINDOW_CLOSE + GOODBYE: no encoder restart and no retry during teardown")
 
+    # NET only records the mode: a start can hold the stream lock across a
+    # portal prompt for two minutes, and the control thread used to wait it
+    # out (no input, no GOODBYE). Streams built for the old mode restart on
+    # the session manager's next tick.
+    token = _fresh_session()
+    hs = host.host_state
+    hs.net_mode = "lan"
+    release = threading.Event()
+
+    class _BlockingPortal:
+        def ensure(self, multiple=True):
+            release.wait(5)
+
+        def match_stream(self, i, mon):
+            return None
+
+    hs.capture_mode, hs.portal = "portal", _BlockingPortal()
+    st = {"epoch": hs.session_epoch, "failures": 0, "next_attempt": 0.0}
+    starter = threading.Thread(target=host._session_tick, args=(_args, st), daemon=True)
+    starter.start()
+    time.sleep(0.2)                          # now inside ensure(), holding the lock
+    ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctl.bind(("127.0.0.1", 0))
+    listener = threading.Thread(target=host.control_listener, args=(ctl,), daemon=True)
+    listener.start()
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.sendto(f"AUTH {token} NET vpn".encode(), ctl.getsockname())
+    tx.sendto(f"AUTH {token} NET wifi".encode(), ctl.getsockname())
+    deadline = time.time() + 1.0
+    while hs.net_mode != "wifi" and time.time() < deadline:
+        time.sleep(0.02)
+    assert hs.net_mode == "wifi", "the control thread blocked behind a portal prompt"
+    release.set()
+    starter.join(3)
+    assert hs.streams_net_mode == "wifi", "a start in progress builds for the new mode"
+    hs.portal, hs.capture_mode = None, "x11grab"
+
+    _FakeStream.started = []
+    hs.net_mode = "lan"                      # e.g. the client moved off the VPN
+    host._session_tick(_args, st)            # stops the wifi-mode streams …
+    assert not hs.video_threads
+    host._session_tick(_args, st)            # … and starts them for lan
+    assert _FakeStream.started[:1] == ["Video 0"] and hs.streams_net_mode == "lan"
+    ctl.close()
+    tx.close()
+    host.end_session("cleanup")
+    ok("NET never blocks the control thread; streams are rebuilt for the new mode")
+
     # Closing one window must not get that monitor restarted mid-session.
     _fresh_session()
     _FakeStream.started = []
