@@ -67,9 +67,14 @@ Thanks to the upstream author for building the thing in the first place — with
 - **Audio Features**
   - Surround Sound Support (5.1 / 7.1): Host detects and captures up to 8 audio channels.
   - Client performs intelligent downmixing (FFplay filters) to stereo for local speakers when necessary.
-  - Playback is drift/gap tolerant (`aresample=async=1`) — no more jitter on a lossy link — and a
-    watchdog restarts the player if its playout clock stops advancing, instead of going silent
-    for the rest of the session.
+  - The host captures what its own speakers play — the default output's monitor — and follows
+    it when the default output changes (a VR headset taking over, HDMI coming back) instead of
+    streaming the old, now silent one. `--audio_source <sink>` pins a specific output.
+  - A watchdog restarts the client's player if its playout clock stops (it plays again in
+    ~0.2 s), and digital silence while the clock runs is logged on both ends. Each session ends
+    with an `Audio report:` line on host and client (sources, restarts, share of silence).
+  - Mute without disconnecting: **Audio ▸ Mute Host Audio** (⌘⇧M) on macOS, `--mute`, or
+    "muted" in the launcher. The stream keeps being watched; only playback is silent.
 - **Granular Encoder Control**
   - Direct control over FFmpeg parameters: **GOP, QP/CRF, Preset, Tune, and Pixel Format (`yuv420p`, `yuv444p`)** are fully exposed via command line arguments.
 - **Advanced Capture Methods**
@@ -339,7 +344,7 @@ top-left corner. Everything on it is graphed over the last 60 seconds:
 | Metric | Where it comes from |
 |--------|---------------------|
 | video in (Mb/s) | bytes actually demuxed on the client — the real received rate |
-| encoder out (Mb/s) | the host's own `ffmpeg -progress` bitrate |
+| encoder out (Mb/s) | the host's encoder over its last 5 s (hosts before Oct 2026: a session-long average, labelled so) |
 | latency / jitter (ms) | heartbeat round trip (the client echoes the host's timestamp, so no clock sync is needed) |
 | decode (ms) / decode (fps) | frame timing in the decoder thread |
 | client cpu / gpu (%) | this machine |
@@ -347,8 +352,14 @@ top-left corner. Everything on it is graphed over the last 60 seconds:
 | dropped (/s) | frames the host's encoder dropped, per second |
 
 The header also shows link mode, connection state, uptime, reconnects, resolution,
-hardware decoder and renderer; the footer shows total received data and keyframes/s.
+hardware decoder (and whether it fell back to the CPU) and renderer, plus a loss line:
+frames that arrived damaged, frames held back until the next keyframe, and how long the
+picture stood frozen waiting for it. The footer shows total received data and keyframes/s.
 Comparing *video in* against *encoder out* is the quickest way to spot packet loss.
+
+The client log's `Frame pacing:` line reports the same loss figures every 5 s, and a
+one-line banner over the video says when the picture is frozen, the client is reconnecting,
+audio dropped out or is muted, or the host is waiting for someone to approve screen sharing.
 
 Note: with host and client on the **same** machine the two processes collide on UDP 7004
 (heartbeat/stats), so latency and host stats will read zero there. On separate machines
@@ -469,14 +480,20 @@ The tests are standalone self-checking scripts (`test_*.py`), tied together by
   no Wayland session, no `/dev/uinput`, an occupied port because a host is
   running, …), anything else = fail. `test_all.py` exits non-zero only on
   failures, so it can gate a commit.
-- `test_portal.py` drives the real portal and needs you to approve the share
-  dialog; run it explicitly rather than as part of a quick check. The portal is
-  damage-driven, so on an idle desktop it produces no frames — the test reports
-  that as SKIP instead of pretending to have verified capture.
+- The live part of `test_portal.py` drives the real portal and needs you to
+  approve the share dialog, so it only runs with `LINUXPLAY_PORTAL_TEST=1`, and
+  with a throwaway restore token: restore tokens are single-use, and a run that
+  timed out against the host's own token made the next host start ask again.
+  The portal is damage-driven, so on an idle desktop it produces no frames — the
+  test reports that as SKIP instead of pretending to have verified capture.
 - A few tests need a port that a running host/client owns (7003 uploads,
   7004 heartbeat, 6001 audio). Stop the host first, or expect SKIP.
 - Nothing in the suite injects input into your session: the uinput tests only
   create the virtual devices, check their capability bitmaps and remove them.
+- To measure a change on the real link rather than in a test, `tools/probe_client.py`
+  runs the client without a window for a set time (same decode path, same teardown) and
+  `tools/analyze_client_log.py` summarises its log or a normal client log, old or new
+  format, for a before/after comparison.
 
 ---
 
