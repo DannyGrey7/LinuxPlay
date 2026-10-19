@@ -54,6 +54,7 @@ See [the incident report](2026-10-19-stale-session.md).
 | 17 | Remove the decoder settings PyAV 18 silently ignores (`low_delay`, `strict_std_compliance`, `flags2="+fast"`) | Code says something it doesn't do (N6) | XS / low |
 | 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fixed in `ea7608b`, deployed 2026-10-19 18:43, awaiting the listening test:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
 | 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
+| 26 | Audio capture reads one Opus frame at a time: `-fragment_size` of 192 bytes × `LP_OPUS_FD` ms (3840 for production's 20 ms) on the pulse input, instead of ffmpeg's default 50 ms. **Committed in `9944f10`, not deployed, needs the listening test** ([measurements below](#item-26-audio-capture-read-size)) | 50 ms reads send audio in lumps of 2–3 packets, each up to 41 ms late. Capture-to-packet goes from 57 to 37 ms on average, and from 84 to 44 ms at worst. A further 20 ms sits in the mpegts muxer (see the section). | XS / low (ffmpeg +0.3% of a core; needs a listening test) |
 
 ### Item 24: audio timestamps
 
@@ -117,10 +118,9 @@ is gone, so this stays a candidate. With the fix, a late read logs nothing,
 so there's nothing to start the loop, and the repeat gate and bounded log
 view (`c3a2300`) keep the reader fast anyway.
 
-**Seen, not changed.** The server picks the 50 ms read size, so audio leaves
-the host in 50 ms lumps, the first of them up to 50 ms late. `-fragment_size`
-on the pulse input could take back most of that, but it needs its own
-latency A/B.
+**Seen, not changed.** The 50 ms read size makes audio leave the host in
+lumps. It is ffmpeg's default, not the server's choice; [item 26](#item-26-audio-capture-read-size)
+measures it and changes it.
 
 **Deployed** 2026-10-19 18:43 (autostart unit, host idle). The suites
 pass on doggoos. A 2-minute muted probe session ran: certificate auth, portal
@@ -131,6 +131,94 @@ still reported, 1.6 MB sent (13.3 KB/s), no timestamp warnings, clean
 **Still to do:** Danny's listening test. Check lip-sync on a talking-head video or a hand clap, play
 a few minutes of a game, then run a long session. The host log should show
 no `backward in time` or `Non-monotonic DTS` lines.
+
+### Item 26: audio capture read size
+
+Measured on doggoos on 2026-10-19, 18:50–19:30, with no session running.
+The default sink was `wivrn.sink`. Each variant ran alone, using the exact
+host audio command (`ea7608b`, `audio`, 20 ms frames) plus `-fragment_size`.
+It sent to a receiver on 127.0.0.1 that timed every Opus packet. Scripts and
+output are in `~/linuxplay-audit/lab/fragsize/` on the box.
+
+**Where the 50 ms comes from.** ffmpeg's pulse input picks it, not the
+server. With no `fragment_size` it asks for 1/20 s
+(`libavdevice/pulse_audio_dec.c`), and a read returns only once a whole
+fragment has arrived. pipewire-pulse 1.6.9 sends a record stream whole
+fragments only. The reads measured exactly the fragment (50, 40, 20 and
+10 ms), with 5.3 ms as the smallest the server allows. Each read lands on
+the graph's 2.7 ms quantum.
+
+**Packets out** (60 s per variant, lateness against a steady 20 ms clock,
+0 = the earliest packet; "stalls" = SIGSTOP 60–250 ms every 0.4–1 s, as
+in item 24):
+
+| `-fragment_size` | calm: late, mean / worst | packets < 2 ms apart | stalls: late, mean | ffmpeg CPU |
+|---|---|---|---|---|
+| default (9600 B, 50 ms) | 20.5 / 42.0 ms | 60% | 40.7 ms | 0.6% |
+| 7680 (40 ms) | 10.0 / 20.7 ms | 50% | 28.9 ms | 0.7% |
+| **3840 (20 ms)** | **0.7 / 2.0 ms** | 0% | **19.5 ms** | 0.9% |
+| 1920 (10 ms) | 0.7 / 1.6 ms | 0% | 20.1 ms | 1.4% |
+
+Calm figures are the worse of the two sinks, `wivrn.sink.monitor` and the HDMI
+monitor, which differed by ≤ 0.5 ms; stall figures are their mean. In all 16 runs there were no
+`backward in time` or `Non-monotonic DTS` lines, no overrun or xrun lines in
+PipeWire's journal, no new driver errors (pw-top), and no lost audio. CPU is
+% of one core. PipeWire's own CPU didn't change with the read size.
+
+**Capture to packet.** 10 ms clicks were played into a temporary null sink
+(nothing audible), 25 per variant. Each was timed from when a 5.3 ms
+reference capture of the monitor saw it to the first loud Opus packet out.
+The player's own latency report agreed with the reference: 0.4 ms apart on
+average, −7 to +2 ms per click.
+
+| `-fragment_size` | mean | worst | with `-pes_payload_size 0` too |
+|---|---|---|---|
+| default | 56.7 ms | 83.7 ms | 37.9 / 62.3 ms |
+| 7680 | 46.2 ms | 62.6 ms | — |
+| **3840** | **37.0 ms** | **44.3 ms** | 16.7 / 25.6 ms |
+| 1920 | 36.3 ms | 46.3 ms | — |
+
+What's left at 3840 with the muxer fix, 7–26 ms, is the 20 ms Opus frame
+plus libopus's 6.5 ms look-ahead.
+
+**What the client gets (inferred).** ffplay plays audio on its own clock
+and never catches up after a late packet: on macOS its audio callback waits
+for the next frame. Its playout therefore settles behind the latest packet
+it has seen, so the client keeps the *worst* lateness, ~40 ms here, not the
+mean.
+
+**Graph quantum.** pipewire-pulse asks the graph for a quantum the size of
+the fragment (pw-top: 2400, 1920, 960 and 480 samples). In every run the
+quantum stayed at 128, because `wivrn.sink` asks for 240 and holds every
+active group there. That includes the HDMI sink once it wakes: capturing
+its monitor moved `wivrn.sink` under the HDMI driver, with no new xruns.
+Without WiVRn, a capture alone on the HDMI sink would set the quantum
+itself. Going by the pipewire-pulse source, not measured: ~2048 samples
+(42.7 ms) today, 512 (10.7 ms) with 3840. 512 is an ordinary desktop
+quantum; the default is 1024.
+
+**Choice: one Opus frame per read** (`9944f10`). That's 3840 bytes for the
+production 20 ms, and 1920 for the 10 ms `voip` default. Going below a frame
+gains nothing and costs CPU (1920 with 20 ms frames). The input is always
+s16le stereo 48 kHz, the pulse demuxer's defaults, so 192 bytes a ms holds
+for surround sinks too. `test_host.py` pins it.
+
+**Also found, not changed: the mpegts muxer holds every audio packet for
+one frame.** `libavformat/mpegtsenc.c` queues audio packets smaller than
+`pes_payload_size` (default ~2.9 KB, i.e. every Opus packet) until the next
+one arrives. `-muxdelay 0` only makes that next packet flush the queue. That
+is another 20 ms. `-pes_payload_size 0` sends packets over 170 bytes at
+once (measured above: 37.0 → 16.7 ms). Packets of 170 bytes or less
+(silence, very quiet frames) are still held. Since the client keeps the
+worst lateness it has seen, the gain only reaches the ear if every packet
+is bigger than that, e.g. CBR Opus (`-vbr off`, 320 bytes per 20 ms at
+128k). That trades the cheaper silent stream for a steady 16 KB/s. It needs
+its own A/B.
+
+**Still to do:** deploy (Danny's call), then the listening test together
+with item 24's. Lip-sync on a talking-head video or a hand clap; a few
+minutes of a game; the host log should show nothing new. Relative to video, audio
+may now play up to ~40 ms earlier than before.
 
 ## Deliberately skipped, and why
 
