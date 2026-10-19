@@ -3310,6 +3310,23 @@ class MainWindow(QMainWindow):
 
         event.accept()
 
+def keep_previous_logs(path, keep=3):
+    """Shift path → path.1 → … → path.<keep> before a run starts a fresh log.
+
+    Opening the log with mode "w" alone erased the only record of the last
+    session the moment the client was launched again — on 2026-10-19 the run
+    that had kept the host busy all night was gone by the time anyone looked.
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return
+        for i in range(keep - 1, 0, -1):
+            if os.path.exists(f"{path}.{i}"):
+                os.replace(f"{path}.{i}", f"{path}.{i + 1}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        pass
+
 def main():
     import os, sys, argparse, psutil, time, logging
     from PyQt5.QtWidgets import QApplication, QMessageBox
@@ -3381,6 +3398,7 @@ def main():
     root_logger.addHandler(console)
 
     try:
+        keep_previous_logs("linuxplay_client.log")
         file_handler = logging.FileHandler("linuxplay_client.log", mode="w", encoding="utf-8")
         file_handler.setLevel(LOG_LEVEL)
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))

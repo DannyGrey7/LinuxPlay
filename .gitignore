@@ -16,3 +16,4 @@ client_key.pem
 HANDOFF.md
 .commandcode/
 .zcode/
+*.log.[0-9]

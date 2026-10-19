@@ -49,9 +49,22 @@ def _launch_log_path(name):
             return None
 
 
-def _open_launch_log(path):
+def _open_launch_log(path, keep=3):
+    """A fresh launch log; the last `keep` runs' logs move to path.1, path.2…
+
+    (client.keep_previous_logs does the same for the client's own log: a
+    relaunch used to erase the only record of the run before it.)
+    """
     if not path:
         return None
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            for i in range(keep - 1, 0, -1):
+                if os.path.exists(f"{path}.{i}"):
+                    os.replace(f"{path}.{i}", f"{path}.{i + 1}")
+            os.replace(path, f"{path}.1")
+    except OSError:
+        pass
     try:
         return open(path, "w", encoding="utf-8")
     except Exception:
