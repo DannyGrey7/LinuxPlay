@@ -52,7 +52,7 @@ See [the incident report](2026-10-19-stale-session.md).
 | 18 | When VideoToolbox rejects a keyframe, decode that GOP in software and return to hardware at the next keyframe, instead of reopening and waiting | VideoToolbox intermittently rejects *valid* `hevc_vaapi` keyframes (4 in 40 min in run C). The CPU decoder takes them. Today each costs a freeze to the next keyframe. | M / medium |
 | 19 | Flag whole-frame losses the demuxer can't see: compare the gap between consecutive frames' PTS with the host's frame cadence, or have the host number frames | With PES lengths, a lost small frame is only noticed when the next one is refused. Same freeze, but one frame of decoder chatter. | S / low |
 | 17 | Remove the decoder settings PyAV 18 silently ignores (`low_delay`, `strict_std_compliance`, `flags2="+fast"`) | Code says something it doesn't do (N6) | XS / low |
-| 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fix committed, not deployed:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
+| 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fixed in `ea7608b`, deployed 2026-10-19 18:43, awaiting the listening test:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
 | 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
 
 ### Item 24: audio timestamps
@@ -122,8 +122,13 @@ the host in 50 ms lumps, the first of them up to 50 ms late. `-fragment_size`
 on the pulse input could take back most of that, but it needs its own
 latency A/B.
 
-**Still to do:** deploy (restart the host while it's idle), then Danny's
-listening test. Check lip-sync on a talking-head video or a hand clap, play
+**Deployed** 2026-10-19 18:43 (autostart unit, host idle). The suites
+pass on doggoos. A 2-minute muted probe session ran: certificate auth, portal
+restored with no dialog, the encoder ran with the new chain, silencedetect
+still reported, 1.6 MB sent (13.3 KB/s), no timestamp warnings, clean
+`GOODBYE`.
+
+**Still to do:** Danny's listening test. Check lip-sync on a talking-head video or a hand clap, play
 a few minutes of a game, then run a long session. The host log should show
 no `backward in time` or `Non-monotonic DTS` lines.
 
