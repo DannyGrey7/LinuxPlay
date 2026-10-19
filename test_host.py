@@ -575,6 +575,68 @@ _st._refresh_cmd()
 assert _st.cmd == ["ffmpeg", "-i", "x"]
 ok("a stream with a command factory rebuilds its command before each start")
 
+# A warning ffmpeg repeats on every frame is logged once, then once a window
+# with a count (2026-10-19: ~17 a second for sixteen hours).
+_flood = "[libopus @ 0x555e3d2e09c0] [warning] Queue input is backward in time"
+_g = host._RepeatGate(window=60.0)
+assert _g.admit(_flood, now=0.0) == [_flood]
+for _i in range(1, 1000):
+    assert _g.admit(_flood.replace("09c0", f"{_i:04x}"), now=_i * 0.05) == []
+_other = "[aost#0:0/libopus @ 0x1] Non-monotonic DTS; previous: 10, current: 9; changing to 11."
+assert _g.admit(_other, now=50.0) == [_other], "another message is not held back"
+_out = _g.admit(_flood, now=61.0)
+assert len(_out) == 1 and "repeated 999 more times in the last 61s" in _out[0], _out
+assert "Queue input is backward in time" in _out[0], _out
+assert _g.admit(_flood, now=62.0) == []
+assert any("repeated 2 more times" in s for s in _g.flush(final=True))
+assert _g.flush(final=True) == []
+assert _g.admit(_other, now=200.0) == [_other], "a quiet message logs again after its window"
+_g2 = host._RepeatGate(max_shapes=4)
+for _c in "abcdefghij":
+    _g2.admit(f"unique message {_c}", now=0.0)
+assert len(_g2._shapes) == 4
+ok("repeated encoder warnings: once, then a count per window; shapes bounded")
+
+
+class _FloodProc:
+    def __init__(self, lines):
+        import io
+        self.stderr = io.StringIO("".join(line + "\n" for line in lines))
+
+
+_warned = []
+with patched(host.logging, warning=lambda *a, **k: _warned.append(a[0] % a[1:])):
+    host.StreamThread(["ffmpeg"], "Audio")._drain_stderr(_FloodProc([_flood] * 5000))
+host.host_state.encoder_stats.pop("Audio", None)
+assert len(_warned) == 2, _warned[:5]
+assert _warned[0] == f"Audio encoder: {_flood}"
+assert "repeated 4999 more times" in _warned[1], _warned[1]
+ok("a 5000-line encoder flood reaches the log as two lines")
+
+# The GUI log view takes queued lines in bounded batches.
+import logging as _logging          # noqa: E402
+import types as _types              # noqa: E402
+_h = host.QtLogHandler(maxlen=100)
+_h.setFormatter(_logging.Formatter("%(message)s"))
+for _i in range(250):
+    _h.emit(_logging.LogRecord("t", _logging.WARNING, __file__, 1, f"line {_i}", None, None))
+_lines, _skipped = _h.drain()
+assert _skipped == 150 and len(_lines) == 100, (_skipped, len(_lines))
+assert _lines[0] == "line 150" and _lines[-1] == "line 249"
+assert _h.drain() == ([], 0)
+for _i in range(120):
+    _h.emit(_logging.LogRecord("t", _logging.INFO, __file__, 1, f"next {_i}", None, None))
+_shown = []
+host.HostWindow._flush_log(_types.SimpleNamespace(_log_handler=_h, append_log=_shown.append))
+assert len(_shown) == 1, "one append per flush, not one per record"
+_batch = _shown[0].split("\n")
+assert _batch[0].startswith("… 20 log lines skipped here") and len(_batch) == 101, _batch[:2]
+_shown.clear()
+host.HostWindow._flush_log(_types.SimpleNamespace(_log_handler=_h, append_log=_shown.append))
+assert _shown == [], "nothing queued, nothing appended"
+assert host.GUI_LOG_MAX_LINES > 0
+ok("GUI log handler: bounded queue, batched appends, skipped lines counted")
+
 # ── 2. session/monitor detection on this machine ─────────────────────
 st = host._session_type()
 print(f"session_type = {st!r}  (XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE')!r})")

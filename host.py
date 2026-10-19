@@ -29,7 +29,7 @@ except Exception:              # pragma: no cover - the host runs without it
     hostlock = None
 
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton, QLabel, QHBoxLayout,
+    QApplication, QWidget, QVBoxLayout, QPlainTextEdit, QPushButton, QLabel, QHBoxLayout,
     QMessageBox
 )
 from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence
@@ -920,6 +920,59 @@ _PROGRESS_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # level+info (for silencedetect); they say nothing about the stream's health.
 _BENIGN_ENCODER_LINES = ("Guessed Channel Layout", "frame size not set")
 
+# ffmpeg repeats some warnings on every frame for as long as their cause lasts:
+# on 2026-10-19 the audio encoder's "Queue input is backward in time" ran at
+# ~17 lines a second for sixteen hours. Logged one by one, that rotated the
+# night's evidence out of host.log and buried the GUI log view (see
+# QtLogHandler). Each distinct message is now written once, then at most once
+# a window with a count of what was held back.
+ENCODER_REPEAT_WINDOW = 60.0
+_ENCODER_LINE_NOISE_RE = re.compile(r"0x[0-9a-fA-F]+|\d+(?:\.\d+)?")
+
+
+class _RepeatGate:
+    """Thins out repeated encoder lines; returns what is worth logging."""
+
+    def __init__(self, window=ENCODER_REPEAT_WINDOW, max_shapes=64):
+        self.window = window
+        self.max_shapes = max_shapes
+        self._shapes = {}       # shape -> [window start, lines held back]
+
+    @staticmethod
+    def shape(line: str) -> str:
+        """The message without its addresses and numbers: what makes it 'the same'."""
+        return _ENCODER_LINE_NOISE_RE.sub("#", line)
+
+    def admit(self, line: str, now=None) -> list:
+        now = time.time() if now is None else now
+        out = self.flush(now)
+        key = self.shape(line)
+        rec = self._shapes.get(key)
+        if rec is None:
+            if len(self._shapes) >= self.max_shapes:
+                self._shapes.pop(next(iter(self._shapes)))
+            self._shapes[key] = [now, 0]
+            out.append(line)
+        elif now - rec[0] < self.window:
+            rec[1] += 1
+        else:
+            # Its window ran out with nothing held back (flush() reports and
+            # restarts the ones that did): a fresh occurrence, log it.
+            rec[0] = now
+            out.append(line)
+        return out
+
+    def flush(self, now=None, final=False) -> list:
+        """Counts for every shape whose window has run out (all of them if final)."""
+        now = time.time() if now is None else now
+        out = []
+        for key, rec in self._shapes.items():
+            if rec[1] and (final or now - rec[0] >= self.window):
+                out.append(f"(repeated {rec[1]} more times in the last "
+                           f"{max(1, round(now - rec[0]))}s) {key}")
+                rec[0], rec[1] = now, 0
+        return out
+
 def _progress_sample(store: dict, now=None):
     """End of one -progress block: remember (time, frames, bytes) for rates."""
     frame, size = store.get("frame"), store.get("total_size")
@@ -1092,6 +1145,7 @@ class StreamThread(threading.Thread):
         alive and feeds the client's stats overlay with real encoder numbers.
         """
         store = host_state.encoder_stats.setdefault(self.name, {})
+        gate = _RepeatGate()
         try:
             for raw in iter(proc.stderr.readline, ""):
                 line = raw.strip()
@@ -1115,9 +1169,12 @@ class StreamThread(threading.Thread):
                 tail.append(line)
                 if len(tail) > 25:
                     del tail[0]
-                logging.warning("%s encoder: %s", self.name, line)
+                for text in gate.admit(line):
+                    logging.warning("%s encoder: %s", self.name, text)
         except Exception:
             pass
+        for text in gate.flush(final=True):
+            logging.warning("%s encoder: %s", self.name, text)
 
     def _wait_for_exit(self):
         """Block until the encoder exits; returns (returncode, stderr)."""
@@ -3927,7 +3984,6 @@ def core_main(args, use_signals=True) -> int:
     return 0
 
 class LogEmitter(QObject):
-    log = pyqtSignal(str)
     status = pyqtSignal(str)
     pin = pyqtSignal(str)
     pair_request = pyqtSignal(object)
@@ -4049,19 +4105,50 @@ def _setup_file_logging(debug: bool):
     except Exception as e:
         logging.warning("Could not open log file %s: %s", path, e)
         return None
+# The GUI log view is a window onto host.log, not a copy of it.
+GUI_LOG_MAX_LINES = 2000
+GUI_LOG_QUEUE_MAX = 500
+GUI_LOG_FLUSH_MS = 250
+
+
 class QtLogHandler(logging.Handler):
-    def __init__(self):
+    """Queues log lines for the GUI, which takes them in batches on a timer.
+
+    One queued signal per record, each appended to an unbounded QTextEdit and
+    scrolled to the end, is what took the host down on 2026-10-19: a log
+    flood grew the document to hundreds of thousands of lines, every append
+    re-laid it out on the GUI thread while holding the GIL, and the heartbeat,
+    handshake and control threads waited up to minutes behind it — clients
+    timed out on certificate auth and were asked for a PIN — until Qt
+    aborted inside the text layout. Now the queue is bounded (the oldest
+    lines give way, and the view says how many) and so is the view.
+    """
+
+    def __init__(self, maxlen=GUI_LOG_QUEUE_MAX):
         super().__init__()
+        self._queue = collections.deque()
+        self._maxlen = maxlen
+        self._skipped = 0
+        self._qlock = threading.Lock()
 
     def emit(self, record):
         try:
             msg = self.format(record)
         except Exception:
             msg = record.getMessage()
-        try:
-            log_emitter.log.emit(msg)
-        except Exception:
-            pass
+        with self._qlock:
+            if len(self._queue) >= self._maxlen:
+                self._queue.popleft()
+                self._skipped += 1
+            self._queue.append(msg)
+
+    def drain(self):
+        """(lines, how many were dropped before them) since the last drain."""
+        with self._qlock:
+            lines, skipped = list(self._queue), self._skipped
+            self._queue.clear()
+            self._skipped = 0
+        return lines, skipped
 
 def _apply_dark_palette(app: QApplication):
     app.setStyle("Fusion")
@@ -4109,8 +4196,9 @@ class HostWindow(QWidget):
         )
         log_emitter.pin.connect(self.pinLabel.setText)
 
-        self.logView = QTextEdit()
+        self.logView = QPlainTextEdit()
         self.logView.setReadOnly(True)
+        self.logView.setMaximumBlockCount(GUI_LOG_MAX_LINES)
         font = QFont("monospace"); font.setStyleHint(QFont.TypeWriter)
         self.logView.setFont(font)
 
@@ -4140,7 +4228,9 @@ class HostWindow(QWidget):
         logging.getLogger().addHandler(self._log_handler)
         logging.getLogger().setLevel(logging.getLogger().level)
 
-        log_emitter.log.connect(self.append_log)
+        self._log_timer = QTimer(self)
+        self._log_timer.timeout.connect(self._flush_log)
+        self._log_timer.start(GUI_LOG_FLUSH_MS)
         log_emitter.status.connect(self.set_status_text)
         log_emitter.pair_request.connect(self._on_pair_request)
         host_state.gui_window = self
@@ -4193,8 +4283,17 @@ class HostWindow(QWidget):
         trigger_shutdown("User pressed Stop")
 
     def append_log(self, text: str):
-        self.logView.append(text)
-        self.logView.moveCursor(self.logView.textCursor().End)
+        # QPlainTextEdit follows the end by itself while the view is scrolled
+        # to the bottom, and leaves it alone while someone reads further up.
+        self.logView.appendPlainText(text)
+
+    def _flush_log(self):
+        lines, skipped = self._log_handler.drain()
+        if skipped:
+            lines.insert(0, f"… {skipped} log lines skipped here (all of them are in "
+                            f"{getattr(host_state, 'log_path', None) or 'host.log'})")
+        if lines:
+            self.append_log("\n".join(lines))
 
     def set_status_text(self, text: str):
         self.statusLabel.setText(text)
