@@ -42,6 +42,10 @@ DEFAULT_RESOLUTION = "1920x1080"
 # Mirrors host.PAIR_APPROVAL_TIMEOUT: the host may ask its own user to approve
 # a first-time pairing, so the PIN handshake must wait longer than 8s.
 PAIR_APPROVAL_TIMEOUT = 45.0
+# A host that took the connection but did not answer the certificate within
+# CERT_TIMEOUT gets one more, longer try before the client gives up on it.
+CERT_TIMEOUT = 8.0
+CERT_RETRY_TIMEOUT = 30.0
 
 IS_WINDOWS = py_platform.system() == "Windows"
 IS_LINUX   = py_platform.system() == "Linux"
@@ -441,20 +445,24 @@ def _recv_handshake_reply(sock, want_tokens=0, idle=0.4, max_bytes=65536):
         buf += chunk
     return buf.decode("utf-8", errors="replace").strip()
 
-def _try_cert_handshake(host_ip, cert_path, key_path):
+def _try_cert_handshake(host_ip, cert_path, key_path, timeout=None):
     """Authenticate with the stored certificate on a connection of its own.
 
-    Returns (ok, info, rejected): `rejected` means the host turned down the
-    credential itself (rather than the network failing), so pairing should ask
-    for a replacement. The socket is always closed — a host that rejects a proof
-    closes its end, and the PIN handshake that follows needs a live connection.
+    Returns (ok, info, status). `status` is "" on success or a network error,
+    "rejected" when the host turned down the credential itself (pairing should
+    ask for a replacement), "busy" when it is in a session it will not give
+    up, and "noreply" when it took the connection but said nothing in
+    `timeout` seconds. The socket is always closed — a host that rejects a
+    proof closes its end, and the PIN handshake that follows needs a live
+    connection.
     """
+    timeout = CERT_TIMEOUT if timeout is None else timeout
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(8)
+    sock.settimeout(timeout)
     try:
         fp_hex = _read_pem_cert_fingerprint(cert_path)
         if not fp_hex:
-            return (False, None, False)
+            return (False, None, "")
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
         sock.sendall(f'HELLO CERTFP:{fp_hex}\n'.encode('utf-8'))
         resp = _recv_handshake_reply(sock, want_tokens=2)
@@ -463,7 +471,7 @@ def _try_cert_handshake(host_ip, cert_path, key_path):
             proof = _build_client_proof(cert_path, key_path, nonce_hex)
             if proof is None:
                 logging.warning('Stored certificate found but signing failed — falling back to PIN.')
-                return (False, None, False)
+                return (False, None, "")
             sock.sendall((proof + "\n").encode('utf-8'))
             resp = _recv_handshake_reply(sock)
         logging.debug('Cert handshake response: %s', resp.splitlines()[0] if resp else '(empty)')
@@ -474,15 +482,21 @@ def _try_cert_handshake(host_ip, cert_path, key_path):
             CLIENT_STATE['connected'] = True
             CLIENT_STATE['last_heartbeat'] = time.time()
             logging.info('Authenticated via client certificate (FP %s…) — PIN skipped', fp_hex[:12])
-            return (True, info, False)
+            return (True, info, "")
         if resp.startswith('FAIL:UNTRUSTEDCERT'):
             logging.warning('Host does not accept this certificate — falling back to PIN.')
-            return (False, None, True)
+            return (False, None, "rejected")
+        if resp.startswith('BUSY'):
+            logging.warning('Host is busy with a session (%s).', resp)
+            return (False, None, "busy")
+        if not resp:
+            logging.warning('Host took the connection but did not answer within %ss.', timeout)
+            return (False, None, "noreply")
         logging.warning('Unexpected response to certificate auth (%s) — falling back to PIN', resp)
-        return (False, None, False)
+        return (False, None, "")
     except Exception as e:
         logging.debug('Certificate auth failed: %s — falling back to PIN', e)
-        return (False, None, False)
+        return (False, None, "")
     finally:
         try:
             sock.close()
@@ -523,10 +537,30 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
             logging.warning('%s — asking the host for a new one during pairing.', problem)
             need_fresh_credentials = True
         else:
-            ok, info, rejected = _try_cert_handshake(host_ip, cert_path, key_path)
+            ok, info, status = _try_cert_handshake(host_ip, cert_path, key_path)
+            if status == "noreply":
+                logging.info('Retrying the certificate once with a %ss wait.', CERT_RETRY_TIMEOUT)
+                ok, info, status = _try_cert_handshake(host_ip, cert_path, key_path,
+                                                       timeout=CERT_RETRY_TIMEOUT)
             if ok:
                 return (True, info)
-            need_fresh_credentials = rejected
+            # A PIN cannot help with either of these, and asking for one sent
+            # the user to the host's screen for a code it had no use for
+            # (2026-10-19: a stalled host answered the challenge 30 s late).
+            if status in ("busy", "noreply"):
+                title, text = {
+                    "busy": ("Host Busy",
+                             "The host is in a session with another device (or still closing "
+                             "a previous one). Try again in a few seconds."),
+                    "noreply": ("Host Not Responding",
+                                "The host accepted the connection but did not answer. "
+                                "It may be overloaded or stuck — check it and try again."),
+                }[status]
+                logging.error("%s: %s", title, text)
+                if interactive:
+                    QMessageBox.critical(None, title, text)
+                return (False, None)
+            need_fresh_credentials = (status == "rejected")
             logging.info('Continuing with the PIN handshake on a fresh connection.')
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

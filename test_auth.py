@@ -340,6 +340,79 @@ with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
     ok("handshake carries the stream size separately from the desktop geometry")
     host.host_state.stream_size = None
 
+    # ── the device holding a session may replace it ──
+    # 2026-10-19: the host still held a session for a client that had given up
+    # on it, and every reconnect from that same device got BUSY for hours.
+    good_fp = client._read_pem_cert_fingerprint(good_cert).upper()
+    reset_host()
+    install(good_cert, good_key)
+    ok1, _info, st1 = client._try_cert_handshake("127.0.0.1", good_cert, good_key)
+    assert ok1 and st1 == "", st1
+    first_token = host.host_state.session_token
+    assert host.host_state.session_cert_fp == good_fp
+    ok2, _info, st2 = client._try_cert_handshake("127.0.0.1", good_cert, good_key)
+    assert ok2 and st2 == "", st2
+    assert host.host_state.session_active and host.host_state.session_token != first_token
+    ok("the device holding a session replaces it with a fresh certificate proof")
+
+    # Another certificate gets BUSY — and a BUSY host is not a reason to ask
+    # for a PIN, which could not end that session anyway.
+    ok3, _info, st3 = client._try_cert_handshake("127.0.0.1", other_cert, other_key)
+    assert not ok3 and st3 == "busy", st3
+    assert host.host_state.session_cert_fp == good_fp, "the live session is untouched"
+    install(other_cert, other_key)
+    seen_conns = []
+    real_handler = host._handle_handshake_conn
+    host._handle_handshake_conn = lambda *a: (seen_conns.append(a[1]), real_handler(*a))
+    try:
+        conn_ok, info = client.tcp_handshake_client("127.0.0.1", pin="123456", interactive=False)
+    finally:
+        host._handle_handshake_conn = real_handler
+    assert not conn_ok and len(seen_conns) == 1, seen_conns
+    ok("another device's certificate still gets BUSY, and no PIN attempt follows")
+
+    # A PIN session (how a device holds its first one) is replaced the same way.
+    reset_host(pin="246802")
+    install(None, None)
+    conn_ok, info = client.tcp_handshake_client("127.0.0.1", pin="246802", interactive=False)
+    assert conn_ok and host.host_state.session_cert_fp is None
+    paired_cert = os.path.join(tmp, "client_cert.pem")
+    paired_key = os.path.join(tmp, "client_key.pem")
+    ok4, _info, st4 = client._try_cert_handshake("127.0.0.1", paired_cert, paired_key)
+    assert ok4 and st4 == "", st4
+    assert host.host_state.session_cert_fp == client._read_pem_cert_fingerprint(paired_cert).upper()
+    ok("a fresh pairing's PIN session is replaced by its own certificate")
+    reset_host()
+
+    # A host that takes the connection and then says nothing is retried once,
+    # then reported — not turned into a PIN prompt.
+    silent = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(8)
+    saved = (client.TCP_HANDSHAKE_PORT, client.CERT_TIMEOUT, client.CERT_RETRY_TIMEOUT)
+    client.TCP_HANDSHAKE_PORT = silent.getsockname()[1]
+    client.CERT_TIMEOUT = client.CERT_RETRY_TIMEOUT = 0.5
+    try:
+        ok5, _info, st5 = client._try_cert_handshake("127.0.0.1", good_cert, good_key)
+        assert not ok5 and st5 == "noreply", st5
+        install(good_cert, good_key)
+        conn_ok, info = client.tcp_handshake_client("127.0.0.1", pin="123456", interactive=False)
+        assert not conn_ok
+        silent.settimeout(0.3)
+        accepted = 0
+        while True:
+            try:
+                c, _a = silent.accept()
+            except socket.timeout:
+                break
+            accepted += 1
+            c.close()
+        assert accepted == 3, f"probe + cert try + one retry, no PIN connection ({accepted})"
+    finally:
+        client.TCP_HANDSHAKE_PORT, client.CERT_TIMEOUT, client.CERT_RETRY_TIMEOUT = saved
+        silent.close()
+    ok("a silent host gets one longer retry, then an error instead of a PIN prompt")
+
     srv.close()
 
 print(f"\nALL {len(PASS)} AUTH TESTS PASSED")

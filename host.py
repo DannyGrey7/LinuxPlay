@@ -486,6 +486,7 @@ class HostState:
         self.starting_streams = False
         self.gamepad_thread = None
         self.session_token = None
+        self.session_cert_fp = None    # certificate the live session proved, if any
         self.pin_failures = {}     # peer ip -> [fail_count, locked_until_ts]
         self.pin_fail_lock = threading.Lock()
         self.instance_lock_fd = None   # held for the process lifetime (hostlock)
@@ -700,6 +701,7 @@ def end_session(reason: str) -> bool:
         host_state.client_ip = None
         host_state.authed_client_ip = None
         host_state.session_token = None
+        host_state.session_cert_fp = None
         host_state.starting_streams = False
         host_state.session_epoch += 1
     logging.info("Session with %s ended (%s).", peer, reason)
@@ -2761,14 +2763,16 @@ def _stream_payload():
     size = getattr(host_state, "stream_size", None)
     return f"{size[0]}x{size[1]}" if size else ""
 
-def _begin_session_locked(peer_ip, encoder_str):
+def _begin_session_locked(peer_ip, encoder_str, cert_fp=None):
     """Mark the session active and mint a fresh session token.
 
     Caller must hold host_state.pin_lock. Returns the response text to send.
+    `cert_fp` is the certificate the client proved (None for a PIN session).
     """
     token = secrets.token_hex(16)
     host_state.session_active = True
     host_state.authed_client_ip = peer_ip
+    host_state.session_cert_fp = cert_fp
     host_state.pin_expiry = 0
     host_state.last_pong_ts = time.time()
     host_state.session_token = token
@@ -2784,8 +2788,20 @@ def _begin_session_locked(peer_ip, encoder_str):
     stream_line = f"\nSTREAM {stream}" if stream else ""
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
 
+def _session_is_this_device(peer_ip, fp_hex) -> bool:
+    """Does the live session belong to the device now presenting `fp_hex`?
+
+    Same address, and the same certificate — or a PIN session from that
+    address, which is how a device that just paired holds its first session.
+    """
+    if not host_state.session_active or peer_ip != host_state.authed_client_ip:
+        return False
+    owner = host_state.session_cert_fp
+    return owner is None or owner == fp_hex
+
+
 def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
-    if host_state.session_active:
+    if host_state.session_active and not _session_is_this_device(peer_ip, fp_hex):
         logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session already running.")
         _send_and_close(conn, b"BUSY:ACTIVESESSION")
         return
@@ -2813,11 +2829,20 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
     else:
         ok, reason = False, f"proof line truncated or malformed ({len(parts)} fields)"
     if ok:
+        # The device that owns the live session has just proved it is back, so
+        # that session is stale: a client that died or lost its network without
+        # a GOODBYE, or one that gave up on heartbeats this host was too slow
+        # to send. Answering BUSY until the heartbeat timeout locked it out —
+        # on 2026-10-19 for five hours of retries, all refused.
+        if _session_is_this_device(peer_ip, fp_hex):
+            logging.info("[AUTH] %s proved its certificate again — replacing its "
+                         "previous session.", peer_ip)
+            end_session("replaced by a new connection from the same device")
         with host_state.pin_lock:
             if host_state.session_active:
                 _send_and_close(conn, b"BUSY:ACTIVESESSION")
                 return
-            reply = _begin_session_locked(peer_ip, encoder_str)
+            reply = _begin_session_locked(peer_ip, encoder_str, cert_fp=fp_hex)
         _send_and_close(conn, reply.encode("utf-8"))
         set_status(f"Client (cert): {host_state.client_ip}")
         set_pin_display(f"Session live: {peer_ip} — PIN paused")
