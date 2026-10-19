@@ -30,6 +30,17 @@ row, with tests. Measured effects are in [measurements](2026-10-measurements.md)
 | 13b | A stopped encoder's open silence isn't reported as sound returning; encoder numbers reset per session | live run C | XS / none | `e5f7f75`, `cb5cbde` |
 | 13c | README describes the new audio, overlay and tests | — | XS / none | `f18e360` |
 
+## Done: the 2026-10-19 stale-session incident
+
+See [the incident report](2026-10-19-stale-session.md).
+
+| # | change | cause | effort / risk | commits |
+|---|--------|-------|---------------|---------|
+| 20 | Bounded, batched GUI log view; encoder stderr repeat gate | log flood starved every host thread, then a Qt abort | S / low | `c3a2300` |
+| 21 | The device that owns the live session can replace it; no PIN prompt for `BUSY` or a silent host | five hours of `BUSY` to its own reconnects; a PIN asked for that could not help | S / low | `0e9cc67` |
+| 22 | Client and launch logs keep three previous runs | the relaunch erased the night's client log | XS / none | `84f62ec` |
+| 23 | Upload test waits for its listener | 1-in-12 flaky `test_hardening` | XS / none | `76432b8` |
+
 ## Next (P3): recommended, not done
 
 | # | change | why | effort / risk |
@@ -41,6 +52,8 @@ row, with tests. Measured effects are in [measurements](2026-10-measurements.md)
 | 18 | When VideoToolbox rejects a keyframe, decode that GOP in software and return to hardware at the next keyframe, instead of reopening and waiting | VideoToolbox intermittently rejects *valid* `hevc_vaapi` keyframes (4 in 40 min in run C). The CPU decoder takes them. Today each costs a freeze to the next keyframe. | M / medium |
 | 19 | Flag whole-frame losses the demuxer can't see: compare the gap between consecutive frames' PTS with the host's frame cadence, or have the host number frames | With PES lengths, a lost small frame is only noticed when the next one is refused. Same freeze, but one frame of decoder chatter. | S / low |
 | 17 | Remove the decoder settings PyAV 18 silently ignores (`low_delay`, `strict_std_compliance`, `flags2="+fast"`) | Code says something it doesn't do (N6) | XS / low |
+| 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
+| 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
 
 ## Deliberately skipped, and why
 
