@@ -52,8 +52,80 @@ See [the incident report](2026-10-19-stale-session.md).
 | 18 | When VideoToolbox rejects a keyframe, decode that GOP in software and return to hardware at the next keyframe, instead of reopening and waiting | VideoToolbox intermittently rejects *valid* `hevc_vaapi` keyframes (4 in 40 min in run C). The CPU decoder takes them. Today each costs a freeze to the next keyframe. | M / medium |
 | 19 | Flag whole-frame losses the demuxer can't see: compare the gap between consecutive frames' PTS with the host's frame cadence, or have the host number frames | With PES lengths, a lost small frame is only noticed when the next one is refused. Same freeze, but one frame of decoder chatter. | S / low |
 | 17 | Remove the decoder settings PyAV 18 silently ignores (`low_delay`, `strict_std_compliance`, `flags2="+fast"`) | Code says something it doesn't do (N6) | XS / low |
-| 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
+| 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fix committed, not deployed:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
 | 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
+
+### Item 24: audio timestamps
+
+Measured on doggoos on 2026-10-19 with no session running. These were
+standalone runs of the host's audio command into files. Scripts and output
+are in `~/linuxplay-audit/lab/item24/` on the box.
+
+**Cause.** The PulseAudio capture hands ffmpeg audio in 50 ms reads, and
+`-use_wallclock_as_timestamps 1` stamps each read when it returns. On a calm
+machine the stamps jitter by about 2 ms: a quarter of the reads are stamped
+up to 2.1 ms before the previous read's audio ends. libopus only complains
+when a frame's timestamp fails to increase, so calm runs log nothing. The
+current command was silent in three calm 60 s runs: the HDMI monitor with
+both Opus settings, and the WiVRn monitor. When ffmpeg falls behind, though,
+the reads that catch up get near-equal stamps and time goes backwards. In
+these runs ffmpeg was paused with SIGSTOP for 60–250 ms every 0.4–1 s, as a
+busy host would pause it:
+
+| 120 s, 140 pauses, exact host command (`audio`, 20 ms frames) | `backward in time` | `Non-monotonic DTS` | packets out | timestamp steps |
+|---|---|---|---|---|
+| before (`b5af77c`) | 424 | 762 | 6046 | 803 bumped to +1 tick by the muxer, jumps up to 263 ms |
+| after (`asetpts=N/SR/TB`) | **0** | **0** | 6046 | all exactly 20 ms |
+
+The other candidates, all run together with the same pauses (90 s, 24
+pauses of 0.3–1.5 s):
+
+| variant | warnings | note |
+|---|---|---|
+| current | 414 + 868 | jumps up to 1.49 s |
+| no `-use_wallclock_as_timestamps` (the pulse demuxer's own smoothed clock) | 0 | steps within 0.6 ms of 20 ms. It relies on PulseAudio's latency reports and ffmpeg's time filter, so it isn't monotonic by construction. |
+| `aresample=async=1:first_pts=0` | 0 | Pads the audio to follow the stamps: +60 ms here, +100 ms in a 60 s run with short pauses. That is added latency and inserted sound. The client already dropped `async` because it added 6 s of playout delay. |
+| `asetpts=N/SR/TB` | 0 | renumbers frames by sample count; no buffering, same samples |
+
+**Choice: `asetpts=N/SR/TB`**, first in the encoder's filter chain.
+Timestamps now follow the sound card's sample clock, not the wall clock.
+Nothing lines them up with video: audio and video are separate ffmpeg
+processes on separate ports, and the client's ffplay plays audio on its own
+clock. The input flags shared with video are unchanged. `silencedetect`
+still reports; its times now start at 0 and count samples. `test_host.py`
+pins the chain.
+
+**Why the 2026-10-19 flood held steady (inferred).** A slow stderr reader
+alone causes no warnings, because ffmpeg 7+ writes progress from its main
+thread while capture and encoding run on threads of their own. A 90 s run
+with stderr drained at 300 B/s through a 4 KB pipe logged 0. A warning,
+though, is written by the encoding thread itself. If the host is slow to
+read, that thread waits on the pipe, the capture falls behind meanwhile, and
+the catch-up reads produce more warnings. On 10-19 there were 4 warnings in
+the hour before 01:05. The encoder's restart on the HDMI monitor at 01:05:39
+gave 337 in its first 20 s and then a flat 988–995 a minute for 70 minutes
+(01:06–02:15). A rate that flat is set by the reader, not by the capture.
+It collapsed at 02:16, when the client's reconnects began.
+
+**Link to the silent-audio reports (inferred).** That session's
+`Audio report` says 238.1 MB in 8h13m, i.e. 8.0 KB/s. A silent stream with
+the same settings sends 13.2 KB/s (measured here, and in today's 18:13
+sessions), and sound only adds to that. So at most about 60% of the
+session's audio left the encoder. Hours of it were held up, which the client
+hears as gaps or silence while video plays on. The client log for that night
+is gone, so this stays a candidate. With the fix, a late read logs nothing,
+so there's nothing to start the loop, and the repeat gate and bounded log
+view (`c3a2300`) keep the reader fast anyway.
+
+**Seen, not changed.** The server picks the 50 ms read size, so audio leaves
+the host in 50 ms lumps, the first of them up to 50 ms late. `-fragment_size`
+on the pulse input could take back most of that, but it needs its own
+latency A/B.
+
+**Still to do:** deploy (restart the host while it's idle), then Danny's
+listening test. Check lip-sync on a talking-head video or a hand clap, play
+a few minutes of a game, then run a long session. The host log should show
+no `backward in time` or `Non-monotonic DTS` lines.
 
 ## Deliberately skipped, and why
 

@@ -566,9 +566,15 @@ with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["f
         host.end_session("cleanup")
     assert cmd[cmd.index("-i") + 1] == "alsa_output.hdmi.monitor"
     assert cmd[cmd.index("-loglevel") + 1] == "level+info"
-    assert any(a.startswith("silencedetect=") for a in cmd)
     assert host.host_state.audio_source == "alsa_output.hdmi.monitor"
-    ok("audio command: picked source, silencedetect, level-tagged log")
+    # Fix-plan 24: frames are numbered by sample count before anything else
+    # sees them; wall-clock read stamps ran backwards whenever a capture read
+    # fell behind. Nothing in the chain may buffer or pad the audio.
+    chain = cmd[cmd.index("-af") + 1].split(",")
+    assert chain == ["asetpts=N/SR/TB", f"silencedetect=noise={host.AUDIO_SILENCE_DB}dB:"
+                                        f"duration={host.AUDIO_SILENCE_SECS}"], chain
+    assert cmd.index("-af") < cmd.index("-c:a"), "the filters feed the encoder"
+    ok("audio command: picked source, sample-count timestamps, silencedetect, level-tagged log")
 
 _st = host.StreamThread(None, "Audio", cmd_factory=lambda: ["ffmpeg", "-i", "x"])
 _st._refresh_cmd()

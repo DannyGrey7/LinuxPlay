@@ -2348,8 +2348,17 @@ def build_audio_cmd():
 
     output_side = _output_sync_flags()
 
+    # Timestamps from the sample count, not the wall clock. The input's
+    # wall-clock stamp is taken when each 50 ms capture read returns, so reads
+    # that fall behind and then catch up get near-equal stamps and time runs
+    # backwards ("Queue input is backward in time", "Non-monotonic DTS"; ~17
+    # a second for hours on 2026-10-19). asetpts only renumbers frames: no
+    # buffering, no samples added or dropped, unlike aresample=async, which
+    # pads the audio to follow the stamps. Nothing lines these timestamps up
+    # with video's: the client's ffplay plays audio on its own clock.
     encode = [
-        "-af", f"silencedetect=noise={AUDIO_SILENCE_DB}dB:duration={AUDIO_SILENCE_SECS}",
+        "-af", f"asetpts=N/SR/TB,"
+               f"silencedetect=noise={AUDIO_SILENCE_DB}dB:duration={AUDIO_SILENCE_SECS}",
         "-c:a", "libopus",
         "-b:a", "384k" if channels > 2 else "128k",
         "-application", opus_app,
