@@ -286,9 +286,19 @@ def _live_upload_checks():
     assert host.host_state.file_upload_sock is not None, "upload listener did not bind 7003"
 
     def _send_upload(payload_name, payload, token="tok-e2e", send_auth=True):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect(("127.0.0.1", host.FILE_UPLOAD_PORT))
+        # The listener publishes its socket before bind()/listen(), so the
+        # first connect can still be refused (about 1 run in 12 on a Mac).
+        for attempt in range(40):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            try:
+                s.connect(("127.0.0.1", host.FILE_UPLOAD_PORT))
+                break
+            except ConnectionRefusedError:
+                s.close()
+                if attempt == 39:
+                    raise
+                time.sleep(0.05)
         if send_auth:
             s.sendall(f"AUTH {token}\n".encode("utf-8") if token else b"\n")
         name = payload_name.encode("utf-8")
