@@ -574,7 +574,26 @@ with patched(host, StreamThread=_FakeStream, build_video_cmd=lambda *a, **k: ["f
     assert chain == ["asetpts=N/SR/TB", f"silencedetect=noise={host.AUDIO_SILENCE_DB}dB:"
                                         f"duration={host.AUDIO_SILENCE_SECS}"], chain
     assert cmd.index("-af") < cmd.index("-c:a"), "the filters feed the encoder"
-    ok("audio command: picked source, sample-count timestamps, silencedetect, level-tagged log")
+    # Fix-plan 26: the capture reads one Opus frame at a time (s16le stereo
+    # 48 kHz = 192 bytes a millisecond), not ffmpeg's default 50 ms.
+    _fd = os.environ.pop("LP_OPUS_FD", None)
+    try:
+        for fd, frag in ((None, "1920"), ("20", "3840")):
+            if fd:
+                os.environ["LP_OPUS_FD"] = fd
+            with patched(host, _udp_ts_pkt_size=lambda ip: 1128, _path_mtu=lambda ip: 1280):
+                host._begin_session_locked("127.0.0.1", "h.265")
+                cmd = host.build_audio_cmd()
+                host.end_session("cleanup")
+            assert cmd[cmd.index("-fragment_size") + 1] == frag, (fd, cmd)
+            assert cmd.index("-fragment_size") < cmd.index("-f") < cmd.index("-i"), "an input option"
+            assert cmd[cmd.index("-frame_duration") + 1] == (fd or "10")
+    finally:
+        os.environ.pop("LP_OPUS_FD", None)
+        if _fd is not None:
+            os.environ["LP_OPUS_FD"] = _fd
+    ok("audio command: picked source, sample-count timestamps, frame-sized capture reads, "
+       "silencedetect, level-tagged log")
 
 _st = host.StreamThread(None, "Audio", cmd_factory=lambda: ["ffmpeg", "-i", "x"])
 _st._refresh_cmd()

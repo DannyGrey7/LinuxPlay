@@ -2338,9 +2338,18 @@ def build_audio_cmd():
     # with a level tag and have the stderr reader drop the rest of it.
     base = _ffmpeg_base_cmd()
     base[base.index("-loglevel") + 1] = "level+info"
+    # One capture read per Opus frame. Left alone, ffmpeg's pulse input reads
+    # 50 ms at a time, so 20 ms frames left in lumps of two or three, each up
+    # to 41 ms late. The input is the demuxer's default s16le stereo 48 kHz,
+    # 192 bytes a millisecond; pipewire-pulse won't go below 5.3 ms.
+    try:
+        fragment = ["-fragment_size", str(round(192 * float(opus_fd)))]
+    except ValueError:
+        fragment = []
     input_side = [
         *base,
         *(_input_ll_flags()),
+        *fragment,
         "-f", "pulse",
         "-i", mon,
         "-ac", str(channels),
