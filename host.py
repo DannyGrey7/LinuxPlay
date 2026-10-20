@@ -22,6 +22,7 @@ import base64
 import hmac
 
 from shutil import which
+from seqrelay import RTP_HEADER
 
 try:
     import hostlock
@@ -36,6 +37,9 @@ from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 
 UDP_VIDEO_PORT = 5000
+# With RTP video (fix-plan 27) ffmpeg sends to 127.0.0.1 here (+ monitor
+# index) and seqrelay numbers each datagram on its way to UDP_VIDEO_PORT.
+VIDEO_RELAY_PORT = 25000
 UDP_CONTROL_PORT = 7000
 TCP_HANDSHAKE_PORT = 7001
 UDP_CLIPBOARD_PORT = 7002
@@ -505,6 +509,7 @@ class HostState:
         self.audio_watch_ts = 0.0
         self.audio_stats = _new_audio_stats()
         self.stream_restarts = {}  # stream name -> encoder restarts this session
+        self.video_transport = "udp"   # "rtp": numbered datagrams the client reorders
 
 host_state = HostState()
 HOST_ARGS = None
@@ -1046,11 +1051,15 @@ class StreamThread(threading.Thread):
     lets the session manager retry the stream later.
     """
 
-    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.name = name
         self.feeder_cmd = feeder_cmd
+        # seqrelay between the encoder and the client (RTP video): started
+        # first, and its death restarts the stream like the encoder's would.
+        self.relay_cmd = relay_cmd
+        self.relay = None
         # Called before every (re)start when given: a restart must capture
         # what is current (the default sink may have moved), not replay a
         # command built for a device that has since gone quiet or vanished.
@@ -1060,8 +1069,8 @@ class StreamThread(threading.Thread):
         self._running = True
 
     def _kill_children(self):
-        """Terminate and reap the encoder and its feeder, if they are alive."""
-        for proc in (self.process, self.feeder):
+        """Terminate and reap the encoder, its feeder and relay, if they are alive."""
+        for proc in (self.process, self.feeder, self.relay):
             if proc is None:
                 continue
             try:
@@ -1086,6 +1095,21 @@ class StreamThread(threading.Thread):
         self._kill_children()
         self.process = None
         self.feeder = None
+        self.relay = None
+
+        if self.relay_cmd:
+            try:
+                self.relay = subprocess.Popen(
+                    self.relay_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                )
+            except Exception as e:
+                logging.error("%s relay failed to start: %s", self.name, e)
+                self.relay = None
+                return False
 
         if self.feeder_cmd:
             try:
@@ -1111,6 +1135,7 @@ class StreamThread(threading.Thread):
             self._kill_children()
             self.process = None
             self.feeder = None
+            self.relay = None
             return False
 
         if not self._running or host_state.should_terminate:
@@ -1121,6 +1146,7 @@ class StreamThread(threading.Thread):
             self._kill_children()
             self.process = None
             self.feeder = None
+            self.relay = None
             return False
 
         try:
@@ -1202,6 +1228,15 @@ class StreamThread(threading.Thread):
                     except Exception:
                         pass
                 return ret, err
+            # Without its relay the encoder streams into a closed loopback
+            # port: the client sees nothing, so restart the pair.
+            rret = self.relay.poll() if self.relay else None
+            if rret is not None:
+                try:
+                    _, rerr = self.relay.communicate(timeout=0.5)
+                except Exception:
+                    rerr = ""
+                return rret, "relay: " + (rerr or "(no output)")
             time.sleep(0.2)
         return None, ""
 
@@ -1210,6 +1245,7 @@ class StreamThread(threading.Thread):
         self._kill_children()
         self.process = None
         self.feeder = None
+        self.relay = None
         with host_state.video_thread_lock:
             for idx, t in list(host_state.video_threads.items()):
                 if t is self:
@@ -1237,6 +1273,9 @@ class StreamThread(threading.Thread):
         logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
         if self.feeder_cmd:
             logging.info("Starting %s feeder: %s", self.name, " ".join(self.feeder_cmd))
+        if self.relay_cmd:
+            logging.info("Starting %s relay (RTP sequence numbers): %s", self.name,
+                         " ".join(self.relay_cmd))
 
         failures = 0
         while self._running and not host_state.should_terminate:
@@ -1283,14 +1322,16 @@ class StreamThread(threading.Thread):
                     self.process.kill()
         except Exception:
             pass
-        if self.feeder:
+        for side in (self.feeder, self.relay):
+            if not side:
+                continue
             try:
-                if self.feeder.poll() is None:
-                    self.feeder.terminate()
+                if side.poll() is None:
+                    side.terminate()
                     try:
-                        self.feeder.wait(timeout=1.5)
+                        side.wait(timeout=1.5)
                     except subprocess.TimeoutExpired:
-                        self.feeder.kill()
+                        side.kill()
             except Exception:
                 pass
 
@@ -1454,6 +1495,45 @@ def _mpegts_ll_mux_flags():
     return ["-flush_packets","1","-max_interleave_delta","0","-muxdelay","0","-muxpreload","0",
             "-mpegts_flags","resend_headers","-omit_video_pes_length","0"]
 
+def _client_caps(raw):
+    """What a client lists after its HELLO argument: 'HELLO <pin|CERTFP:..> RTP'.
+
+    Older hosts read only the first argument, so a capability costs nothing
+    to offer.
+    """
+    lines = (raw or "").splitlines()
+    first = lines[0].split() if lines else []
+    return frozenset(t.upper() for t in first[2:] if t.isalnum())
+
+def _video_transport_for(caps):
+    """'rtp' when the client can put late datagrams back in order (fix-plan 27).
+
+    LINUXPLAY_VIDEO_TRANSPORT=udp keeps plain MPEG-TS for an A/B or a
+    misbehaving relay.
+    """
+    if os.environ.get("LINUXPLAY_VIDEO_TRANSPORT", "").strip().lower() == "udp":
+        return "udp"
+    return "rtp" if "RTP" in caps else "udp"
+
+def _video_dest(ip, video_port):
+    """Where ffmpeg sends video: the client, or the local seqrelay that numbers it."""
+    if host_state.video_transport == "rtp":
+        return "127.0.0.1", VIDEO_RELAY_PORT + (video_port - UDP_VIDEO_PORT)
+    return ip, video_port
+
+def _video_pkt_size(ip):
+    """TS bytes per video datagram, leaving room for seqrelay's RTP header."""
+    return _udp_ts_pkt_size(ip, reserve=RTP_HEADER if host_state.video_transport == "rtp" else 0)
+
+def _video_relay_cmd(video_port):
+    """The seqrelay process in front of a video stream, or None for plain MPEG-TS."""
+    if host_state.video_transport != "rtp":
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [sys.executable, os.path.join(here, "seqrelay.py"), "send",
+            str(VIDEO_RELAY_PORT + (video_port - UDP_VIDEO_PORT)),
+            str(host_state.client_ip), str(video_port)]
+
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     if mtu_guess <= 0:
         mtu_guess = 1500
@@ -1479,10 +1559,13 @@ def _route_mtu(ip: str) -> int:
     except Exception:
         return 0
 
-def _udp_ts_pkt_size(ip: str) -> int:
-    """MPEG-TS UDP payload size that fits inside the path MTU to ip (never IP-fragmented)."""
+def _udp_ts_pkt_size(ip: str, reserve: int = 0) -> int:
+    """MPEG-TS UDP payload size that fits inside the path MTU to ip (never IP-fragmented).
+
+    reserve: bytes a relay adds in front of each datagram (the RTP header).
+    """
     mtu_guess = _path_mtu(ip)
-    pkt = _best_ts_pkt_size(mtu_guess, ":" in str(ip))
+    pkt = _best_ts_pkt_size(mtu_guess - reserve, ":" in str(ip))
     if mtu_guess < 1500:
         logging.info("Path MTU to %s is %d → TS pkt_size %d (avoids IP fragmentation).",
                      ip, mtu_guess, pkt)
@@ -2011,19 +2094,20 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
         else:
             extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
         output_side = _output_sync_flags()
-        pkt_size = _udp_ts_pkt_size(ip)
+        pkt_size = _video_pkt_size(ip)
         path_mtu = _path_mtu(ip)
         if path_mtu < 1500 and getattr(host_state, "net_mode", "lan") == "lan":
             logging.info("Tunneled path detected (path MTU %d, pkt_size %d) — "
                          "using larger UDP buffers.", path_mtu, pkt_size)
         fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
+        dest_ip, dest_port = _video_dest(ip, video_port)
         out = [
             *(_mpegts_ll_mux_flags()),
             "-flags", "+low_delay",
             "-f", "mpegts",
             *_marker_opt(),
             (
-                f"udp://{ip}:{video_port}"
+                f"udp://{dest_ip}:{dest_port}"
                 f"?pkt_size={pkt_size}"
                 f"&buffer_size={buffer_size}"
                 f"&fifo_size={fifo_size}"
@@ -2114,12 +2198,13 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
             extra_filters = _prepend_filter(extra_filters, f"scale={cap_w}:{cap_h}")
 
     output_side = _output_sync_flags()
-    pkt_size = _udp_ts_pkt_size(ip)
+    pkt_size = _video_pkt_size(ip)
     path_mtu = _path_mtu(ip)
     if path_mtu < 1500 and getattr(host_state, "net_mode", "lan") == "lan":
         logging.info("Tunneled path detected (path MTU %d, pkt_size %d) — "
                      "using larger UDP buffers.", path_mtu, pkt_size)
     fifo_size, buffer_size = _udp_buffer_sizes(pkt_size)
+    dest_ip, dest_port = _video_dest(ip, video_port)
 
     out = [
         *(_mpegts_ll_mux_flags()),
@@ -2127,7 +2212,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
         "-f", "mpegts",
         *_marker_opt(),
         (
-            f"udp://{ip}:{video_port}"
+            f"udp://{dest_ip}:{dest_port}"
             f"?pkt_size={pkt_size}"
             f"&buffer_size={buffer_size}"
             f"&fifo_size={fifo_size}"
@@ -2781,12 +2866,14 @@ def _stream_payload():
     size = getattr(host_state, "stream_size", None)
     return f"{size[0]}x{size[1]}" if size else ""
 
-def _begin_session_locked(peer_ip, encoder_str, cert_fp=None):
+def _begin_session_locked(peer_ip, encoder_str, cert_fp=None, caps=frozenset()):
     """Mark the session active and mint a fresh session token.
 
     Caller must hold host_state.pin_lock. Returns the response text to send.
-    `cert_fp` is the certificate the client proved (None for a PIN session).
+    `cert_fp` is the certificate the client proved (None for a PIN session);
+    `caps` what its HELLO offered (see _client_caps).
     """
+    host_state.video_transport = _video_transport_for(caps)
     token = secrets.token_hex(16)
     host_state.session_active = True
     host_state.authed_client_ip = peer_ip
@@ -2804,6 +2891,8 @@ def _begin_session_locked(peer_ip, encoder_str, cert_fp=None):
     host_state.encoder_stats = {}
     stream = _stream_payload()
     stream_line = f"\nSTREAM {stream}" if stream else ""
+    if host_state.video_transport == "rtp":
+        stream_line += "\nTRANSPORT rtp"
     return f"OK:{encoder_str}:{_monitors_payload()}\nTOKEN {token}{stream_line}"
 
 def _session_is_this_device(peer_ip, fp_hex) -> bool:
@@ -2818,7 +2907,7 @@ def _session_is_this_device(peer_ip, fp_hex) -> bool:
     return owner is None or owner == fp_hex
 
 
-def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
+def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str, caps=frozenset()):
     if host_state.session_active and not _session_is_this_device(peer_ip, fp_hex):
         logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session already running.")
         _send_and_close(conn, b"BUSY:ACTIVESESSION")
@@ -2860,7 +2949,7 @@ def _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str):
             if host_state.session_active:
                 _send_and_close(conn, b"BUSY:ACTIVESESSION")
                 return
-            reply = _begin_session_locked(peer_ip, encoder_str, cert_fp=fp_hex)
+            reply = _begin_session_locked(peer_ip, encoder_str, cert_fp=fp_hex, caps=caps)
         _send_and_close(conn, reply.encode("utf-8"))
         set_status(f"Client (cert): {host_state.client_ip}")
         set_pin_display(f"Session live: {peer_ip} — PIN paused")
@@ -2889,7 +2978,7 @@ def _handle_pin_handshake(conn, parts, peer_ip, encoder_str, raw=""):
         if (not host_state.session_active
                 and guess_ok
                 and time.time() < host_state.pin_expiry):
-            reply = _begin_session_locked(peer_ip, encoder_str)
+            reply = _begin_session_locked(peer_ip, encoder_str, caps=_client_caps(raw))
 
     if reply is not None:
         _pin_clear_failures(peer_ip)
@@ -2953,7 +3042,7 @@ def _handle_handshake_conn(conn, peer_ip, encoder_str, args):
 
         if cmd == "HELLO" and len(parts) >= 2 and parts[1].startswith("CERTFP:"):
             fp_hex = parts[1][len("CERTFP:"):].strip().upper()
-            _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str)
+            _handle_certfp_handshake(conn, peer_ip, fp_hex, encoder_str, _client_caps(raw))
             return
 
         if cmd == "HELLO":
@@ -3060,7 +3149,8 @@ def start_streams_for_current_client(args):
                 feeder = portal_capture.build_feeder_cmd(
                     ps, fps=args.framerate,
                     size=_portal_stream_size(ps, stream_size)) if (portal and ps) else None
-                t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder)
+                t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder,
+                                 relay_cmd=_video_relay_cmd(UDP_VIDEO_PORT + i))
                 t.start()
                 host_state.video_threads[i] = t
 

@@ -28,7 +28,16 @@ from PyQt5.QtGui import (QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainter
 
 from OpenGL.GL import *
 
+import seqrelay
+
 DEFAULT_UDP_PORT = 5000
+# The reorder relay (fix-plan 27) receives each video port and hands the
+# decoder plain MPEG-TS on 127.0.0.1 at port + this.
+VIDEO_RELAY_OFFSET = 10000
+# How long the relay waits for a datagram that arrived out of order. On
+# 2026-10-20 late ones came 3 ms (median) to 17 ms (p99) late; a missing
+# datagram costs at most this before the keyframe gate takes over.
+VIDEO_REORDER_WAIT = 0.05
 CONTROL_PORT = 7000
 TCP_HANDSHAKE_PORT = 7001
 UDP_CLIPBOARD_PORT = 7002
@@ -464,7 +473,9 @@ def _try_cert_handshake(host_ip, cert_path, key_path, timeout=None):
         if not fp_hex:
             return (False, None, "")
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
-        sock.sendall(f'HELLO CERTFP:{fp_hex}\n'.encode('utf-8'))
+        # RTP: this client puts the host's numbered video datagrams back in
+        # order (seqrelay). Hosts that don't know it read only CERTFP.
+        sock.sendall(f'HELLO CERTFP:{fp_hex} RTP\n'.encode('utf-8'))
         resp = _recv_handshake_reply(sock, want_tokens=2)
         if resp.startswith('CHALLENGE '):
             nonce_hex = resp.split(None, 1)[1].strip()
@@ -611,7 +622,7 @@ def tcp_handshake_client(host_ip, pin=None, interactive=True):
         # The host asks its own user to approve a first-time pairing, so this
         # wait can be much longer than the 8s connect/handshake timeout.
         sock.settimeout(PAIR_APPROVAL_TIMEOUT + 15)
-        sock.sendall(f"HELLO {code}{keyreq_line}\n".encode("utf-8"))
+        sock.sendall(f"HELLO {code} RTP{keyreq_line}\n".encode("utf-8"))
         resp = _recv_handshake_reply(sock)
         logging.debug("Handshake response: %s", resp.splitlines()[0] if resp else '(empty)')
 
@@ -2916,14 +2927,41 @@ class MainWindow(QMainWindow):
         if mtu_guess < 1500:
             logging.info("Path MTU to %s is %d → TS pkt_size %d (no IP fragmentation).",
                          self.host_ip, mtu_guess, pkt)
+        relay = getattr(self, "video_relay", None)
+        bind = (f"127.0.0.1:{self.udp_port + VIDEO_RELAY_OFFSET}" if relay is not None
+                else f"0.0.0.0:{self.udp_port}")
         return (
-            f"udp://@0.0.0.0:{self.udp_port}"
+            f"udp://@{bind}"
             f"?pkt_size={pkt}"
             f"&reuse=1&buffer_size=4194304&fifo_size=131072"
             f"&overrun_nonfatal=1&max_delay=0&rw_timeout=5000000"
         )
 
+    def _start_video_relay(self):
+        """Put the host's numbered (RTP) video datagrams back in order.
+
+        Runs whatever the host answered: an older host's plain MPEG-TS passes
+        straight through. LINUXPLAY_VIDEO_RELAY=0 reads the port directly.
+        """
+        old = getattr(self, "video_relay", None)
+        if old is not None and old.is_alive():
+            return                      # it owns the port: a second one would fail to bind
+        self.video_relay = None
+        if os.environ.get("LINUXPLAY_VIDEO_RELAY", "1") == "0":
+            return
+        try:
+            self.video_relay = seqrelay.ReorderRelay(
+                self.udp_port, self.udp_port + VIDEO_RELAY_OFFSET,
+                wait=VIDEO_REORDER_WAIT, name=f"Video {self.monitor_index}")
+        except OSError as e:
+            logging.warning("Video reorder relay unavailable on UDP %d (%s) — reading "
+                            "the stream directly.", self.udp_port, e)
+            self.video_relay = None
+            return
+        self.video_relay.start()
+
     def _start_decoder_thread(self):
+        self._start_video_relay()
         self.video_url = self._video_url_for_path()
         self.decoder_thread = DecoderThread(self.video_url, self.decoder_opts,
                                             ultra=self.ultra,
@@ -3280,6 +3318,8 @@ class MainWindow(QMainWindow):
                 self.decoder_thread.wait(2000)
             except Exception as e:
                 logging.debug(f"Decoder cleanup error: {e}")
+        if getattr(self, "video_relay", None) is not None:
+            self.video_relay.stop()
 
         if getattr(self, "_gp_thread", None):
             try:

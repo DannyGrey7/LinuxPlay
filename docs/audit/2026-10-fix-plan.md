@@ -55,6 +55,7 @@ See [the incident report](2026-10-19-stale-session.md).
 | 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fixed in `ea7608b`, deployed 2026-10-19 18:43, awaiting the listening test:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
 | 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
 | 26 | Audio capture reads one Opus frame at a time: `-fragment_size` of 192 bytes × `LP_OPUS_FD` ms (3840 for production's 20 ms) on the pulse input, instead of ffmpeg's default 50 ms. **Committed in `9944f10`, not deployed, needs the listening test** ([measurements below](#item-26-audio-capture-read-size)) | 50 ms reads send audio in lumps of 2–3 packets, each up to 41 ms late. Capture-to-packet goes from 57 to 37 ms on average, and from 84 to 44 ms at worst. A further 20 ms sits in the mpegts muxer (see the section). | XS / low (ffmpeg +0.3% of a core; needs a listening test) |
+| 27 | Number the video datagrams and put them back in order on the client: the host's `seqrelay.py` adds an RTP header to ffmpeg's own TS datagrams, and the client's relay restores the order (waiting at most 50 ms) before the unchanged decoder. Negotiated in the handshake; older hosts and clients keep plain MPEG-TS. **Committed, not deployed** ([measurements below](#item-27-video-stutter-from-wi-fi-reordering)) | On 2026-10-19/20 the picture was frozen 55–85% of the time. The Wi-Fi reorders 2–13% of the video datagrams, almost all inside keyframes, and every out-of-order datagram froze a whole GOP. Through the client's own decode path: 84.7% → 1.2% frozen. | M / medium (a new process per video stream on the host; needs a session to confirm) |
 
 ### Item 24: audio timestamps
 
@@ -220,6 +221,85 @@ with item 24's. Lip-sync on a talking-head video or a hand clap; a few
 minutes of a game; the host log should show nothing new. Relative to video, audio
 may now play up to ~40 ms earlier than before.
 
+### Item 27: video stutter from Wi-Fi reordering
+
+Measured on 2026-10-20 between doggoos and the Mac over Tailscale, while
+Danny streamed. Lab scripts and data are in
+`~/linuxplay-audit/lab/fec/` (Mac) and the same folder on the box.
+
+**Symptom.** The client logged 20–106 damaged frames a minute, against about
+1 on 10-13, and the picture was frozen 55–85% of the time. The host was
+clean: wired gigabit, a single-queue NIC (`r8169`), and no send, qdisc or
+Tailscale drops. The Mac's full-socket counter didn't move either.
+
+**Not loss: reordering.** `trace.py` replayed the real stream's datagram
+pattern from a 10-13 recording (keyframes ~360 datagrams every 0.45 s,
+95% of all datagrams) from doggoos to the Mac, with sequence numbers:
+
+| run | lost | out of order |
+|---|---|---|
+| 120 s, via Tailscale | 0.013% | (order not recorded) |
+| 30 s, via Tailscale / plain LAN, same minute | 0 / 0 | 7.3% / 7.5% |
+| 60 s, alongside the live stream | 0.065% | 4.8% |
+| 30 s, unpaced, later | 0.047% | 13.2% |
+
+The same reordering shows on the plain LAN as through Tailscale, and the
+host NIC has one transmit queue, so it is the Wi-Fi. Of the late datagrams,
+98% were inside keyframes. They were displaced by up to 127 places, and
+arrived 3.4 ms late at the median, 16.8 ms at p99 (none over 20 ms in a
+realistic run). A `tailscale debug capture` on the Mac showed 1,137
+continuity gaps in 75 s on the live video, while a trace sent alongside it
+lost 0.065%.
+
+FFmpeg's TS demuxer flags an out-of-order datagram as a continuity error,
+and the keyframe gate (item 2) then holds the picture until the next
+keyframe. Three quarters of keyframes had at least one late datagram, so
+the picture was frozen about three quarters of the time.
+
+**Options, measured:**
+
+| option | result |
+|---|---|
+| FEC | Doesn't apply: almost nothing is missing. |
+| Pace the bursts (200 / 100 / 50 Mb/s) | 3.6 / 1.6 / 3.9% of datagrams still late, 55–88% of keyframes still hit: 59–90% frozen in the model. |
+| ffmpeg `rtp_mpegts` + FFmpeg's RTP reorder queue | 8.2% → 1.2% corrupt packets. But PyAV can't decode the streams RTP/MP2T adds after opening, and `rtp_mpegts` fills every RTP payload, so it holds each frame's tail until the next frame arrives (frames began at TS index 0–5 of full datagrams). On a quiet desktop that is the item 13 delay again. |
+| **Host `seqrelay` + client reorder relay** | Through the client's own decode path, same minute: **84.7% → 1.2% frozen, 5.8 → 33.1 fps, 94 → 0 damaged frames.** In order, both relays together add 0.42 ms median, 3.4 ms p99. A missing datagram costs at most 50 ms before the keyframe gate takes over. |
+
+**How it works.**
+- The client offers `RTP` on its `HELLO` line. The host answers `TRANSPORT rtp`.
+- For each video stream the host runs `seqrelay.py send` as its own
+  process, so the GUI can never hold up video. ffmpeg sends its unchanged
+  MPEG-TS to `127.0.0.1:25000+i`, with `pkt_size` leaving room for the
+  12-byte header. The relay adds an RTP header (RFC 3550, PT 33) and sends
+  it on to the client's video port. A relay that dies restarts the stream.
+- Each client window runs a `ReorderRelay` on its video port. It restores
+  sequence order (waiting at most 50 ms, holding at most 1024), strips the
+  header, and feeds the decoder on `127.0.0.1:15000+i`. Plain TS from an
+  older host passes straight through.
+- Off switches: `LINUXPLAY_VIDEO_TRANSPORT=udp` on the host,
+  `LINUXPLAY_VIDEO_RELAY=0` on the client. Audio is unchanged.
+
+**Tests.** `test_seqrelay.py` (12) covers the ordering rules: late,
+missing, wrap, a sender restart, a full queue, duplicates and plain TS. It
+also runs the real host relay into the client relay with Wi-Fi-style
+reordering. `test_host.py` adds 4 tests (the HELLO capability, the command
+and relay for each transport, the `TRANSPORT` line, a dying relay) and
+`test_auth.py` adds 2 (a current client gets RTP; an older HELLO gets
+plain TS). These suites and the other client suites pass on the Mac.
+`test_client_audio`, `test_client_av` and `test_stats_overlay` can't bind
+their ports while a client is running, and fail the same way on the
+unchanged code; they need a rerun after the session. The suites also pass
+on doggoos, run from a scratch copy.
+
+**Still to do:** deploy (host restart while idle, client restart; Danny's
+call), then a session. The client log should show "the host numbers its
+datagrams (RTP)", and the pacing lines should show damaged frames back near
+0 a minute. The Wi-Fi itself (six networks on channel 157, AWDL) is still
+worth fixing, since reordering also costs up to 50 ms per late datagram.
+Not done: a lab recorder that strips the RTP header
+(`~/linuxplay-audit/lab/record_stream.py` now records numbered datagrams
+unless the host sets `LINUXPLAY_VIDEO_TRANSPORT=udp`).
+
 ## Deliberately skipped, and why
 
 - **`output_corrupt` (decode frames with missing references).** It makes the
@@ -229,7 +309,9 @@ may now play up to ~40 ms earlier than before.
 - **Pacing or FEC on the UDP sender.** Bursts up to 400 datagrams were
   lossless; the loss that does happen is runs of ~44 datagrams during Wi-Fi
   stalls. Pacing doesn't touch that, and FEC able to cover it costs more than
-  it saves at this loss rate (one event per ~85 s).
+  it saves at this loss rate (one event per ~85 s). Re-measured on
+  2026-10-20: loss was still 0–0.07%, but 2–13% of datagrams arrived out of
+  order. FEC can't fix that, and pacing only reduced it (item 27).
 - **SRT/ARQ transport.** It would recover those runs, but adds a fixed
   2–4× RTT to every frame and replaces the transport on both ends. Worth it
   only if the freezes in item 13 stay annoying after the cheap fixes.

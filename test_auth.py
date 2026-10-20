@@ -273,6 +273,9 @@ with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
     auth_ok, info, rejected = client._try_cert_handshake("127.0.0.1", good_cert, good_key)
     assert auth_ok and not rejected, (auth_ok, info, rejected)
     ok("stored certificate authenticates without a PIN")
+    # Fix-plan 27: this client offers RTP, so the host numbers its video.
+    assert host.host_state.video_transport == "rtp", host.host_state.video_transport
+    ok("a current client is sent numbered (RTP) video")
 
     reset_host(pin="123456")
     install(good_cert, other_key)
@@ -306,6 +309,9 @@ with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
     s.close()
     assert resp.startswith("OK:"), resp
     ok("proof split across TCP segments still authenticates")
+    # That HELLO offered nothing: plain MPEG-TS, as an older client expects.
+    assert "TRANSPORT" not in resp and host.host_state.video_transport == "udp", resp
+    ok("a client that does not offer RTP gets plain MPEG-TS")
 
     # ...and so does a client from before that change, which sends HELLO and
     # KEYREQ in one write with no trailing newline.
@@ -319,6 +325,7 @@ with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
     resp = s.recv(8192).decode("utf-8", errors="replace").strip()
     s.close()
     assert resp.startswith("OK:") and "CERT " in resp, resp[:200]
+    assert host.host_state.video_transport == "udp", "KEYREQ is not a capability"
     ok("a pre-fix client's PIN+KEYREQ line still gets a certificate")
 
     # ── the host's stream size reaches the client ──

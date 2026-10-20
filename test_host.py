@@ -222,6 +222,46 @@ try:
 finally:
     os.environ.pop("LINUXPLAY_CAPTURE", None)
 
+# ── 1d'. fix-plan 27: numbered (RTP) video goes out through seqrelay ──
+# On 2026-10-20 the Mac's Wi-Fi delivered up to 13% of video datagrams out of
+# order; numbered datagrams let the client put them back before the demuxer.
+assert host._client_caps("HELLO 123456 RTP\nKEYREQ abc") == {"RTP"}
+assert host._client_caps("HELLO CERTFP:AB12 rtp") == {"RTP"}
+assert host._client_caps("HELLO CERTFP:AB12\n") == frozenset()
+assert host._client_caps("HELLO 123456\nKEYREQ RTP") == frozenset(), "only the HELLO line"
+assert host._video_transport_for({"RTP"}) == "rtp" and host._video_transport_for(set()) == "udp"
+os.environ["LINUXPLAY_VIDEO_TRANSPORT"] = "udp"
+try:
+    assert host._video_transport_for({"RTP"}) == "udp"
+finally:
+    os.environ.pop("LINUXPLAY_VIDEO_TRANSPORT", None)
+ok("RTP is offered on the HELLO line; LINUXPLAY_VIDEO_TRANSPORT=udp turns it off")
+
+os.environ["LINUXPLAY_CAPTURE"] = "x11grab"
+_hs = host.host_state
+_saved = (_hs.client_ip, _hs.video_transport)
+try:
+    # A 1344-byte path: 7 TS packets fit plain, but not behind a 12-byte header.
+    with patched(host, _session_type=lambda: "wayland", _path_mtu=lambda ip: 1344):
+        _hs.client_ip = "100.104.182.44"
+        _hs.video_transport = "udp"
+        _plain = host.build_video_cmd(_mk_args(), "8M", (1920, 1080, 0, 0), 5001)
+        _plain_relay = host._video_relay_cmd(5001)
+        _hs.video_transport = "rtp"
+        _numbered = host.build_video_cmd(_mk_args(), "8M", (1920, 1080, 0, 0), 5001)
+        _relay = host._video_relay_cmd(5001)
+finally:
+    _hs.client_ip, _hs.video_transport = _saved
+    os.environ.pop("LINUXPLAY_CAPTURE", None)
+assert _plain[-1].startswith("udp://100.104.182.44:5001?pkt_size=1316&"), _plain[-1]
+assert _plain_relay is None
+assert _numbered[-1].startswith("udp://127.0.0.1:25001?pkt_size=1128&"), _numbered[-1]
+_out_fmt = _numbered[len(_numbered) - 1 - _numbered[::-1].index("-f") + 1]
+assert _out_fmt == "mpegts", "ffmpeg's own output stays plain TS"
+assert _relay[1].endswith("seqrelay.py"), _relay
+assert _relay[2:] == ["send", "25001", "100.104.182.44", "5001"], _relay
+ok("RTP video: ffmpeg sends TS to the local relay, sized for the RTP header")
+
 # ── 1e. the handshake reader waits for the whole message ─────────────
 def _handshake_msg(first, second=None, delay=0.2, want_tokens=2):
     a, b = socket.socketpair()
@@ -292,8 +332,9 @@ class _FakeStream:
     """Stands in for StreamThread: records starts, never spawns ffmpeg."""
     started = []
 
-    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None):
         self.name = name
+        self.relay_cmd = relay_cmd
 
     def start(self):
         _FakeStream.started.append(self.name)
@@ -599,6 +640,31 @@ _st = host.StreamThread(None, "Audio", cmd_factory=lambda: ["ffmpeg", "-i", "x"]
 _st._refresh_cmd()
 assert _st.cmd == ["ffmpeg", "-i", "x"]
 ok("a stream with a command factory rebuilds its command before each start")
+
+# The handshake reply names the transport only when the client asked for it.
+with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
+             build_video_cmd=lambda *a, **k: ["ffmpeg"], HOST_ARGS=_args, **_quiet):
+    with host.host_state.pin_lock:
+        _reply = host._begin_session_locked("127.0.0.1", "h.265", caps=frozenset({"RTP"}))
+    assert _reply.endswith("\nTRANSPORT rtp") and host.host_state.video_transport == "rtp", _reply
+    host.end_session("cleanup")
+    with host.host_state.pin_lock:
+        _reply = host._begin_session_locked("127.0.0.1", "h.265")
+    assert "TRANSPORT" not in _reply and host.host_state.video_transport == "udp", _reply
+    host.end_session("cleanup")
+ok("the reply says TRANSPORT rtp only to a client that offered it")
+
+# A relay that dies takes its encoder down with it: the stream restarts as a
+# pair instead of encoding into a closed loopback port.
+_rs = host.StreamThread(["sleep", "30"], "Video 9", relay_cmd=[
+    sys.executable, "-c", "import sys; sys.stderr.write('bind failed'); sys.exit(3)"])
+assert _rs._start_children()
+_ret, _err = _rs._wait_for_exit()
+_rs._running = False
+_rs._kill_children()
+assert _ret == 3 and _err == "relay: bind failed", (_ret, _err)
+assert _rs.process.poll() is not None, "the encoder is stopped with its relay"
+ok("a stream's relay dying ends the encoder too, so both restart")
 
 # A warning ffmpeg repeats on every frame is logged once, then once a window
 # with a count (2026-10-19: ~17 a second for sixteen hours).
