@@ -54,8 +54,8 @@ See [the incident report](2026-10-19-stale-session.md).
 | 17 | Remove the decoder settings PyAV 18 silently ignores (`low_delay`, `strict_std_compliance`, `flags2="+fast"`) | Code says something it doesn't do (N6) | XS / low |
 | 24 | Monotonic audio timestamps: wall-clock stamping of the PulseAudio input makes frames overlap (`Queue input is backward in time`, `Non-monotonic DTS`). **Fixed in `ea7608b`, deployed 2026-10-19 18:43, awaiting the listening test:** `asetpts=N/SR/TB` ahead of `silencedetect` ([measurements below](#item-24-audio-timestamps)) | Flooded the log on 2026-10-19 (now contained). Candidate cause of the earlier silent-audio reports. | S / medium (A/V timing, needs a listening test) |
 | 25 | Pause the stream while the client's display sleeps, or after long inactivity | On 2026-10-19 the host encoded for ~9 h to a Mac with its display off | S / low |
-| 26 | Audio capture reads one Opus frame at a time: `-fragment_size` of 192 bytes × `LP_OPUS_FD` ms (3840 for production's 20 ms) on the pulse input, instead of ffmpeg's default 50 ms. **Committed in `9944f10`, not deployed, needs the listening test** ([measurements below](#item-26-audio-capture-read-size)) | 50 ms reads send audio in lumps of 2–3 packets, each up to 41 ms late. Capture-to-packet goes from 57 to 37 ms on average, and from 84 to 44 ms at worst. A further 20 ms sits in the mpegts muxer (see the section). | XS / low (ffmpeg +0.3% of a core; needs a listening test) |
-| 27 | Number the video datagrams and put them back in order on the client: the host's `seqrelay.py` adds an RTP header to ffmpeg's own TS datagrams, and the client's relay restores the order (waiting at most 50 ms) before the unchanged decoder. Negotiated in the handshake; older hosts and clients keep plain MPEG-TS. **Committed, not deployed** ([measurements below](#item-27-video-stutter-from-wi-fi-reordering)) | On 2026-10-19/20 the picture was frozen 55–85% of the time. The Wi-Fi reorders 2–13% of the video datagrams, almost all inside keyframes, and every out-of-order datagram froze a whole GOP. Through the client's own decode path: 84.7% → 1.2% frozen. | M / medium (a new process per video stream on the host; needs a session to confirm) |
+| 26 | Audio capture reads one Opus frame at a time: `-fragment_size` of 192 bytes × `LP_OPUS_FD` ms (3840 for production's 20 ms) on the pulse input, instead of ffmpeg's default 50 ms. **Committed in `9944f10`, deployed 2026-10-20 18:55 with item 27, needs the listening test** ([measurements below](#item-26-audio-capture-read-size)) | 50 ms reads send audio in lumps of 2–3 packets, each up to 41 ms late. Capture-to-packet goes from 57 to 37 ms on average, and from 84 to 44 ms at worst. A further 20 ms sits in the mpegts muxer (see the section). | XS / low (ffmpeg +0.3% of a core; needs a listening test) |
+| 27 | Number the video datagrams and put them back in order on the client: the host's `seqrelay.py` adds an RTP header to ffmpeg's own TS datagrams, and the client's relay restores the order (waiting at most 50 ms) before the unchanged decoder. Negotiated in the handshake; older hosts and clients keep plain MPEG-TS. **`7657a5e`, deployed 2026-10-20 18:55** ([measurements below](#item-27-video-stutter-from-wi-fi-reordering)) | On 2026-10-19/20 the picture was frozen 55–85% of the time. The Wi-Fi reorders 2–13% of the video datagrams, almost all inside keyframes, and every out-of-order datagram froze a whole GOP. Through the client's own decode path: 84.7% → 1.2% frozen. | M / medium (a new process per video stream on the host; needs a session to confirm) |
 
 ### Item 24: audio timestamps
 
@@ -291,10 +291,17 @@ their ports while a client is running, and fail the same way on the
 unchanged code; they need a rerun after the session. The suites also pass
 on doggoos, run from a scratch copy.
 
-**Still to do:** deploy (host restart while idle, client restart; Danny's
-call), then a session. The client log should show "the host numbers its
-datagrams (RTP)", and the pacing lines should show damaged frames back near
-0 a minute. The Wi-Fi itself (six networks on channel 157, AWDL) is still
+**Deployed** 2026-10-20 18:55, with item 26, through the autostart unit
+while the host was idle. Every suite passes on both machines. A 3-minute
+muted probe session went through the relays: **0 damaged frames, 0.4%
+frozen, 29.7 fps against the host's 28.6.** The Wi-Fi was still reordering
+heavily: the client relay filled 1,211, 789 and 1,109 gaps in successive
+minutes and gave up on 5 datagrams. Earlier that day the same path had been
+55–85% frozen.
+
+**Still to do:** a real session. The client log should say "the host
+numbers its datagrams (RTP)", and the pacing lines should show damaged
+frames near 0 a minute. The Wi-Fi itself (six networks on channel 157, AWDL) is still
 worth fixing, since reordering also costs up to 50 ms per late datagram.
 Not done: a lab recorder that strips the RTP header
 (`~/linuxplay-audit/lab/record_stream.py` now records numbered datagrams
