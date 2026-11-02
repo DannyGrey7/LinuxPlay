@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Client audio survival: silence while the clock runs, mute, reporting, banner.
+"""Client audio survival: silence while the clock runs, mute, reporting, banner, stalls.
 
 The audio "didn't survive" sessions looked healthy to every check: the
 player's clock kept running on a stream of digital silence. These tests pin
@@ -11,8 +11,11 @@ what replaced that blind spot:
   4. live: a real Opus stream of silence, then tone, through ffplay — the
      silence is reported while the clock runs, and its end too. The player
      runs muted, so nothing is audible while the suite runs.
+  5. live: tone, then datagrams that never decode — ffplay's clock keeps
+     ticking on wall time, so only the decoded-frame heartbeat sees the
+     stall, and the player is replaced.
 
-Section 4 needs ffmpeg and ffplay with libopus; it is skipped otherwise.
+Sections 4 and 5 need ffmpeg and ffplay with libopus; they are skipped otherwise.
 """
 import logging
 import os
@@ -160,8 +163,9 @@ else:
          "-c:a", "libopus", "-ar", "48000", "-ac", "2",
          "-f", "mpegts", f"udp://127.0.0.1:{client.UDP_AUDIO_PORT}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    listener = None
     try:
-        client.audio_listener("127.0.0.1", enabled=True, muted=True)
+        listener = client.audio_listener("127.0.0.1", enabled=True, muted=True)
         deadline = time.time() + 40           # ~14 s when healthy; slack for a loaded box
         toggled = False
         while time.time() < deadline:
@@ -188,7 +192,47 @@ else:
         client.audio_stop.set()
         if client.audio_proc:
             client.audio_proc.terminate()
+        if listener:
+            listener.join(timeout=5)
     ok("live: digital silence is reported while the clock runs, then its end")
+
+# ── 5. live: data keeps coming, nothing decodes ───────────────────────
+if not have:
+    skip("live stall detection", "ffmpeg/ffplay not installed")
+else:
+    import socket
+    records.clear()
+    st.update(restarts=0, stalls=0)
+    client.audio_stop.clear()
+    client._audio_listener_started = False
+    stall_secs, client.AUDIO_STALL_SECS = client.AUDIO_STALL_SECS, 3.0
+    listener = None
+    junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        listener = client.audio_listener("127.0.0.1", enabled=True, muted=True)
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+             "-c:a", "libopus", "-ar", "48000", "-ac", "2",
+             "-f", "mpegts", f"udp://127.0.0.1:{client.UDP_AUDIO_PORT}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        assert any("playout clock running" in m for m in records), records[-8:]
+        deadline = time.time() + 15           # ~3 s when healthy
+        while time.time() < deadline and not st["stalls"]:
+            # Under rw_timeout's 5 s, so only the heartbeat can notice.
+            junk.sendto(os.urandom(1128), ("127.0.0.1", client.UDP_AUDIO_PORT))
+            time.sleep(0.02)
+        assert st["stalls"] >= 1, records[-8:]
+        assert any("nothing decoded" in m for m in records), records[-8:]
+    finally:
+        junk.close()
+        client.AUDIO_STALL_SECS = stall_secs
+        client.audio_stop.set()
+        if client.audio_proc:
+            client.audio_proc.terminate()
+        if listener:
+            listener.join(timeout=5)
+    ok("live: undecodable data while the clock ticks is caught and the player replaced")
 
 
 print(f"\nALL {len(PASS)} CLIENT AUDIO TESTS PASSED"

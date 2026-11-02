@@ -155,9 +155,13 @@ def choose_auto_hwaccel():
     return "cpu"
 
 
-# How long ffplay may go without advancing its playback clock before we assume
-# the demuxer lost sync and replace it (it can otherwise stay silent forever).
+# How long ffplay may go without decoding audio before we assume the demuxer
+# lost sync or the output device died, and replace it (it can otherwise stay
+# silent forever). ffplay's own clock can't tell: it keeps ticking on wall time
+# while nothing decodes, so a side branch of the filter graph logs every
+# AUDIO_BEAT_FRAMES-th decoded frame instead (≤ 3 s apart even at Opus's 120 ms).
 AUDIO_STALL_SECS = 8.0
+AUDIO_BEAT_FRAMES = 25
 
 _FFPLAY_CLOCK_RES = (
     re.compile(r"^\s*(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\s+[MA]-[AV]\s*:"),
@@ -977,9 +981,13 @@ def audio_listener(host_ip, enabled=True, muted=False):
         afilter = ("aresample=matrix_encoding=none,"
                    "pan=stereo|FL<0.5*FL+0.5*FC|FR<0.5*FR+0.5*FC")
         logging.info("Stereo-only output detected — downmixing surround audio.")
-    # The stall watchdog only sees a stopped clock; a stream of digital
-    # silence (the host capturing an idle sink) keeps the clock running.
+    # The stall watchdog only sees audio that stops decoding; a stream of
+    # digital silence (the host capturing an idle sink) still decodes.
     afilter += f",silencedetect=noise={AUDIO_SILENCE_DB}dB:duration={AUDIO_SILENCE_SECS}"
+    # The stall watchdog's heartbeat (see AUDIO_STALL_SECS). Counted in frames,
+    # not timestamps: a host encoder restart sends timestamps back to 0.
+    afilter += (f",asplit[out][beat];[beat]aselect='not(mod(n,{AUDIO_BEAT_FRAMES}))',"
+                f"ashowinfo,anullsink;[out]anull")
 
     def loop():
         global audio_proc
@@ -1022,7 +1030,7 @@ def audio_listener(host_ip, enabled=True, muted=False):
                         pass
                     break
                 last_clock = None
-                last_progress = time.time()
+                last_progress = None         # last decoded-audio heartbeat
                 buf = b""
                 while True:
                     if audio_stop.is_set():
@@ -1031,21 +1039,24 @@ def audio_listener(host_ip, enabled=True, muted=False):
                         except Exception:
                             pass
                         break
+                    # Checked on every pass: ffplay prints a status line every
+                    # ~30 ms whether or not audio decodes, so waiting for a
+                    # quiet pipe would never get here.
+                    if (last_progress is not None
+                            and time.time() - last_progress > AUDIO_STALL_SECS):
+                        logging.warning(
+                            "Audio stalled: nothing decoded for %.0fs (clock at %.1fs) — restarting the player.",
+                            AUDIO_STALL_SECS, last_clock or 0.0)
+                        AUDIO_STATE["stalls"] += 1
+                        try:
+                            # Release UDP 6001 before the restart, or the
+                            # replacement player would receive nothing.
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
                     ready, _, _ = select.select([proc.stdout], [], [], 1.0)
                     if not ready:
-                        if (last_clock is not None
-                                and time.time() - last_progress > AUDIO_STALL_SECS):
-                            logging.warning(
-                                "Audio stalled for %.0fs (clock stuck at %.1fs) — restarting the player.",
-                                AUDIO_STALL_SECS, last_clock)
-                            AUDIO_STATE["stalls"] += 1
-                            try:
-                                # Release UDP 6001 before the restart, or the
-                                # replacement player would receive nothing.
-                                proc.terminate()
-                            except Exception:
-                                pass
-                            break
                         if proc.poll() is not None:
                             break
                         continue
@@ -1065,7 +1076,9 @@ def audio_listener(host_ip, enabled=True, muted=False):
                         if clock is not None:
                             if last_clock is None:
                                 logging.info("Audio stream detected — playout clock running.")
-                            last_clock, last_progress = clock, time.time()
+                            last_clock = clock
+                        elif "ashowinfo" in line:
+                            last_progress = time.time()
                         elif _audio_silence_line(line):
                             pass
                         else:
