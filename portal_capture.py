@@ -391,5 +391,7 @@ def build_feeder_cmd(stream, fps=None, size=None):
     cmd = ["gst-launch-1.0", "-q", "pipewiresrc", f"path={stream['node']}", "!"]
     if fps_i:
         cmd += ["videorate", "drop-only=true", "!"]
-    cmd += ["videoconvert", "!", "videoscale", "!", caps, "!", "fdsink", "sync=false"]
+    # n-threads: one thread spent ~10 ms a frame scaling a 4K panel (175%) to its
+    # 2194x1234 logical size; four take ~2 ms, i.e. ~8 ms less latency a frame.
+    cmd += ["videoconvert", "!", "videoscale", "n-threads=4", "!", caps, "!", "fdsink", "sync=false"]
     return cmd
