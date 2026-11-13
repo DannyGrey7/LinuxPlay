@@ -66,13 +66,20 @@ Thanks to the upstream author for building the thing in the first place — with
   - Handshake and file upload over TCP.
 - **Audio Features**
   - Surround Sound Support (5.1 / 7.1): Host detects and captures up to 8 audio channels.
-  - Client performs intelligent downmixing (FFplay filters) to stereo for local speakers when necessary.
+  - The client plays audio through a **built-in player** by default (PyAV decodes, Qt plays). It
+    keeps an 80 ms buffer: after a network gap it plays silence and refills instead of stalling
+    the sound card, and a backlog over 250 ms (the burst after a stall) is dropped, so the delay
+    stays bounded. It always plays stereo (surround is downmixed). If QtMultimedia is missing
+    the client falls back to ffplay by itself.
+  - **Audio ▸ Player** on macOS switches live between the built-in player and ffplay
+    (`-sync ext`, which can also play 5.1/7.1 on a surround device), for comparison.
   - The host captures what its own speakers play — the default output's monitor — and follows
     it when the default output changes (a VR headset taking over, HDMI coming back) instead of
     streaming the old, now silent one. `--audio_source <sink>` pins a specific output.
-  - A watchdog restarts the client's player if its playout clock stops (it plays again in
-    ~0.2 s), and digital silence while the clock runs is logged on both ends. Each session ends
-    with an `Audio report:` line on host and client (sources, restarts, share of silence).
+  - A watchdog replaces the client's player when it decodes nothing for 8 s (it plays again in
+    ~0.2 s), and digital silence is logged on both ends. Each session ends with an
+    `Audio report:` line on host and client (sources, restarts, share of silence; for the
+    built-in player also how often its buffer ran dry and how much late audio it dropped).
   - Mute without disconnecting: **Audio ▸ Mute Host Audio** on macOS (no shortcut: every ⌘
     key combination goes to the host), `--mute`, or "muted" in the launcher. The stream keeps
     being watched; only playback is silent.
@@ -240,7 +247,8 @@ python3 client.py --host_ip 192.168.1.20 --decoder h.264 --hwaccel auto --audio 
   in use (`decode CPU` vs `decode videotoolbox`).
 - `./run.sh check` / `./run.sh client ...` also work on macOS — the bootstrap detects Homebrew and skips Linux-only pieces.
 - Controller (gamepad) forwarding is not yet available on macOS; keyboard/mouse, video, audio, clipboard and certificate auth all work.
-- `ffplay` for audio playback ships with Homebrew's `ffmpeg`.
+- The built-in audio player uses PyQt5's QtMultimedia (part of the PyQt5 wheel); `ffplay`, the
+  alternative player, ships with Homebrew's `ffmpeg`.
 
 ---
 

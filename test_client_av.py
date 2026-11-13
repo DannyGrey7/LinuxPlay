@@ -259,14 +259,14 @@ pump = subprocess.Popen(
      "-f", "mpegts", f"udp://127.0.0.1:{client.UDP_AUDIO_PORT}"],
     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 try:
-    client.audio_listener("127.0.0.1", enabled=True)
+    client.audio_listener("127.0.0.1", enabled=True, muted=True)   # inaudible
     deadline = time.time() + 12
     while time.time() < deadline:
-        if any("playout clock running" in m for m in records):
+        if any("Audio stream detected" in m for m in records):
             break
         time.sleep(0.2)
     msgs = [m for m in records]
-    assert any("playout clock running" in m for m in msgs), \
+    assert any("Audio stream detected" in m for m in msgs), \
         f"listener never saw audio flow; log was: {msgs[-6:]}"
     assert not any("Audio stalled" in m for m in msgs), "watchdog fired while audio flowed"
     assert not any("Audio listener failed" in m for m in msgs), "listener crashed"
@@ -278,7 +278,7 @@ finally:
         pump.kill()
     client.audio_stop.set()
     logging.getLogger().removeHandler(cap)
-ok("live Opus stream: clock advances, no false stall restart, no crash")
+ok("live Opus stream: the default player plays it, no false stall restart, no crash")
 
 
 # ── 2d. clicks map to desktop pixels, not video pixels ────────────────

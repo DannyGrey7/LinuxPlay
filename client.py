@@ -21,7 +21,7 @@ import select
 
 from queue import Queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QMessageBox, QOpenGLWidget,
-                             QInputDialog, QWidget, QLabel, QAction)
+                             QInputDialog, QWidget, QLabel, QAction, QActionGroup)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QRectF
 from PyQt5.QtGui import QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath
 
@@ -844,17 +844,33 @@ def clipboard_listener():
 
 audio_stop = threading.Event()
 _audio_listener_started = False
-# Set by set_audio_muted(): the player is being restarted on purpose (new
-# volume), which is not a glitch and must not be counted as one.
-_audio_mute_restart = threading.Event()
+# Set when the player is replaced on purpose (ffplay's new volume, the other
+# player picked in the menu), which is not a glitch and must not count as one.
+_audio_planned_restart = threading.Event()
 
 AUDIO_SILENCE_DB = -60          # quieter than this for …
 AUDIO_SILENCE_SECS = 10         # … this long is "silent" (the clock keeps running)
+
+# The built-in player (2026-11 audit, finding 0). ffplay played each packet the
+# moment it arrived, and its output callback waited for the next one: no
+# reserve, so Wi-Fi jitter crackled, a ~1 s stall left the Mac's output silent
+# for good, and a late start stayed late. Here the client owns the buffer: the
+# sound card always gets data at once (silence while refilling, never a wait),
+# a gap refills to the target before playing again, and audio piling up past
+# the limit (the burst after a stall) is dropped back to the target.
+AUDIO_TARGET_MS = 80
+AUDIO_LIMIT_MS = 250
+AUDIO_DEVICE_MS = 40            # Qt's own buffer in front of the sound card
+AUDIO_OUTPUT_STUCK_SECS = 2.0   # the sound card took nothing this long: reopen it
+_PCM_PER_MS = 192               # bytes of s16 stereo at 48 kHz
+_SILENCE_PEAK = round(32768 * 10 ** (AUDIO_SILENCE_DB / 20))
+AUDIO_PLAYERS = {"builtin": "Built-in (low latency)", "ffplay": "ffplay (-sync ext)"}
 
 AUDIO_STATE = {
     "started": None, "restarts": 0, "stalls": 0, "last_glitch": 0.0,
     "muted": False, "muted_since": None, "muted_total": 0.0,
     "silent_since": None, "silence_total": 0.0, "silence_longest": 0.0,
+    "player": "builtin", "used": set(), "dry": 0, "dropped": 0.0,
 }
 
 
@@ -927,9 +943,11 @@ def audio_report(now=None):
         cur = now - st["silent_since"]
         silent, longest = silent + cur, max(longest, cur)
     muted = st["muted_total"] + ((now - st["muted_since"]) if st["muted_since"] else 0.0)
+    builtin = (f", built-in player: buffer ran dry {st['dry']}×, {st['dropped']:.1f}s dropped"
+               if "builtin" in st["used"] else "")
     return (f"Audio report: {_fmt_secs(span)}, {st['restarts']} player restarts "
             f"({st['stalls']} stalls), silent {100.0 * silent / span:.0f}% "
-            f"(longest {_fmt_secs(longest)}), muted {_fmt_secs(muted)}.")
+            f"(longest {_fmt_secs(longest)}), muted {_fmt_secs(muted)}{builtin}.")
 
 
 def set_audio_muted(muted):
@@ -949,25 +967,305 @@ def set_audio_muted(muted):
         st["muted_since"] = None
     logging.info("Audio %s.", "muted (the stream keeps playing silently)" if muted else "unmuted")
     proc = audio_proc
-    if proc is not None:
-        _audio_mute_restart.set()
+    # The built-in player reads AUDIO_STATE["muted"] for every chunk it plays;
+    # ffplay only takes a volume at start, so it is restarted.
+    if proc is not None and not isinstance(proc, _BuiltinAudio):
+        _audio_planned_restart.set()
         try:
             proc.terminate()
         except Exception:
             pass
 
 
-def audio_listener(host_ip, enabled=True, muted=False):
-    """Decode the host's Opus stream with ffplay, restarting it whenever it dies.
+def set_audio_player(name):
+    """Switch players mid-session (Audio ▸ Player on macOS): a planned restart."""
+    if name not in AUDIO_PLAYERS or name == AUDIO_STATE["player"]:
+        return
+    AUDIO_STATE["player"] = name
+    logging.info("Audio player: %s.", AUDIO_PLAYERS[name])
+    proc = audio_proc
+    if proc is not None:
+        _audio_planned_restart.set()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
+
+class _PcmQueue:
+    """Decoded audio waiting for the sound card (see AUDIO_TARGET_MS).
+
+    pull() always returns n bytes at once: audio while playing, silence while
+    (re)filling to `target`. Running dry mid-play counts as an underrun and
+    refills; push() past `limit` drops the oldest audio back to `target`.
+    """
+
+    def __init__(self, target, limit):
+        self.target, self.limit = target, limit
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.playing = False
+        self.underruns = 0
+        self.dropped = 0                 # bytes
+
+    def depth(self):
+        with self._lock:
+            return len(self._buf)
+
+    def push(self, pcm):
+        with self._lock:
+            self._buf += pcm
+            if len(self._buf) > self.limit:
+                cut = len(self._buf) - self.target
+                cut -= cut % 4           # whole stereo frames
+                del self._buf[:cut]
+                self.dropped += cut
+
+    def pull(self, n):
+        with self._lock:
+            if not self.playing:
+                if len(self._buf) < self.target:
+                    return bytes(n)
+                self.playing = True
+            if len(self._buf) >= n:
+                out = bytes(self._buf[:n])
+                del self._buf[:n]
+                return out
+            out = bytes(self._buf) + bytes(n - len(self._buf))
+            self._buf.clear()
+            self.playing = False
+            self.underruns += 1
+            return out
+
+
+class _BuiltinAudio:
+    """One run of the built-in player.
+
+    One thread decodes the host's Opus with PyAV from a socket we own (PyAV
+    reads this object like a file), another feeds Qt's audio output from a
+    _PcmQueue. It has Popen's face (terminate, poll, wait, returncode), so the
+    restart loop, mute and shutdown treat it like an ffplay process. It ends
+    by itself on a stall (nothing decoded for AUDIO_STALL_SECS), when the
+    sound card stops taking audio, or when the default output changes
+    (`planned`: not a glitch). `unavailable` says ffplay has to take over.
+    shortcut: always plays stereo (surround is downmixed); upgrade if a
+    surround client shows up.
+    """
+
+    def __init__(self, port=None):
+        self.queue = _PcmQueue(AUDIO_TARGET_MS * _PCM_PER_MS, AUDIO_LIMIT_MS * _PCM_PER_MS)
+        self.returncode = None
+        self.tail = []                   # why it ended, for the exit report
+        self.planned = False
+        self.unavailable = None
+        self._stop = threading.Event()
+        self._last_pcm = time.time()
+        self._left = b""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            self.sock.bind(("0.0.0.0", UDP_AUDIO_PORT if port is None else port))
+        except OSError:
+            self.sock.close()
+            raise
+        self.sock.settimeout(0.2)
+        self._threads = [threading.Thread(target=self._decode, name="Audio-decode", daemon=True),
+                         threading.Thread(target=self._play, name="Audio-output", daemon=True)]
+        for t in self._threads:
+            t.start()
+
+    # ── Popen's face ──
+    def _end(self, rc, why=None):
+        if self.returncode is None:
+            self.returncode = rc
+            if why:
+                self.tail.append(why)
+        self._stop.set()
+
+    def terminate(self):
+        self._end(-15)
+
+    def poll(self):
+        return None if any(t.is_alive() for t in self._threads) else self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.time() + timeout
+        for t in self._threads:
+            t.join(None if deadline is None else max(0.0, deadline - time.time()))
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("built-in audio player", timeout)
+        return self.returncode
+
+    # ── decoding ──
+    def read(self, size):
+        """PyAV's input: one datagram at a time; b"" (end of stream) stops it."""
+        if self._left:
+            data, self._left = self._left[:size], self._left[size:]
+            return data
+        while not self._stop.is_set():
+            if time.time() - self._last_pcm > AUDIO_STALL_SECS:
+                logging.warning("Audio stalled: nothing decoded for %.0fs — restarting the "
+                                "built-in player.", AUDIO_STALL_SECS)
+                AUDIO_STATE["stalls"] += 1
+                self._end(1, f"nothing decoded for {AUDIO_STALL_SECS:.0f}s")
+                break
+            try:
+                data = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                self._end(1, f"socket: {e}")
+                break
+            if len(data) > size:
+                data, self._left = data[:size], data[size:]
+            return data
+        return b""
+
+    def _decode(self):
+        container = None
+        try:
+            container = av.open(self, format="mpegts", options={
+                "probesize": "32", "analyzeduration": "0",
+                "fflags": "nobuffer+discardcorrupt", "scan_all_pmts": "1"})
+            stream = next((s for s in container.streams if s.type == "audio"), None)
+            if stream is None:
+                self._end(1, "no audio stream in the host's MPEG-TS")
+                return
+            resampler = av.AudioResampler(format="s16", layout="stereo", rate=48000)
+            first = True
+            for packet in container.demux(stream):
+                if self._stop.is_set():
+                    break
+                try:
+                    frames = packet.decode()
+                except av.error.FFmpegError:
+                    continue             # a damaged packet; the next one decodes
+                for frame in frames:
+                    for out in resampler.resample(frame):
+                        self.queue.push(out.to_ndarray().tobytes())
+                    self._last_pcm = time.time()
+                    if first:
+                        first = False
+                        logging.info("Audio stream detected — built-in player, %d ms buffer.",
+                                     AUDIO_TARGET_MS)
+        except Exception as e:
+            self._end(1, f"decoder: {e}")
+        finally:
+            self._end(0)
+            try:
+                if container is not None:
+                    container.close()
+            except Exception:
+                pass
+            self.sock.close()
+
+    # ── playing ──
+    def _play(self):
+        try:
+            from PyQt5.QtMultimedia import QAudio, QAudioDeviceInfo, QAudioFormat, QAudioOutput
+        except ImportError as e:
+            self.unavailable = f"PyQt5.QtMultimedia is missing ({e})"
+            self._end(1, self.unavailable)
+            return
+        fmt = QAudioFormat()
+        fmt.setSampleRate(48000)
+        fmt.setChannelCount(2)
+        fmt.setSampleSize(16)
+        fmt.setCodec("audio/pcm")
+        fmt.setByteOrder(QAudioFormat.LittleEndian)
+        fmt.setSampleType(QAudioFormat.SignedInt)
+        device = QAudioDeviceInfo.defaultOutputDevice()
+        name = device.deviceName()
+        if device.isNull() or not device.isFormatSupported(fmt):
+            self.unavailable = f"no output device takes 48 kHz 16-bit stereo ({name or 'none'})"
+            self._end(1, self.unavailable)
+            return
+        out = QAudioOutput(device, fmt)
+        out.setBufferSize(AUDIO_DEVICE_MS * _PCM_PER_MS)
+        out.setNotifyInterval(0)
+        sink = out.start()
+        if sink is None or out.error() != QAudio.NoError:
+            self.unavailable = f"output {name!r} did not open (error {int(out.error())})"
+            self._end(1, self.unavailable)
+            return
+        logging.info("Audio output: %s (built-in player).", name)
+        q = self.queue
+        quiet_since = stuck_since = None
+        next_device_check = report_at = time.time()
+        seen = (0, 0)
+        try:
+            while not self._stop.is_set():
+                now = time.time()
+                period = out.periodSize() or 1920
+                free = out.bytesFree()
+                if free >= period:
+                    stuck_since = None
+                elif stuck_since is None:
+                    stuck_since = now
+                elif now - stuck_since > AUDIO_OUTPUT_STUCK_SECS:
+                    self._end(1, f"the sound card ({name}) took no audio for "
+                                 f"{AUDIO_OUTPUT_STUCK_SECS:.0f}s")
+                    break
+                while free >= period:
+                    pcm = q.pull(period)
+                    quiet_since = self._watch_level(pcm, now, quiet_since)
+                    sink.write(bytes(period) if AUDIO_STATE["muted"] else pcm)
+                    free -= period
+                if now >= next_device_check:
+                    next_device_check = now + 2.0
+                    current = QAudioDeviceInfo.defaultOutputDevice().deviceName()
+                    if current and current != name:
+                        logging.info("Audio: the default output is now %s — moving the "
+                                     "built-in player there.", current)
+                        self.planned = True
+                        self._end(0)
+                        break
+                if now - report_at >= 60.0:
+                    cur = (q.underruns, q.dropped)
+                    if cur != seen:
+                        logging.info("Audio: the buffer ran dry %d times and %.2fs of late audio "
+                                     "was dropped in the last %.0fs (holding %d ms now).",
+                                     cur[0] - seen[0], (cur[1] - seen[1]) / (_PCM_PER_MS * 1000),
+                                     now - report_at, q.depth() // _PCM_PER_MS)
+                    seen, report_at = cur, now
+                time.sleep(0.01)
+        except Exception as e:
+            self._end(1, f"output: {e}")
+        finally:
+            self._end(0)
+            try:
+                out.stop()
+            except Exception:
+                pass
+            AUDIO_STATE["dry"] += q.underruns
+            AUDIO_STATE["dropped"] += q.dropped / (_PCM_PER_MS * 1000)
+
+    @staticmethod
+    def _watch_level(pcm, now, quiet_since):
+        """Silence bookkeeping on what is actually played; returns quiet_since."""
+        a = np.frombuffer(pcm, dtype=np.int16)
+        if a.size and (a.max() >= _SILENCE_PEAK or a.min() <= -_SILENCE_PEAK):
+            _audio_sound_back(now)
+            return None
+        if quiet_since is None:
+            return now
+        if now - quiet_since >= AUDIO_SILENCE_SECS:
+            _audio_went_silent(now)
+        return quiet_since
+
+
+def audio_listener(host_ip, enabled=True, muted=False):
+    """Play the host's Opus stream, restarting the player whenever it dies.
+
+    AUDIO_STATE["player"] picks the built-in player (the default) or ffplay.
     After heavy packet loss the mpegts demuxer can lose sync and stay silent
-    for the rest of the session; the stall watchdog below replaces a player
-    that decodes nothing for AUDIO_STALL_SECS, with or without data arriving.
-    (ffmpeg's UDP input ignores rw_timeout, so the URL carries none.)
+    for the rest of the session; both players are replaced when they decode
+    nothing for AUDIO_STALL_SECS, with or without data arriving. (ffmpeg's
+    UDP input ignores rw_timeout, so ffplay's URL carries none.)
     """
     global _audio_listener_started
     if not enabled:
-        logging.info("Audio disabled — ffplay listener not started.")
+        logging.info("Audio disabled — no player started.")
         return None
     if _audio_listener_started:
         return None   # one listener process for all windows (port 6001)
@@ -1006,115 +1304,138 @@ def audio_listener(host_ip, enabled=True, muted=False):
     afilter += (f",asplit[out][beat];[beat]aselect='not(mod(n,{AUDIO_BEAT_FRAMES}))',"
                 f"ashowinfo,anullsink;[out]anull")
 
-    def loop():
+    def run_ffplay(tail):
+        """One ffplay run, its output parsed until it ends; returns the process."""
         global audio_proc
         url = f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576"
-        restarts = 0
-        while not audio_stop.is_set():
-            cmd = [
-                "ffplay",
-                "-hide_banner", "-loglevel", "info",
-                "-nodisp", "-autoexit",
-                "-volume", "0" if AUDIO_STATE["muted"] else "100",
-                # ffplay's default 5 s stream analysis meant ~4.8 s of nothing
-                # after every (re)start — each stall recovery, glitch restart
-                # and mute toggle. The TS descriptors already carry what the
-                # Opus decoder needs: measured 0.2 s to first sound.
-                "-probesize", "32", "-analyzeduration", "0",
-                "-fflags", "nobuffer+discardcorrupt",
-                # Audio as the master clock plays every packet on arrival and
-                # never catches up: no reserve (crackle, then a dead output on
-                # the Mac after a ~1 s stall) and a late start stays late
-                # (2 s on 2026-11-13). The external clock runs 0.9-1.01x to
-                # hold 2-10 packets queued, so the delay stays bounded.
-                "-sync", "ext",
-                "-af", afilter,
-                "-f", "mpegts",
-                url,
-            ]
-            tail = []                    # last few non-clock lines, for the exit report
-            proc = None
+        cmd = [
+            "ffplay",
+            "-hide_banner", "-loglevel", "info",
+            "-nodisp", "-autoexit",
+            "-volume", "0" if AUDIO_STATE["muted"] else "100",
+            # ffplay's default 5 s stream analysis meant ~4.8 s of nothing
+            # after every (re)start — each stall recovery, glitch restart
+            # and mute toggle. The TS descriptors already carry what the
+            # Opus decoder needs: measured 0.2 s to first sound.
+            "-probesize", "32", "-analyzeduration", "0",
+            "-fflags", "nobuffer+discardcorrupt",
+            # Audio as the master clock plays every packet on arrival and
+            # never catches up: no reserve (crackle, then a dead output on
+            # the Mac after a ~1 s stall) and a late start stays late
+            # (2 s on 2026-11-13). The external clock runs 0.9-1.01x to
+            # hold 2-10 packets queued, so the delay stays bounded.
+            "-sync", "ext",
+            "-af", afilter,
+            "-f", "mpegts",
+            url,
+        ]
+        logging.debug("Audio listener command: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0            # binary: the reader below parses bytes
+        )
+        audio_proc = proc
+        if audio_stop.is_set():
+            # Shutdown sampled audio_proc before this spawn assigned
+            # it, so nothing else will ever stop this player: an
+            # orphan would keep UDP 6001 and play on after exit.
             try:
-                logging.debug("Audio listener command: %s", " ".join(cmd))
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    bufsize=0            # binary: the reader below parses bytes
-                )
-                audio_proc = proc
-                if audio_stop.is_set():
-                    # Shutdown sampled audio_proc before this spawn assigned
-                    # it, so nothing else will ever stop this player: an
-                    # orphan would keep UDP 6001 and play on after exit.
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    break
-                last_clock = None
-                last_progress = None         # last decoded-audio heartbeat
-                buf = b""
-                while True:
-                    if audio_stop.is_set():
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
-                        break
-                    # Checked on every pass: ffplay prints a status line every
-                    # ~30 ms whether or not audio decodes, so waiting for a
-                    # quiet pipe would never get here.
-                    if (last_progress is not None
-                            and time.time() - last_progress > AUDIO_STALL_SECS):
-                        logging.warning(
-                            "Audio stalled: nothing decoded for %.0fs (clock at %.1fs) — restarting the player.",
-                            AUDIO_STALL_SECS, last_clock or 0.0)
-                        AUDIO_STATE["stalls"] += 1
-                        try:
-                            # Release UDP 6001 before the restart, or the
-                            # replacement player would receive nothing.
-                            proc.terminate()
-                        except Exception:
-                            pass
-                        break
-                    ready, _, _ = select.select([proc.stdout], [], [], 1.0)
-                    if not ready:
-                        if proc.poll() is not None:
-                            break
-                        continue
-                    chunk = proc.stdout.read(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while True:
-                        m = re.search(rb"[\r\n]", buf)
-                        if not m:
-                            break
-                        line = buf[:m.start()].decode("utf-8", errors="replace").strip()
-                        buf = buf[m.end():]
-                        if not line:
-                            continue
-                        clock = _parse_ffplay_clock(line)
-                        if clock is not None:
-                            if last_clock is None:
-                                logging.info("Audio stream detected — playout clock running.")
-                            last_clock = clock
-                        elif "ashowinfo" in line:
-                            last_progress = time.time()
-                        elif _audio_silence_line(line):
-                            pass
-                        else:
-                            if "Audio:" in line:
-                                logging.info(line)
-                            tail.append(line[:160])
-                            del tail[:-4]
-                    if buf and len(buf) > 8192:      # runaway line: drop it
-                        buf = b""
+                proc.terminate()
+            except Exception:
+                pass
+            return proc
+        last_clock = None
+        last_progress = None         # last decoded-audio heartbeat
+        buf = b""
+        while True:
+            if audio_stop.is_set():
                 try:
-                    proc.wait(timeout=2)
+                    proc.terminate()
                 except Exception:
                     pass
+                break
+            # Checked on every pass: ffplay prints a status line every
+            # ~30 ms whether or not audio decodes, so waiting for a
+            # quiet pipe would never get here.
+            if (last_progress is not None
+                    and time.time() - last_progress > AUDIO_STALL_SECS):
+                logging.warning(
+                    "Audio stalled: nothing decoded for %.0fs (clock at %.1fs) — restarting the player.",
+                    AUDIO_STALL_SECS, last_clock or 0.0)
+                AUDIO_STATE["stalls"] += 1
+                try:
+                    # Release UDP 6001 before the restart, or the
+                    # replacement player would receive nothing.
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                m = re.search(rb"[\r\n]", buf)
+                if not m:
+                    break
+                line = buf[:m.start()].decode("utf-8", errors="replace").strip()
+                buf = buf[m.end():]
+                if not line:
+                    continue
+                clock = _parse_ffplay_clock(line)
+                if clock is not None:
+                    if last_clock is None:
+                        logging.info("Audio stream detected — playout clock running.")
+                    last_clock = clock
+                elif "ashowinfo" in line:
+                    last_progress = time.time()
+                elif _audio_silence_line(line):
+                    pass
+                else:
+                    if "Audio:" in line:
+                        logging.info(line)
+                    tail.append(line[:160])
+                    del tail[:-4]
+            if buf and len(buf) > 8192:      # runaway line: drop it
+                buf = b""
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return proc
+
+    def run_builtin():
+        """One run of the built-in player, until it ends; returns it."""
+        global audio_proc
+        proc = _BuiltinAudio()
+        audio_proc = proc
+        while proc.poll() is None:
+            if audio_stop.is_set():
+                proc.terminate()     # also covers a shutdown that missed audio_proc
+            time.sleep(0.1)
+        return proc
+
+    def loop():
+        global audio_proc
+        restarts = 0
+        while not audio_stop.is_set():
+            player = AUDIO_STATE["player"]
+            AUDIO_STATE["used"].add(player)
+            tail = []                    # last few lines, for the exit report
+            proc = None
+            try:
+                if player == "builtin":
+                    proc = run_builtin()
+                    tail = proc.tail
+                else:
+                    proc = run_ffplay(tail)
             except Exception as e:
                 logging.error("Audio listener failed: %s", e)
             finally:
@@ -1123,8 +1444,13 @@ def audio_listener(host_ip, enabled=True, muted=False):
                 _audio_end_silence()
             if audio_stop.is_set():
                 break
-            if _audio_mute_restart.is_set():
-                _audio_mute_restart.clear()      # volume change, not a glitch
+            if getattr(proc, "unavailable", None):
+                logging.warning("Built-in audio player unavailable (%s) — using ffplay.",
+                                proc.unavailable)
+                AUDIO_STATE["player"] = "ffplay"
+                continue
+            if _audio_planned_restart.is_set() or getattr(proc, "planned", False):
+                _audio_planned_restart.clear()   # a new volume, player or device: no glitch
                 continue
             restarts += 1
             AUDIO_STATE["restarts"] = restarts
@@ -3030,6 +3356,21 @@ class MainWindow(QMainWindow):
         self.mute_action.setEnabled(bool(self._audio_enabled))
         self.mute_action.toggled.connect(set_audio_muted)
         audio.addAction(self.mute_action)
+        # Live switch for the A/B of the two players (2026-11 audit).
+        player = audio.addMenu("Player")
+        player.setEnabled(bool(self._audio_enabled))
+        group = QActionGroup(self)
+        self.player_actions = {}
+        for key, label in AUDIO_PLAYERS.items():
+            act = QAction(label, self, checkable=True)
+            act.triggered.connect(lambda _on, k=key: set_audio_player(k))
+            group.addAction(act)
+            player.addAction(act)
+            self.player_actions[key] = act
+        # The built-in player can hand over to ffplay by itself (no QtMultimedia).
+        player.aboutToShow.connect(
+            lambda: self.player_actions[AUDIO_STATE["player"]].setChecked(True))
+        self.player_actions[AUDIO_STATE["player"]].setChecked(True)
         view = bar.addMenu("View")
         stats = QAction("Toggle Stats Overlay (F1)", self)
         stats.triggered.connect(self.toggle_stats)

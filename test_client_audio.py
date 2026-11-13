@@ -6,7 +6,8 @@ player's clock kept running on a stream of digital silence. These tests pin
 what replaced that blind spot:
 
   1. silence bookkeeping and the end-of-session audio report;
-  2. mute is a volume change, never counted as a glitch;
+  2. mute is a volume change, never counted as a glitch, and a player switch
+     neither; 2b. the built-in player's buffer rules;
   3. the status banner says what the picture and sound cannot;
   4. live: a real Opus stream of silence, then tone, through ffplay — the
      silence is reported while the clock runs, and its end too. The player
@@ -14,9 +15,13 @@ what replaced that blind spot:
   5. live: tone, then datagrams that never decode — ffplay's clock keeps
      ticking on wall time, so only the decoded-frame heartbeat sees the
      stall, and the player is replaced.
+  6./7. live: the same through the built-in player, plus a burst cut back to
+     the buffer target and a switch to ffplay mid-stream (muted: it plays zeros).
 
-Sections 4 and 5 need ffmpeg and ffplay with libopus; they are skipped otherwise.
+Sections 4-5 need ffmpeg and ffplay with libopus, 6-7 ffmpeg and
+PyQt5.QtMultimedia; they are skipped otherwise.
 """
+import socket
 import logging
 import os
 import shutil
@@ -83,16 +88,50 @@ class _Proc:
 
 client.audio_proc = _Proc()
 client.set_audio_muted(True)
-assert st["muted"] and _Proc.terminated and client._audio_mute_restart.is_set()
-client._audio_mute_restart.clear()
+assert st["muted"] and _Proc.terminated and client._audio_planned_restart.is_set()
+client._audio_planned_restart.clear()
 _Proc.terminated = False
 client.set_audio_muted(True)                          # no change: no restart
 assert not _Proc.terminated
 client.set_audio_muted(False)
 assert not st["muted"] and st["muted_since"] is None and st["muted_total"] >= 0.0
-client._audio_mute_restart.clear()
+client._audio_planned_restart.clear()
+
+
+class _Builtin(client._BuiltinAudio):
+    def __init__(self):                               # no socket, no threads
+        self.stopped = False
+
+    def terminate(self):
+        self.stopped = True
+
+
+client.audio_proc = _Builtin()
+client.set_audio_muted(True)                          # the built-in player reads the flag
+assert not client.audio_proc.stopped and not client._audio_planned_restart.is_set()
+client.set_audio_muted(False)
+client.set_audio_player("ffplay")                     # switching is a planned restart
+assert client.audio_proc.stopped and client._audio_planned_restart.is_set()
+assert st["player"] == "ffplay"
+client._audio_planned_restart.clear()
 client.audio_proc = None
-ok("mute/unmute restarts the player at the new volume, once per change")
+st["player"] = "builtin"
+ok("mute restarts ffplay at the new volume (not the built-in player); a player switch "
+   "is a planned restart")
+
+# ── 2b. the built-in player's buffer rules ────────────────────────────
+q = client._PcmQueue(target=8, limit=20)
+assert q.pull(4) == bytes(4) and not q.playing, "silence until the target is buffered"
+q.push(b"\x01" * 8)
+assert q.pull(4) == b"\x01" * 4 and q.playing
+assert q.pull(4) == b"\x01" * 4
+assert q.pull(4) == bytes(4) and q.underruns == 1 and not q.playing, "ran dry: refill"
+q.push(b"\x02" * 4)
+assert q.pull(4) == bytes(4), "still refilling: 4 of 8 bytes"
+q.push(b"\x03" * 24)                                  # a burst past the limit …
+assert q.depth() == 8 and q.dropped == 20, (q.depth(), q.dropped)
+assert q.pull(8) == b"\x03" * 8, "… keeps the newest audio, at the target"
+ok("built-in buffer: silence while filling, refill after running dry, bursts cut to target")
 
 # ── 3. the status banner ──────────────────────────────────────────────
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
@@ -154,6 +193,7 @@ have = all(shutil.which(b) for b in ("ffmpeg", "ffplay"))
 if not have:
     skip("live silence detection", "ffmpeg/ffplay not installed")
 else:
+    st["player"] = "ffplay"                           # sections 4-5 are ffplay's
     records.clear()
     st.update(restarts=0, stalls=0, silent_since=None, silence_total=0.0,
               silence_longest=0.0, muted=False, muted_since=None, muted_total=0.0)
@@ -235,6 +275,97 @@ else:
         if listener:
             listener.join(timeout=5)
     ok("live: undecodable data while the clock ticks is caught and the player replaced")
+
+
+# ── 6./7. live: the built-in player ───────────────────────────────────
+def _opus_pump(lavfi, realtime=True):
+    """ffmpeg sending lavfi audio the way the host does (Opus, 20 ms, MPEG-TS)."""
+    return subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", *(["-re"] if realtime else []),
+         "-f", "lavfi", "-i", lavfi, "-c:a", "libopus", "-b:a", "128k",
+         "-frame_duration", "20", "-ar", "48000", "-ac", "2",
+         "-f", "mpegts", f"udp://127.0.0.1:{client.UDP_AUDIO_PORT}?pkt_size=1316"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _wait_for(text, secs):
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        if any(text in m for m in records):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _fresh_listener():
+    records.clear()
+    client.audio_stop.clear()
+    client._audio_listener_started = False
+    st.update(player="builtin", restarts=0, stalls=0, silent_since=None, silence_total=0.0,
+              silence_longest=0.0, muted=False, muted_since=None, muted_total=0.0)
+    return client.audio_listener("127.0.0.1", enabled=True, muted=True)
+
+
+def _stop_listener(listener):
+    client.audio_stop.set()
+    if client.audio_proc:
+        client.audio_proc.terminate()
+    if listener:
+        listener.join(timeout=5)
+
+
+try:
+    from PyQt5 import QtMultimedia  # noqa: F401
+    have_builtin = shutil.which("ffmpeg") is not None
+except ImportError:
+    have_builtin = False
+
+if not have_builtin:
+    skip("live built-in player", "ffmpeg or PyQt5.QtMultimedia missing")
+else:
+    listener = None
+    pump = _opus_pump("aevalsrc='if(lt(t,12),0,0.1*sin(2*PI*440*t))':s=48000:d=14")
+    try:
+        listener = _fresh_listener()                  # muted: plays zeros
+        assert _wait_for("sound again after", 30), records[-8:]
+        player = client.audio_proc
+        assert isinstance(player, client._BuiltinAudio), player
+        assert any("stream detected — built-in player" in m for m in records), records[-8:]
+        assert any("stream silent for" in m for m in records), records[-8:]
+        pump.wait(timeout=10)
+        # A stall's backlog arriving at once (3 s of audio, unpaced) is cut to the target.
+        _opus_pump("sine=frequency=440:duration=3", realtime=False).wait(timeout=10)
+        time.sleep(0.5)
+        assert player.queue.dropped >= 2 * 1000 * client._PCM_PER_MS, player.queue.dropped
+        assert player.queue.depth() <= client.AUDIO_LIMIT_MS * client._PCM_PER_MS
+        # Switching to ffplay while audio flows is a planned restart.
+        pump = _opus_pump("sine=frequency=440:duration=6")
+        time.sleep(0.5)
+        client.set_audio_player("ffplay")
+        assert _wait_for("playout clock running", 10), records[-8:]
+        assert st["restarts"] == 0, "silence, a burst and a switch are not glitches"
+    finally:
+        pump.terminate()
+        _stop_listener(listener)
+    ok("live built-in player: silence then sound, a burst cut to the target, switch to ffplay")
+
+    listener = None
+    junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    stall_secs, client.AUDIO_STALL_SECS = client.AUDIO_STALL_SECS, 3.0
+    try:
+        listener = _fresh_listener()
+        _opus_pump("sine=frequency=440:duration=2").wait(timeout=10)
+        assert any("stream detected — built-in player" in m for m in records), records[-8:]
+        deadline = time.time() + 15                   # ~3 s when healthy
+        while time.time() < deadline and not st["stalls"]:
+            junk.sendto(os.urandom(1128), ("127.0.0.1", client.UDP_AUDIO_PORT))
+            time.sleep(0.02)
+        assert st["stalls"] >= 1 and any("nothing decoded" in m for m in records), records[-8:]
+    finally:
+        junk.close()
+        client.AUDIO_STALL_SECS = stall_secs
+        _stop_listener(listener)
+    ok("live built-in player: undecodable data is caught and the player replaced")
 
 
 print(f"\nALL {len(PASS)} CLIENT AUDIO TESTS PASSED"
