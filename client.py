@@ -865,24 +865,41 @@ def _fmt_secs(secs):
     return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
 
 
-def _audio_silence_line(line, now=None):
-    """Fold one silencedetect line from the player into AUDIO_STATE."""
-    now = time.time() if now is None else now
+def _audio_went_silent(now):
+    """The player has played AUDIO_SILENCE_SECS of silence: note it, once."""
     st = AUDIO_STATE
+    if st["silent_since"] is None:
+        st["silent_since"] = now - AUDIO_SILENCE_SECS
+        logging.info("Audio: stream silent for %ds+ while the playout clock runs "
+                     "(nothing playing on the host, or it captures an idle source).",
+                     AUDIO_SILENCE_SECS)
+
+
+def _audio_sound_back(now):
+    """Sound after a silence: bank its length.
+
+    Timed by the wall clock, not silencedetect's silence_duration: the stream's
+    timestamps start again at 0 whenever the host restarts its encoder, which
+    turned a 2-minute silence into "4h59m" and a run into "silent 246%".
+    """
+    st = AUDIO_STATE
+    if st["silent_since"] is None:
+        return
+    dur = now - st["silent_since"]
+    st["silent_since"] = None
+    st["silence_total"] += dur
+    st["silence_longest"] = max(st["silence_longest"], dur)
+    logging.info("Audio: sound again after %s of silence.", _fmt_secs(dur))
+
+
+def _audio_silence_line(line, now=None):
+    """Fold one silencedetect line from ffplay into AUDIO_STATE."""
+    now = time.time() if now is None else now
     if "silence_start:" in line:
-        if st["silent_since"] is None:
-            st["silent_since"] = now - AUDIO_SILENCE_SECS
-            logging.info("Audio: stream silent for %ds+ while the playout clock runs "
-                         "(nothing playing on the host, or it captures an idle source).",
-                         AUDIO_SILENCE_SECS)
+        _audio_went_silent(now)
         return True
     if "silence_end:" in line:
-        m = re.search(r"silence_duration:\s*([\d.]+)", line)
-        dur = float(m.group(1)) if m else (now - (st["silent_since"] or now))
-        st["silent_since"] = None
-        st["silence_total"] += dur
-        st["silence_longest"] = max(st["silence_longest"], dur)
-        logging.info("Audio: sound again after %s of silence.", _fmt_secs(dur))
+        _audio_sound_back(now)
         return True
     return False
 

@@ -59,8 +59,10 @@ st.update(started=1000.0, silent_since=None, silence_total=0.0, silence_longest=
 assert client._audio_silence_line("[silencedetect @ 0x1] silence_start: 3.2", now=1100.0)
 assert st["silent_since"] == 1100.0 - client.AUDIO_SILENCE_SECS
 assert any("stream silent for" in m for m in records)
+# silence_duration is in stream time, which a host encoder restart sends back
+# to 0: the wall clock (60 s here) is what counts.
 assert client._audio_silence_line(
-    "[silencedetect @ 0x1] silence_end: 63.2 | silence_duration: 60.0", now=1150.0)
+    "[silencedetect @ 0x1] silence_end: 9.0 | silence_duration: 17970.0", now=1150.0)
 assert st["silence_longest"] == 60.0 and st["silent_since"] is None
 assert any(m == "Audio: sound again after 1m00s of silence." for m in records)
 assert not client._audio_silence_line("  12.34 M-A:  0.000 fd=   0 aq=   0KB")
