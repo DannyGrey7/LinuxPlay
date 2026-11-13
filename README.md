@@ -73,8 +73,9 @@ Thanks to the upstream author for building the thing in the first place — with
   - A watchdog restarts the client's player if its playout clock stops (it plays again in
     ~0.2 s), and digital silence while the clock runs is logged on both ends. Each session ends
     with an `Audio report:` line on host and client (sources, restarts, share of silence).
-  - Mute without disconnecting: **Audio ▸ Mute Host Audio** (⌘⇧M) on macOS, `--mute`, or
-    "muted" in the launcher. The stream keeps being watched; only playback is silent.
+  - Mute without disconnecting: **Audio ▸ Mute Host Audio** on macOS (no shortcut: every ⌘
+    key combination goes to the host), `--mute`, or "muted" in the launcher. The stream keeps
+    being watched; only playback is silent.
 - **Granular Encoder Control**
   - Direct control over FFmpeg parameters: **GOP, QP/CRF, Preset, Tune, and Pixel Format (`yuv420p`, `yuv444p`)** are fully exposed via command line arguments.
 - **Advanced Capture Methods**

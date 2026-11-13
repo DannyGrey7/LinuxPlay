@@ -23,8 +23,7 @@ from queue import Queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QMessageBox, QOpenGLWidget,
                              QInputDialog, QWidget, QLabel, QAction)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QRectF
-from PyQt5.QtGui import (QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath,
-                         QKeySequence)
+from PyQt5.QtGui import QSurfaceFormat, QPainter, QPen, QColor, QFont, QPainterPath
 
 from OpenGL.GL import *
 
@@ -2988,11 +2987,13 @@ class MainWindow(QMainWindow):
         logging.info("Decoder thread started")
 
     def _build_menu(self):
-        """macOS menu bar: Audio ▸ Mute Host Audio (⌘⇧M), View ▸ Stats Overlay.
+        """macOS menu bar: Audio ▸ Mute Host Audio, View ▸ Stats Overlay.
 
         The menu bar lives in the system bar on macOS, so it costs the video
-        nothing; other platforms keep upstream's bare window. A menu shortcut
-        is consumed here, never forwarded to the host as a key press.
+        nothing; other platforms keep upstream's bare window. No shortcut on
+        the mute: ⌘ goes to the host as Ctrl, so ⌘⇧M was a host app's
+        Ctrl+Shift+M (Discord's mute) that silently muted the stream here
+        instead — 50 h on 2026-11-10.
         """
         if not IS_MAC:
             return
@@ -3000,7 +3001,6 @@ class MainWindow(QMainWindow):
         audio = bar.addMenu("Audio")
         self.mute_action = QAction("Mute Host Audio", self)
         self.mute_action.setCheckable(True)
-        self.mute_action.setShortcut(QKeySequence("Ctrl+Shift+M"))
         self.mute_action.setChecked(bool(AUDIO_STATE["muted"] or self._audio_muted))
         self.mute_action.setEnabled(bool(self._audio_enabled))
         self.mute_action.toggled.connect(set_audio_muted)
