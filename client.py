@@ -3803,8 +3803,11 @@ def main():
         pass
 
     LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
-    LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-    LOG_DATEFMT = "%H:%M:%S"
+    # Date and milliseconds: a log that spans days had to be dated by hand, and
+    # pairing its audio events with the host's to measure the audio delay
+    # needs better than whole seconds.
+    LOG_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s"
+    LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
     root_logger = logging.getLogger()
     root_logger.setLevel(LOG_LEVEL)

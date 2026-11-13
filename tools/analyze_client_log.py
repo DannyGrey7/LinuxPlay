@@ -14,7 +14,9 @@ import statistics
 import sys
 from collections import Counter
 
-PACING = re.compile(r"^(\d\d):(\d\d):(\d\d) \[INFO\] Frame pacing: (\d+) frames in ([\d.]+)s "
+# Client logs since 2026-11 carry the date and milliseconds; older ones and the probe do not.
+STAMP = r"^(?:\d{4}-\d\d-\d\d )?(\d\d):(\d\d):(\d\d)(?:[.,]\d+)? "
+PACING = re.compile(STAMP + r"\[INFO\] Frame pacing: (\d+) frames in ([\d.]+)s "
                     r"\(([\d.]+) fps\), max gap (\d+) ms")
 OLD = re.compile(r"(\d+) corrupt, (\d+) ts-errors")
 NEW = re.compile(r"loss: (\d+) damaged, (\d+) held, (\d+) refused, (\d+) corrupt, "
@@ -47,7 +49,7 @@ def analyze(path):
     day = 0
     prev = None
     for line in open(path, errors="ignore"):
-        m = re.match(r"^(\d\d):(\d\d):(\d\d) \[(\w+)\]", line)
+        m = re.match(STAMP + r"\[(\w+)\]", line)
         if m:
             t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
             if prev is not None and prev - t > 7200:
