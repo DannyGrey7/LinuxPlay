@@ -781,6 +781,7 @@ else:
         skip("kscreen monitor detection", f"no usable monitors reported: {ks}")
     else:
         ok(f"kscreen parser finds {len(ks)} monitor(s)")
+        host.host_state.monitors = []     # the session tests above left a fake 1920x1080
         vw, vh = host._virtual_screen_size()
         assert (vw, vh) == (max(w + x for w, h, x, y in ks),
                             max(h + y for w, h, x, y in ks)), (vw, vh)
