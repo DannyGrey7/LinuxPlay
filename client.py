@@ -1022,6 +1022,12 @@ def audio_listener(host_ip, enabled=True, muted=False):
                 # Opus decoder needs: measured 0.2 s to first sound.
                 "-probesize", "32", "-analyzeduration", "0",
                 "-fflags", "nobuffer+discardcorrupt",
+                # Audio as the master clock plays every packet on arrival and
+                # never catches up: no reserve (crackle, then a dead output on
+                # the Mac after a ~1 s stall) and a late start stays late
+                # (2 s on 2026-11-13). The external clock runs 0.9-1.01x to
+                # hold 2-10 packets queued, so the delay stays bounded.
+                "-sync", "ext",
                 "-af", afilter,
                 "-f", "mpegts",
                 url,
