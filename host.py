@@ -3698,7 +3698,9 @@ def resource_monitor():
         cpu = p.cpu_percent(interval=1)
         mem = get_host_memory_mb()
         gpu_info = read_gpu_usage()
-        logging.info(f"[MONITOR] CPU: {cpu:.1f}% | RAM: {mem:.1f} MB" + (f" | {gpu_info}" if gpu_info else ""))
+        # Debug: every 6 s at INFO it was 99% of host-launch.log and cut host.log's
+        # four 2 MB files to ~5 days of history.
+        logging.debug(f"[MONITOR] CPU: {cpu:.1f}% | RAM: {mem:.1f} MB" + (f" | {gpu_info}" if gpu_info else ""))
         time.sleep(5)
 
 def stats_broadcast():
@@ -4503,9 +4505,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Dated: this console output is host-launch.log, which spans days.
     logging.basicConfig(level=(logging.DEBUG if args.debug else logging.INFO),
                         format="%(asctime)s [%(levelname)s] %(message)s",
-                        datefmt="%H:%M:%S")
+                        datefmt="%Y-%m-%d %H:%M:%S")
     host_state.log_path = _setup_file_logging(args.debug)
 
     if not IS_LINUX:
