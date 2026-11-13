@@ -298,8 +298,8 @@ else:
     got = []
 
     def _recv():
-        box = av.open(f"udp://@127.0.0.1:{port}?fifo_size=131072&overrun_nonfatal=1"
-                      f"&rw_timeout=2000000", format="mpegts", options=_client_opts())
+        box = av.open(f"udp://@127.0.0.1:{port}?fifo_size=131072&overrun_nonfatal=1",
+                      format="mpegts", options=_client_opts())
         vs = next(st for st in box.streams if st.type == "video")
         try:
             for pk in box.demux(vs):

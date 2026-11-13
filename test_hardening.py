@@ -229,12 +229,13 @@ assert client._best_ts_pkt_size(1500, True) == 1316
 assert client._best_ts_pkt_size(0, False) == 1316
 assert client._best_ts_pkt_size(1360, False) == 1316
 assert client._best_ts_pkt_size(1360, True) == 1128, "IPv6 overhead must be accounted for"
-assert "rw_timeout=5000000" in CLIENT_SRC, "a blackholed stream must fail, not freeze"
+# No rw_timeout: ffmpeg's UDP input ignores it (tested on n9.0.2: no exit in 6 s).
+assert "rw_timeout=" not in CLIENT_SRC
 assert "_video_url_for_path" in CLIENT_SRC
 assert "self.video_url = self._video_url_for_path()" in CLIENT_SRC, \
     "the URL is recomputed on every decoder (re)start"
 assert "def _route_mtu" in CLIENT_SRC
-ok("video input re-probes the path MTU and cannot freeze forever")
+ok("video input re-probes the path MTU on every (re)start")
 
 
 # ── 11. the host always leaves a log, and the launcher keeps child output ──

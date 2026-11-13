@@ -221,7 +221,7 @@ else:
         assert any("playout clock running" in m for m in records), records[-8:]
         deadline = time.time() + 15           # ~3 s when healthy
         while time.time() < deadline and not st["stalls"]:
-            # Under rw_timeout's 5 s, so only the heartbeat can notice.
+            # Data keeps arriving, so only the decoded-frame heartbeat can notice.
             junk.sendto(os.urandom(1128), ("127.0.0.1", client.UDP_AUDIO_PORT))
             time.sleep(0.02)
         assert st["stalls"] >= 1, records[-8:]

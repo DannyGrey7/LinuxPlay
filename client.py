@@ -961,8 +961,9 @@ def audio_listener(host_ip, enabled=True, muted=False):
     """Decode the host's Opus stream with ffplay, restarting it whenever it dies.
 
     After heavy packet loss the mpegts demuxer can lose sync and stay silent
-    for the rest of the session; rw_timeout makes ffplay give up after 5 s
-    without data so the restart loop swaps in a fresh demuxer.
+    for the rest of the session; the stall watchdog below replaces a player
+    that decodes nothing for AUDIO_STALL_SECS, with or without data arriving.
+    (ffmpeg's UDP input ignores rw_timeout, so the URL carries none.)
     """
     global _audio_listener_started
     if not enabled:
@@ -1007,7 +1008,7 @@ def audio_listener(host_ip, enabled=True, muted=False):
 
     def loop():
         global audio_proc
-        url = f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576&rw_timeout=5000000"
+        url = f"udp://@0.0.0.0:{UDP_AUDIO_PORT}?overrun_nonfatal=1&buffer_size=1048576"
         restarts = 0
         while not audio_stop.is_set():
             cmd = [
@@ -2942,8 +2943,9 @@ class MainWindow(QMainWindow):
 
         Called on every decoder (re)start so a client that moved between
         Wi-Fi, Ethernet and Tailscale picks up the new path MTU instead of a
-        stale one. rw_timeout matches the audio listener: a blackholed stream
-        then fails and is restarted instead of freezing on the last frame.
+        stale one. No read timeout: ffmpeg's UDP input ignores rw_timeout,
+        and `timeout=` would reconnect in a loop on a still desktop, which
+        sends no frames at all.
         """
         mtu_guess = _route_mtu(self.host_ip) or 1500
         try:
@@ -2963,7 +2965,7 @@ class MainWindow(QMainWindow):
             f"udp://@{bind}"
             f"?pkt_size={pkt}"
             f"&reuse=1&buffer_size=4194304&fifo_size=131072"
-            f"&overrun_nonfatal=1&max_delay=0&rw_timeout=5000000"
+            f"&overrun_nonfatal=1&max_delay=0"
         )
 
     def _start_video_relay(self):
