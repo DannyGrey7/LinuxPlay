@@ -188,6 +188,27 @@ finally:
     host.host_state.should_terminate = False
 ok("crashing encoder retries with backoff, then retires — host stays up")
 
+# A run that lasted ends the streak: rare failures must not add up to a retirement
+# (and a 16 s wait) over a long session.
+saved = host.STREAM_MAX_RESTARTS, host.STREAM_RESTART_MAX_DELAY, host.STREAM_HEALTHY_SECS
+host.STREAM_MAX_RESTARTS, host.STREAM_RESTART_MAX_DELAY, host.STREAM_HEALTHY_SECS = 1, 0.1, 0.3
+t = host.StreamThread([sys.executable, "-c", "import time; time.sleep(0.5); raise SystemExit(1)"],
+                      "Video lasting")
+host.host_state.video_threads[8] = t
+try:
+    t.start()
+    deadline = time.time() + 15
+    while time.time() < deadline and host.host_state.stream_restarts.get("Video lasting", 0) < 3:
+        time.sleep(0.1)
+    assert host.host_state.stream_restarts.get("Video lasting", 0) >= 3 and t.is_alive(), \
+        "failures after runs that lasted must not count as a streak"
+finally:
+    t.stop()
+    t.join(timeout=5)
+    host.STREAM_MAX_RESTARTS, host.STREAM_RESTART_MAX_DELAY, host.STREAM_HEALTHY_SECS = saved
+    host.host_state.video_threads.pop(8, None)
+ok("an encoder that ran for a while restarts from the shortest backoff, never retires")
+
 
 # ── 8. pairing approval: GUI asks, headless auto-approves ──
 host.host_state.gui_window = None

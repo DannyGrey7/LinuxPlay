@@ -80,6 +80,9 @@ HANDSHAKE_TAIL_GRACE = 0.5
 # A failing encoder is restarted with backoff instead of stopping the host.
 STREAM_MAX_RESTARTS = 5
 STREAM_RESTART_MAX_DELAY = 20.0
+# A run that lasted this long ends a failure streak: five failures spread
+# over a week are not "five in a row".
+STREAM_HEALTHY_SECS = 60.0
 
 DEFAULT_FPS = "30"
 LEGACY_BITRATE = "8M"
@@ -1282,9 +1285,12 @@ class StreamThread(threading.Thread):
             if failures:
                 self._refresh_cmd()
             if self._start_children():
+                started = time.time()
                 ret, err = self._wait_for_exit()
                 if not self._running or host_state.should_terminate:
                     break
+                if time.time() - started >= STREAM_HEALTHY_SECS:
+                    failures = 0
                 if ret == 0:
                     logging.error("%s stopped unexpectedly (exit 0).", self.name)
                 elif ret is not None:
