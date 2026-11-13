@@ -860,6 +860,9 @@ AUDIO_SILENCE_SECS = 10         # … this long is "silent" (the clock keeps run
 # the limit (the burst after a stall) is dropped back to the target.
 AUDIO_TARGET_MS = 80
 AUDIO_LIMIT_MS = 250
+# A shorter gap leaves the late packets arriving together below the limit, and
+# that delay would stay: more than twice the target for this long settles it.
+AUDIO_SETTLE_SECS = 1.0
 AUDIO_DEVICE_MS = 40            # Qt's own buffer in front of the sound card
 AUDIO_OUTPUT_STUCK_SECS = 2.0   # the sound card took nothing this long: reopen it
 _PCM_PER_MS = 192               # bytes of s16 stereo at 48 kHz
@@ -997,7 +1000,9 @@ class _PcmQueue:
 
     pull() always returns n bytes at once: audio while playing, silence while
     (re)filling to `target`. Running dry mid-play counts as an underrun and
-    refills; push() past `limit` drops the oldest audio back to `target`.
+    refills. The oldest audio is dropped back to `target` when push() goes past
+    `limit`, or when more than twice the target stays queued for
+    AUDIO_SETTLE_SECS.
     """
 
     def __init__(self, target, limit):
@@ -1007,34 +1012,47 @@ class _PcmQueue:
         self.playing = False
         self.underruns = 0
         self.dropped = 0                 # bytes
+        self._high_since = None
 
     def depth(self):
         with self._lock:
             return len(self._buf)
 
+    def _cut_to_target(self):
+        cut = len(self._buf) - self.target
+        cut -= cut % 4                   # whole stereo frames
+        if cut > 0:
+            del self._buf[:cut]
+            self.dropped += cut
+
     def push(self, pcm):
         with self._lock:
             self._buf += pcm
             if len(self._buf) > self.limit:
-                cut = len(self._buf) - self.target
-                cut -= cut % 4           # whole stereo frames
-                del self._buf[:cut]
-                self.dropped += cut
+                self._cut_to_target()
 
-    def pull(self, n):
+    def pull(self, n, now=None):
+        now = time.monotonic() if now is None else now
         with self._lock:
             if not self.playing:
                 if len(self._buf) < self.target:
                     return bytes(n)
                 self.playing = True
-            if len(self._buf) >= n:
-                out = bytes(self._buf[:n])
-                del self._buf[:n]
+            if len(self._buf) < n:
+                out = bytes(self._buf) + bytes(n - len(self._buf))
+                self._buf.clear()
+                self.playing = False
+                self.underruns += 1
                 return out
-            out = bytes(self._buf) + bytes(n - len(self._buf))
-            self._buf.clear()
-            self.playing = False
-            self.underruns += 1
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            if len(self._buf) <= 2 * self.target:
+                self._high_since = None
+            elif self._high_since is None:
+                self._high_since = now
+            elif now - self._high_since >= AUDIO_SETTLE_SECS:
+                self._cut_to_target()
+                self._high_since = None
             return out
 
 

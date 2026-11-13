@@ -131,7 +131,16 @@ assert q.pull(4) == bytes(4), "still refilling: 4 of 8 bytes"
 q.push(b"\x03" * 24)                                  # a burst past the limit …
 assert q.depth() == 8 and q.dropped == 20, (q.depth(), q.dropped)
 assert q.pull(8) == b"\x03" * 8, "… keeps the newest audio, at the target"
-ok("built-in buffer: silence while filling, refill after running dry, bursts cut to target")
+q = client._PcmQueue(target=8, limit=100)          # a delay under the limit …
+q.push(b"\x04" * 40)
+q.pull(4, now=0.0)
+q.push(b"\x04" * 4)
+q.pull(4, now=0.5)
+assert q.depth() == 36 and q.dropped == 0
+q.pull(4, now=1.0)                                    # … that stays above 2x target for 1 s
+assert q.depth() == 8 and q.dropped == 24, (q.depth(), q.dropped)
+ok("built-in buffer: silence while filling, refill after running dry, bursts and lasting "
+   "excess cut to target")
 
 # ── 3. the status banner ──────────────────────────────────────────────
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
