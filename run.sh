@@ -442,6 +442,24 @@ autostart_target() {
   printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$AUTOSTART_NAME"
 }
 
+# Plasma and GNOME run autostart entries as systemd units named by
+# systemd-xdg-autostart-generator ("-" escaped as \x2d), with Restart=no: a
+# host that crashed stayed down. This drop-in restarts it on failure; closing
+# its window (exit 0) or logging out still stops it. ExitType=main: when the
+# host dies, encoders it left behind are stopped with it instead of keeping
+# the unit "running".
+AUTOSTART_UNIT='app-linuxplay\x2dhost@autostart.service'
+
+autostart_dropin() {
+  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$AUTOSTART_UNIT.d/restart.conf"
+}
+
+autostart_reload() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
 # Desktop Entry Exec values are not shell words: quote only when needed.
 exec_field() {
   case "$1" in
@@ -485,7 +503,22 @@ X-KDE-autostart-after=panel
 EOF
   chmod 0644 "$target"
 
+  local dropin; dropin="$(autostart_dropin)"
+  mkdir -p "$(dirname "$dropin")" || bail "Could not create $(dirname "$dropin")"
+  cat > "$dropin" <<EOF
+[Unit]
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+ExitType=main
+Restart=on-failure
+RestartSec=5
+EOF
+  autostart_reload
+
   msg "Autostart entry written: $target"
+  echo "  Restart on crash (systemd): $dropin"
   echo "  $(grep -m1 '^Exec=' "$target" || true)"
   echo "  Settings come from ~/.linuxplay_start_cfg.json (the launcher's Host tab)."
   echo
@@ -501,6 +534,12 @@ EOF
 
 autostart_disable() {
   local target; target="$(autostart_target)"
+  local dropin; dropin="$(autostart_dropin)"
+  if [ -f "$dropin" ]; then
+    rm -f "$dropin" && rmdir "$(dirname "$dropin")" 2>/dev/null
+    autostart_reload
+    msg "Removed $dropin"
+  fi
   if [ -f "$target" ]; then
     rm -f "$target" && msg "Removed $target"
     echo "Note: KDE may keep its own copy of the entry's enabled/disabled state;"
@@ -522,6 +561,11 @@ autostart_status() {
   else
     msg "Installed: $target"
     grep -m1 '^Exec=' "$target" | sed 's/^/  /' || true
+  fi
+  if [ -f "$(autostart_dropin)" ]; then
+    msg "Restart on crash: $(autostart_dropin)"
+  else
+    warn "No restart on crash — run ./run.sh autostart enable to add it"
   fi
 
   section "Host state"

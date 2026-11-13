@@ -263,6 +263,8 @@ env["HOME"] = home
 env.pop("XDG_CONFIG_HOME", None)
 env.pop("LINUXPLAY_STATE_DIR", None)
 entry = os.path.join(home, ".config", "autostart", "linuxplay-host.desktop")
+dropin = os.path.join(home, ".config", "systemd", "user",
+                      "app-linuxplay\\x2dhost@autostart.service.d", "restart.conf")
 
 
 def run(*args):
@@ -284,6 +286,12 @@ assert "--headless" not in exec_line, "the entry shows the host window by defaul
 assert "X-GNOME-Autostart-enabled=true" in text
 ok("autostart enable writes a session entry that runs the repo's venv python")
 
+# Plasma/GNOME run the entry as a generated systemd unit with Restart=no.
+drop = open(dropin).read()
+assert "Restart=on-failure" in drop and "ExitType=main" in drop, drop
+assert "StartLimitBurst=" in drop, "a host that keeps crashing must not restart forever"
+ok("autostart enable adds a restart-on-crash drop-in for the generated unit")
+
 r = run("autostart", "enable", "--headless")
 assert r.returncode == 0 and "--headless" in open(entry).read()
 
@@ -294,12 +302,14 @@ assert "Installed" in r.stdout, r.stdout
 # names what is holding the port — but it must never claim nothing is there.
 assert ("host running:   no" in r.stdout) or ("listening on TCP" in r.stdout), r.stdout
 assert "portal capture" in r.stdout, r.stdout
-ok("autostart status reports the entry, the host and the portal token")
+assert "Restart on crash" in r.stdout, r.stdout
+ok("autostart status reports the entry, the restart rule, the host and the portal token")
 
 r = run("autostart", "disable")
 assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
 assert not os.path.exists(entry), "disable removes the entry"
-ok("autostart disable removes the entry")
+assert not os.path.exists(os.path.dirname(dropin)), "disable removes the restart drop-in"
+ok("autostart disable removes the entry and the restart drop-in")
 
 
 print(f"\nALL {len(PASS)} AUTOSTART TESTS PASSED"

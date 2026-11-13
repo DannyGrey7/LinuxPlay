@@ -313,6 +313,12 @@ The entry also shows up in **System Settings → Autostart**, where it can be to
 - **Stopping**: closing the host window stops the host (it waits for encoders and the portal
   session to close). Logging out does the same via SIGTERM. A host started from this launcher
   keeps its own Stop button.
+- **Crash restart**: Plasma and GNOME run the entry as a systemd user unit
+  (`app-linuxplay\x2dhost@autostart.service`). `enable` adds a drop-in so a host that crashes
+  is restarted after 5 s (at most 5 times in 10 minutes), with anything it left running
+  stopped first. A clean stop is not restarted. A host started from the launcher is not
+  supervised; to start the supervised one by hand:
+  `systemctl --user start 'app-linuxplay\x2dhost@autostart.service'`.
 - **Logs**: `~/.local/state/linuxplay/autostart.log` records what the entry did (command line,
   waits, refusals to double-start); the host itself keeps logging to `host.log`.
 
