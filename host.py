@@ -513,6 +513,7 @@ class HostState:
         self.audio_stats = _new_audio_stats()
         self.stream_restarts = {}  # stream name -> encoder restarts this session
         self.video_transport = "udp"   # "rtp": numbered datagrams the client reorders
+        self.portal_stale = False      # a capture stream gave up: renegotiate the share
 
 host_state = HostState()
 HOST_ARGS = None
@@ -1253,6 +1254,10 @@ class StreamThread(threading.Thread):
             for idx, t in list(host_state.video_threads.items()):
                 if t is self:
                     host_state.video_threads.pop(idx, None)
+            if self.feeder_cmd:
+                # The portal share itself may be gone (a stop-sharing click,
+                # KWin or the portal restarting): the next start asks again.
+                host_state.portal_stale = True
         if host_state.audio_thread is self:
             host_state.audio_thread = None
 
@@ -3120,6 +3125,13 @@ def start_streams_for_current_client(args):
                 if portal is None:
                     portal = portal_capture.PortalCapture()
                     host_state.portal = portal
+                elif host_state.portal_stale:
+                    # ensure() would hand back the dead session, and every
+                    # retry would fail the same way until a host restart.
+                    logging.info("Portal: a capture stream gave up — negotiating the "
+                                 "screen share again (the saved token avoids a dialog).")
+                    portal.close()
+                host_state.portal_stale = False
                 try:
                     portal.ensure(multiple=True)
                 except TimeoutError:

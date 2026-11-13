@@ -492,6 +492,42 @@ with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
     host.end_session("cleanup")
     ok("a monitor the client closed stays closed for the rest of the session")
 
+
+# A capture stream that gave up (the share may be gone: a stop-sharing click,
+# KWin or the portal restarting) makes the next start negotiate again, instead
+# of handing every retry the dead session until the host restarts.
+class _RecPortal:
+    def __init__(self):
+        self.calls = []
+
+    def close(self):
+        self.calls.append("close")
+
+    def ensure(self, multiple=True):
+        self.calls.append("ensure")
+
+    def match_stream(self, i, mon):
+        return None
+
+
+host.host_state.portal_stale = False
+host.StreamThread(["true"], "Audio")._retire()
+assert not host.host_state.portal_stale, "only a capture stream marks the share stale"
+host.StreamThread(["true"], "Video 0", feeder_cmd=["true"])._retire()
+assert host.host_state.portal_stale
+with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
+             build_video_cmd=lambda *a, **k: ["ffmpeg"], HOST_ARGS=_args,
+             RECONNECT_COOLDOWN=0.2, **_quiet):
+    _fresh_session()
+    host.host_state.capture_mode, host.host_state.portal = "portal", _RecPortal()
+    st = {"epoch": host.host_state.session_epoch, "failures": 0, "next_attempt": 0.0}
+    host._session_tick(_args, st)
+    assert host.host_state.portal.calls == ["close", "ensure"], host.host_state.portal.calls
+    assert not host.host_state.portal_stale
+    host.end_session("cleanup")
+    host.host_state.portal, host.host_state.capture_mode = None, "x11grab"
+ok("a capture stream that gave up makes the next start negotiate the portal again")
+
 # ── 1h. audio follows the default sink and reports what it did ─────────
 _SOURCES = ("53\talsa_output.hdmi.monitor\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n"
             "98\twivrn.sink.monitor\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"
