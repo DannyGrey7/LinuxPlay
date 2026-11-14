@@ -16,7 +16,8 @@ what replaced that blind spot:
      ticking on wall time, so only the decoded-frame heartbeat sees the
      stall, and the player is replaced.
   6./7. live: the same through the built-in player, plus a burst cut back to
-     the buffer target and a switch to ffplay mid-stream (muted: it plays zeros).
+     the buffer target, a switch to ffplay mid-stream, and late wake-ups that
+     grow the output buffer (muted: it plays zeros).
 
 Sections 4-5 need ffmpeg and ffplay with libopus, 6-7 ffmpeg and
 PyQt5.QtMultimedia; they are skipped otherwise.
@@ -142,6 +143,53 @@ assert q.depth() == 8 and q.dropped == 24, (q.depth(), q.dropped)
 ok("built-in buffer: silence while filling, refill after running dry, bursts and lasting "
    "excess cut to target")
 
+# ── 2c. a mute that lands while ffplay is spawning is not lost ─────────
+class _FakeFfplay:
+    """Popen stand-in: a pipe for stdout; the first spawn gets muted mid-start."""
+    volumes = []
+
+    def __init__(self, cmd, **_kw):
+        r, self._w = os.pipe()
+        self.stdout = os.fdopen(r, "rb", buffering=0)
+        self.args, self.rc = cmd, None
+        _FakeFfplay.volumes.append(cmd[cmd.index("-volume") + 1])
+        if len(_FakeFfplay.volumes) == 1:
+            st["muted"] = True                        # audio_proc is still None here
+
+    def terminate(self):
+        if self._w is not None:
+            os.close(self._w)
+            self._w, self.rc = None, -15
+
+    def poll(self):
+        return self.rc
+
+    def wait(self, timeout=None):
+        return self.rc
+
+
+real_popen = client.subprocess.Popen
+st.update(player="ffplay", muted=False, muted_since=None, restarts=0)
+client.subprocess.Popen = _FakeFfplay
+try:
+    listener = client.audio_listener("127.0.0.1", enabled=True)
+    deadline = time.time() + 5
+    while time.time() < deadline and len(_FakeFfplay.volumes) < 2:
+        time.sleep(0.05)
+    assert _FakeFfplay.volumes[:2] == ["100", "0"], _FakeFfplay.volumes
+    assert st["restarts"] == 0, "a planned restart, not a glitch"
+finally:
+    client.audio_stop.set()
+    if client.audio_proc:
+        client.audio_proc.terminate()
+    listener.join(timeout=5)
+    client.subprocess.Popen = real_popen
+    client.audio_stop.clear()
+    client._audio_listener_started = False
+    client._audio_planned_restart.clear()
+    st.update(player="builtin", muted=False, muted_since=None)
+ok("a mute that lands while ffplay is spawning restarts it at the new volume")
+
 # ── 3. the status banner ──────────────────────────────────────────────
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -208,7 +256,7 @@ else:
               silence_longest=0.0, muted=False, muted_since=None, muted_total=0.0)
     pump = subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re",
-         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=14",
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=20",   # toggles restart ffplay
          "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
          "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
          "-c:a", "libopus", "-ar", "48000", "-ac", "2",
@@ -375,6 +423,23 @@ else:
         client.AUDIO_STALL_SECS = stall_secs
         _stop_listener(listener)
     ok("live built-in player: undecodable data is caught and the player replaced")
+
+    # A player that wakes up later than its output buffer lasts (a busy GIL, a
+    # throttled process) grows the buffer instead of crackling.
+    listener = None
+    tick, client.AUDIO_TICK = client.AUDIO_TICK, 0.05     # 50 ms wake-ups …
+    client.AUDIO_STATE["device_ms"] = 40                   # … for a 40 ms buffer
+    try:
+        listener = _fresh_listener()
+        assert _wait_for("output buffer grows from 40 to 80 ms", 5), records[-8:]
+        assert _wait_for("80 ms output buffer", 3), records[-8:]
+        time.sleep(1.0)
+        assert client.AUDIO_STATE["device_ms"] >= 80 and st["restarts"] == 0, records[-8:]
+    finally:
+        client.AUDIO_TICK = tick
+        _stop_listener(listener)
+        client.AUDIO_STATE["device_ms"] = client.AUDIO_DEVICE_MS
+    ok("live built-in player: late wake-ups grow the output buffer (a planned restart)")
 
 
 print(f"\nALL {len(PASS)} CLIENT AUDIO TESTS PASSED"

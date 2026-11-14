@@ -863,7 +863,9 @@ AUDIO_LIMIT_MS = 250
 # A shorter gap leaves the late packets arriving together below the limit, and
 # that delay would stay: more than twice the target for this long settles it.
 AUDIO_SETTLE_SECS = 1.0
-AUDIO_DEVICE_MS = 40            # Qt's own buffer in front of the sound card
+AUDIO_DEVICE_MS = 40            # Qt's own buffer in front of the sound card …
+AUDIO_DEVICE_MAX_MS = 160       # … doubled up to this when the player wakes up late
+AUDIO_TICK = 0.01               # how often the player refills it
 AUDIO_OUTPUT_STUCK_SECS = 2.0   # the sound card took nothing this long: reopen it
 _PCM_PER_MS = 192               # bytes of s16 stereo at 48 kHz
 _SILENCE_PEAK = round(32768 * 10 ** (AUDIO_SILENCE_DB / 20))
@@ -874,6 +876,7 @@ AUDIO_STATE = {
     "muted": False, "muted_since": None, "muted_total": 0.0,
     "silent_since": None, "silence_total": 0.0, "silence_longest": 0.0,
     "player": "builtin", "used": set(), "dry": 0, "dropped": 0.0,
+    "device_ms": AUDIO_DEVICE_MS,
 }
 
 
@@ -946,8 +949,8 @@ def audio_report(now=None):
         cur = now - st["silent_since"]
         silent, longest = silent + cur, max(longest, cur)
     muted = st["muted_total"] + ((now - st["muted_since"]) if st["muted_since"] else 0.0)
-    builtin = (f", built-in player: buffer ran dry {st['dry']}×, {st['dropped']:.1f}s dropped"
-               if "builtin" in st["used"] else "")
+    builtin = (f", built-in player: buffer ran dry {st['dry']}×, {st['dropped']:.1f}s dropped, "
+               f"{st['device_ms']} ms output buffer" if "builtin" in st["used"] else "")
     return (f"Audio report: {_fmt_secs(span)}, {st['restarts']} player restarts "
             f"({st['stalls']} stalls), silent {100.0 * silent / span:.0f}% "
             f"(longest {_fmt_secs(longest)}), muted {_fmt_secs(muted)}{builtin}.")
@@ -1198,22 +1201,38 @@ class _BuiltinAudio:
             self.unavailable = f"no output device takes 48 kHz 16-bit stereo ({name or 'none'})"
             self._end(1, self.unavailable)
             return
+        device_ms = AUDIO_STATE["device_ms"]
         out = QAudioOutput(device, fmt)
-        out.setBufferSize(AUDIO_DEVICE_MS * _PCM_PER_MS)
+        out.setBufferSize(device_ms * _PCM_PER_MS)
         out.setNotifyInterval(0)
         sink = out.start()
         if sink is None or out.error() != QAudio.NoError:
             self.unavailable = f"output {name!r} did not open (error {int(out.error())})"
             self._end(1, self.unavailable)
             return
-        logging.info("Audio output: %s (built-in player).", name)
+        logging.info("Audio output: %s (built-in player, %d ms output buffer).", name, device_ms)
         q = self.queue
         quiet_since = stuck_since = None
-        next_device_check = report_at = time.time()
-        seen = (0, 0)
+        next_device_check = report_at = last_wake = time.time()
+        seen, late, slowest = (0, 0), 0, 0.0
         try:
             while not self._stop.is_set():
                 now = time.time()
+                gap, last_wake = now - last_wake, now
+                slowest = max(slowest, gap)
+                # Woken too late to refill before the sound card ran out (a busy
+                # GIL, a throttled process: 10 ms sleeps took ~85 ms in one on
+                # the Mac). That crackles, so give the card more to hold.
+                if gap * 1000 > 0.75 * device_ms:
+                    late += 1
+                    if late >= 3 and device_ms < AUDIO_DEVICE_MAX_MS:
+                        AUDIO_STATE["device_ms"] = min(2 * device_ms, AUDIO_DEVICE_MAX_MS)
+                        logging.warning("Audio: the player woke up late %d times (%.0f ms) — "
+                                        "its output buffer grows from %d to %d ms.", late,
+                                        gap * 1000, device_ms, AUDIO_STATE["device_ms"])
+                        self.planned = True
+                        self._end(0)
+                        break
                 period = out.periodSize() or 1920
                 free = out.bytesFree()
                 if free >= period:
@@ -1240,13 +1259,15 @@ class _BuiltinAudio:
                         break
                 if now - report_at >= 60.0:
                     cur = (q.underruns, q.dropped)
-                    if cur != seen:
-                        logging.info("Audio: the buffer ran dry %d times and %.2fs of late audio "
-                                     "was dropped in the last %.0fs (holding %d ms now).",
-                                     cur[0] - seen[0], (cur[1] - seen[1]) / (_PCM_PER_MS * 1000),
-                                     now - report_at, q.depth() // _PCM_PER_MS)
-                    seen, report_at = cur, now
-                time.sleep(0.01)
+                    if cur != seen or late:
+                        logging.info("Audio: in the last %.0fs the buffer ran dry %d times, %.2fs "
+                                     "of late audio was dropped and the player woke up late %d "
+                                     "times (slowest %.0f ms); holding %d ms now.",
+                                     now - report_at, cur[0] - seen[0],
+                                     (cur[1] - seen[1]) / (_PCM_PER_MS * 1000), late,
+                                     slowest * 1000, q.depth() // _PCM_PER_MS)
+                    seen, report_at, late, slowest = cur, now, 0, 0.0
+                time.sleep(AUDIO_TICK)
         except Exception as e:
             self._end(1, f"output: {e}")
         finally:
@@ -1364,6 +1385,12 @@ def audio_listener(host_ip, enabled=True, muted=False):
             except Exception:
                 pass
             return proc
+        if (AUDIO_STATE["player"] != "ffplay"
+                or (cmd[cmd.index("-volume") + 1] == "0") != AUDIO_STATE["muted"]):
+            # A mute or a player switch landed while this one was spawning,
+            # when there was no player to restart: restart it now.
+            _audio_planned_restart.set()
+            proc.terminate()
         last_clock = None
         last_progress = None         # last decoded-audio heartbeat
         buf = b""
@@ -1434,6 +1461,9 @@ def audio_listener(host_ip, enabled=True, muted=False):
         global audio_proc
         proc = _BuiltinAudio()
         audio_proc = proc
+        if AUDIO_STATE["player"] != "builtin":   # switched while it was starting
+            _audio_planned_restart.set()
+            proc.terminate()
         while proc.poll() is None:
             if audio_stop.is_set():
                 proc.terminate()     # also covers a shutdown that missed audio_proc
