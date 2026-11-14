@@ -62,12 +62,12 @@ def gst_pipewiresrc_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def gpu_feeder_enabled() -> bool:
-    """LINUXPLAY_PORTAL_GPU=1 asks for the GPU feeder; it needs GStreamer's VA plugin.
+    """The GPU feeder is used unless LINUXPLAY_PORTAL_GPU=0; it needs GStreamer's VA plugin.
 
     The va plugin only registers vapostproc when the VA driver can post-process,
     so the element being there is the driver check.
     """
-    return os.environ.get("LINUXPLAY_PORTAL_GPU") == "1" and gst_element_available("vapostproc")
+    return os.environ.get("LINUXPLAY_PORTAL_GPU", "1") != "0" and gst_element_available("vapostproc")
 
 
 def nv12_frame_dims(w, h):

@@ -203,7 +203,7 @@ assert "size=_portal_stream_size(ps, stream_size)" in \
     "the feeder must be told the same size the encoder reads"
 ok("portal: encoder reads the size the feeder writes when the probe disagrees")
 
-# GPU feeder (LINUXPLAY_PORTAL_GPU=1): GStreamer pads NV12 rows to 4 bytes, so
+# GPU feeder (the default): GStreamer pads NV12 rows to 4 bytes, so
 # 2194 wide arrives as 2196. The encoder reads the padded frame and crops it;
 # read as 2194, every frame would start 3,702 bytes early and roll the picture.
 with patched(host, ffmpeg_has_encoder=lambda n: True, has_vaapi=lambda: True):

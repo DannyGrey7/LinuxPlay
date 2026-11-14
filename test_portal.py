@@ -65,6 +65,25 @@ assert pc.nv12_frame_dims(1707, 1067) == (1708, 1068)
 assert pc.nv12_frame_dims(1280, 720) == (1280, 720)
 ok("GPU feeder: vapostproc to NV12 at the stream size, rate cap kept, padded frame known")
 
+# On by default wherever vapostproc exists; LINUXPLAY_PORTAL_GPU=0 turns it off.
+_env, _avail = os.environ.get("LINUXPLAY_PORTAL_GPU"), pc.gst_element_available
+try:
+    for _val, _has, _want in ((None, True, True), ("1", True, True), ("0", True, False),
+                              (None, False, False)):
+        os.environ.pop("LINUXPLAY_PORTAL_GPU", None)
+        if _val is not None:
+            os.environ["LINUXPLAY_PORTAL_GPU"] = _val
+        pc.gst_element_available = lambda name, _has=_has: _has and name == "vapostproc"
+        pc.gpu_feeder_enabled.cache_clear()
+        assert pc.gpu_feeder_enabled() is _want, (_val, _has, _want)
+finally:
+    os.environ.pop("LINUXPLAY_PORTAL_GPU", None)
+    if _env is not None:
+        os.environ["LINUXPLAY_PORTAL_GPU"] = _env
+    pc.gst_element_available = _avail
+    pc.gpu_feeder_enabled.cache_clear()
+ok("GPU feeder is the default where vapostproc exists; LINUXPLAY_PORTAL_GPU=0 turns it off")
+
 # ── negotiation logging, without a portal: what the log says about prompts ──
 import logging  # noqa: E402
 

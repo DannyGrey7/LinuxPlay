@@ -458,12 +458,20 @@ LinuxPlay detects the session type automatically (`XDG_SESSION_TYPE` / `WAYLAND_
   matching client on the other end — an older client would map clicks by the scaled video.
   Odd sizes work but the encoder pads them to even (1707x1067 arrives as 1708x1068), so a
   standard size like 1920x1080 avoids the extra pixel row.
+- **GPU feeder** (the default when GStreamer's VA plugin provides `vapostproc`: Intel/AMD,
+  `gst-plugins-bad`): the feeder takes the frames as DMA-BUF and scales and converts them to
+  NV12 on the GPU. Over shared memory, KWin re-renders each frame into a new texture and reads it
+  back on its main thread. On KDE Plasma 6.8 with a 3840x2160 panel at 175% that capped capture
+  at 30 fps, and at 12 with VR running. With DMA-BUF it was 60, at a third of the CPU (feeder,
+  encoder and KWin together; see `docs/audit/2026-11-framerate.md`). `LINUXPLAY_PORTAL_GPU=0`
+  uses the CPU feeder. A GPU feeder that fails in its first 60 s switches to the CPU feeder by
+  itself.
 - **Capture rate**: the portal path is damage-driven, and how fast it can push depends on the
   panel's refresh and the captured resolution — measured ~48 fps at 2560x1440 on 60 Hz panels,
   but ~72 fps at 1707x1067 on a 119 Hz panel (a single PipeWire consumer either way; two
-  consumers get roughly double between them). The feeder drops whatever exceeds `--framerate`
-  (`videorate drop-only=true`), so the overlay's *encoder out* fps stays at your setting instead
-  of running away with the bitrate.
+  consumers get roughly double between them; CPU feeder, measured 2026-09). The feeder drops
+  whatever exceeds `--framerate` (`videorate drop-only=true`), so the overlay's *encoder out* fps
+  stays at your setting instead of running away with the bitrate.
 - **Limitations**: each monitor must be selected in the portal dialog for multi-monitor
   streaming; NVIDIA kmsgrab users may need `nvidia-drm.modeset=1`.
 
