@@ -336,11 +336,15 @@ else:
 
 # ── 6./7. live: the built-in player ───────────────────────────────────
 def _opus_pump(lavfi, realtime=True):
-    """ffmpeg sending lavfi audio the way the host does (Opus, 20 ms, MPEG-TS)."""
+    """ffmpeg sending lavfi audio the way the host does (Opus, 20 ms frames and PES)."""
     return subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", *(["-re"] if realtime else []),
          "-f", "lavfi", "-i", lavfi, "-c:a", "libopus", "-b:a", "128k",
          "-frame_duration", "20", "-ar", "48000", "-ac", "2",
+         # The host's mux flags: one 20 ms Opus frame per PES. ffmpeg's defaults
+         # pack ~100 ms per PES, lumps the host never sends.
+         "-flush_packets", "1", "-max_interleave_delta", "0", "-muxdelay", "0",
+         "-muxpreload", "0",
          "-f", "mpegts", f"udp://127.0.0.1:{client.UDP_AUDIO_PORT}?pkt_size=1316"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
