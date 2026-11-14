@@ -12,6 +12,7 @@ Works on KDE Plasma, GNOME and wlroots compositors. The compositor shows a
 screen-share permission dialog on first use; approval can be persisted by
 the portal (restore token stored in ~/.config/linuxplay/).
 """
+import functools
 import json
 import logging
 import os
@@ -41,18 +42,41 @@ PERSISTENT = 2       # persist_mode: portal may store a restore token
 DIALOG_SECS = 3.0
 
 
-def gst_pipewiresrc_available() -> bool:
+def gst_element_available(name) -> bool:
     import shutil, subprocess
     if not shutil.which("gst-launch-1.0"):
         return False
     try:
         out = subprocess.run(
-            ["gst-inspect-1.0", "pipewiresrc"],
+            ["gst-inspect-1.0", name],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
         )
         return out.returncode == 0
     except Exception:
         return False
+
+
+def gst_pipewiresrc_available() -> bool:
+    return gst_element_available("pipewiresrc")
+
+
+@functools.lru_cache(maxsize=1)
+def gpu_feeder_enabled() -> bool:
+    """LINUXPLAY_PORTAL_GPU=1 asks for the GPU feeder; it needs GStreamer's VA plugin.
+
+    The va plugin only registers vapostproc when the VA driver can post-process,
+    so the element being there is the driver check.
+    """
+    return os.environ.get("LINUXPLAY_PORTAL_GPU") == "1" and gst_element_available("vapostproc")
+
+
+def nv12_frame_dims(w, h):
+    """The frame GStreamer writes for NV12 w x h: rows padded to 4 bytes, rows even.
+
+    ffmpeg's rawvideo reader expects packed rows, so the encoder reads this size
+    and crops back to w x h (2194 wide arrives as 2196: 4,064,796 bytes a frame).
+    """
+    return (w + 3) // 4 * 4, (h + 1) // 2 * 2
 
 
 def _load_restore_token():
@@ -363,8 +387,8 @@ class PortalCapture:
             self.conn = None
 
 
-def build_feeder_cmd(stream, fps=None, size=None):
-    """gst-launch pipeline piping raw BGRx frames of this stream to stdout.
+def build_feeder_cmd(stream, fps=None, size=None, gpu=False):
+    """gst-launch pipeline piping raw BGRx frames (gpu: NV12) of this stream to stdout.
 
     videoscale is not optional here: the portal reports the monitor's *logical*
     size (1707x1067 for a 2560x1600 panel at 150% scaling) while the node hands
@@ -380,18 +404,32 @@ def build_feeder_cmd(stream, fps=None, size=None):
     fps caps the rate the compositor pushes — a 120 Hz panel under damage can
     exceed the host's --framerate; drop-only means a slow compositor is never
     padded out with duplicate frames.
+
+    gpu: vapostproc's sink takes DMA-BUF first, so KWin renders each frame
+    straight into a GPU buffer instead of re-rendering the whole output and
+    reading 33 MB back on its main thread (KWin 6.8, SHM casts). It then scales
+    and converts to NV12 on the GPU. It also takes SHM buffers: a compositor
+    that refuses DMA-BUF still negotiates.
     """
     w, h = size or (stream["w"], stream["h"])
     # fps absent = no rate cap; an unparseable value falls back to the same
     # 60 the encoder side uses, so both halves agree on what is valid.
     fps_i = parse_framerate(fps, 60) if fps else 0
-    caps = f"video/x-raw,format=BGRx,width={w},height={h}"
+    # 2:4:7:1 = limited range, BT.601 matrix, the source's own transfer and
+    # primaries: swscale's untagged conversion, which the client assumes
+    # (measured; "bt601" also converts the primaries and shifts reds/greens).
+    caps = (f"video/x-raw,format=NV12,width={w},height={h},colorimetry=2:4:7:1" if gpu
+            else f"video/x-raw,format=BGRx,width={w},height={h}")
     if fps_i:
         caps += f",framerate={fps_i}/1"
     cmd = ["gst-launch-1.0", "-q", "pipewiresrc", f"path={stream['node']}", "!"]
     if fps_i:
         cmd += ["videorate", "drop-only=true", "!"]
-    # n-threads: one thread spent ~10 ms a frame scaling a 4K panel (175%) to its
-    # 2194x1234 logical size; four take ~2 ms, i.e. ~8 ms less latency a frame.
-    cmd += ["videoconvert", "!", "videoscale", "n-threads=4", "!", caps, "!", "fdsink", "sync=false"]
+    if gpu:
+        cmd += ["vapostproc"]
+    else:
+        # n-threads: one thread spent ~10 ms a frame scaling a 4K panel (175%) to its
+        # 2194x1234 logical size; four take ~2 ms, i.e. ~8 ms less latency a frame.
+        cmd += ["videoconvert", "!", "videoscale", "n-threads=4"]
+    cmd += ["!", caps, "!", "fdsink", "sync=false"]
     return cmd

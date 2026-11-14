@@ -50,6 +50,21 @@ _scaled_feeder = pc.build_feeder_cmd(_stream, fps=60, size=(1280, 720))
 assert "video/x-raw,format=BGRx,width=1280,height=720,framerate=60/1" in _scaled_feeder, _scaled_feeder
 ok("feeder command rescales the node's buffers to the logical size")
 
+# GPU feeder: vapostproc scales and converts on the GPU (DMA-BUF in, NV12 out),
+# keeps the rate cap, and writes BT.601 without a primaries conversion — what
+# swscale made of the BGRx before (measured on SMPTE bars: identical values).
+_gpu = pc.build_feeder_cmd(_stream, fps=60, size=(2194, 1234), gpu=True)
+assert "vapostproc" in _gpu and "videoscale" not in _gpu and "videoconvert" not in _gpu, _gpu
+assert ("video/x-raw,format=NV12,width=2194,height=1234,colorimetry=2:4:7:1,framerate=60/1"
+        in _gpu), _gpu
+assert _gpu.index("videorate") < _gpu.index("vapostproc"), _gpu
+# GStreamer's NV12 rows are 4-byte aligned and its row count even; the encoder
+# reads this padded size (test_host pins it), else every frame starts mid-row.
+assert pc.nv12_frame_dims(2194, 1234) == (2196, 1234)
+assert pc.nv12_frame_dims(1707, 1067) == (1708, 1068)
+assert pc.nv12_frame_dims(1280, 720) == (1280, 720)
+ok("GPU feeder: vapostproc to NV12 at the stream size, rate cap kept, padded frame known")
+
 # ── negotiation logging, without a portal: what the log says about prompts ──
 import logging  # noqa: E402
 

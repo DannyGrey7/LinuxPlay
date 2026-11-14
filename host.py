@@ -514,6 +514,7 @@ class HostState:
         self.stream_restarts = {}  # stream name -> encoder restarts this session
         self.video_transport = "udp"   # "rtp": numbered datagrams the client reorders
         self.portal_stale = False      # a capture stream gave up: renegotiate the share
+        self.portal_gpu_failed = False  # the GPU feeder failed once: CPU feeder from now on
 
 host_state = HostState()
 HOST_ARGS = None
@@ -1055,11 +1056,15 @@ class StreamThread(threading.Thread):
     lets the session manager retry the stream later.
     """
 
-    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None,
+                 fallback=None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.name = name
         self.feeder_cmd = feeder_cmd
+        # (cmd, feeder_cmd) to switch to when a run fails before it was
+        # healthy: the GPU feeder hands over to the CPU one.
+        self.fallback = fallback
         # seqrelay between the encoder and the client (RTP video): started
         # first, and its death restarts the stream like the encoder's would.
         self.relay_cmd = relay_cmd
@@ -1289,8 +1294,8 @@ class StreamThread(threading.Thread):
         while self._running and not host_state.should_terminate:
             if failures:
                 self._refresh_cmd()
+            started = time.time()
             if self._start_children():
-                started = time.time()
                 ret, err = self._wait_for_exit()
                 if not self._running or host_state.should_terminate:
                     break
@@ -1303,6 +1308,13 @@ class StreamThread(threading.Thread):
                                   (err or "(no output)").strip()[-1500:])
             else:
                 logging.error("%s could not be started.", self.name)
+
+            if self.fallback and time.time() - started < STREAM_HEALTHY_SECS:
+                logging.warning("%s: the GPU feeder failed before the stream ran healthy — "
+                                "using the CPU feeder from now on.", self.name)
+                self.cmd, self.feeder_cmd = self.fallback
+                self.fallback = None
+                host_state.portal_gpu_failed = True
 
             failures += 1
             host_state.stream_restarts[self.name] = host_state.stream_restarts.get(self.name, 0) + 1
@@ -1998,7 +2010,8 @@ def _normalise_codec(value) -> str:
     return "h.264"
 
 
-def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None, stream_size=None):
+def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None, stream_size=None,
+                    gpu_feeder=False):
     try:
         # float() first so a fractional --framerate (29.97) resolves the same
         # way the portal feeder resolves it instead of raising there.
@@ -2074,23 +2087,26 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
         pw, ph = int(portal_stream["w"]), int(portal_stream["h"])
         logging.info("Linux capture: portal/PipeWire node %s (%sx%s) selected (pref=%s).",
                      portal_stream.get("node"), pw, ph, capture_pref)
+        # The GPU feeder writes NV12 with GStreamer's padded rows: read those, crop them off.
+        in_w, in_h = portal_capture.nv12_frame_dims(cap_w, cap_h) if gpu_feeder else (cap_w, cap_h)
+        crop = [f"crop={cap_w}:{cap_h}:0:0"] if (in_w, in_h) != (cap_w, cap_h) else []
         input_side = [
             *base_in,
             "-f", "rawvideo",
-            "-pixel_format", "bgr0",
-            "-video_size", f"{cap_w}x{cap_h}",
+            "-pixel_format", "nv12" if gpu_feeder else "bgr0",
+            "-video_size", f"{in_w}x{in_h}",
             "-framerate", str(fps_i),
             "-i", "-",
         ]
         if (cap_w, cap_h) != (pw, ph):
-            logging.info("Capture %dx%d → streaming %dx%d (videoscale in the feeder).",
+            logging.info("Capture %dx%d → streaming %dx%d (scaled in the feeder).",
                          pw, ph, cap_w, cap_h)
         extra_filters, encode = _pick_encoder_args(
             codec=codec_name, hwenc=args.hwenc, preset=preset,
             gop=gop, qp=qp, tune=tune, bitrate=bitrate, pix_fmt=pix_fmt
         )
         if any(x in encode for x in ("h264_vaapi", "hevc_vaapi")):
-            extra_filters = ["-vf", "format=nv12,hwupload",
+            extra_filters = ["-vf", ",".join(crop + ["format=nv12", "hwupload"]),
                              "-vaapi_device", "/dev/dri/renderD128"]
             # The encoder takes VAAPI surfaces uploaded from nv12: the stream is
             # 4:2:0 whatever --pix_fmt says. ffmpeg used to ignore the flag with
@@ -2103,7 +2119,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port, portal_stream=None,
                            "VAAPI encodes 4:2:0 from nv12 surfaces — --pix_fmt %s has no "
                            "effect on the portal path.", pix_fmt)
         else:
-            extra_filters = ["-vf", f"format={pix_fmt or 'yuv420p'}"]
+            extra_filters = ["-vf", ",".join(crop + [f"format={pix_fmt or 'yuv420p'}"])]
         output_side = _output_sync_flags()
         pkt_size = _video_pkt_size(ip)
         path_mtu = _path_mtu(ip)
@@ -3157,8 +3173,10 @@ def start_streams_for_current_client(args):
                 # prompt): the session manager restarts them if it changes.
                 host_state.streams_net_mode = host_state.net_mode
                 stream_size = getattr(host_state, "stream_size", None)
+                gpu = bool(portal and ps) and not host_state.portal_gpu_failed \
+                    and portal_capture.gpu_feeder_enabled()
                 cmd = build_video_cmd(args, host_state.current_bitrate, mon, UDP_VIDEO_PORT + i,
-                                      portal_stream=ps, stream_size=stream_size)
+                                      portal_stream=ps, stream_size=stream_size, gpu_feeder=gpu)
                 if not cmd:
                     logging.error(f"Failed to build video cmd for monitor {i}; skipping.")
                     continue
@@ -3166,8 +3184,14 @@ def start_streams_for_current_client(args):
                 # the feeder writes into the pipe is what the encoder reads.
                 feeder = portal_capture.build_feeder_cmd(
                     ps, fps=args.framerate,
-                    size=_portal_stream_size(ps, stream_size)) if (portal and ps) else None
-                t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder,
+                    size=_portal_stream_size(ps, stream_size), gpu=gpu) if (portal and ps) else None
+                fallback = (build_video_cmd(args, host_state.current_bitrate, mon,
+                                            UDP_VIDEO_PORT + i, portal_stream=ps,
+                                            stream_size=stream_size),
+                            portal_capture.build_feeder_cmd(
+                                ps, fps=args.framerate,
+                                size=_portal_stream_size(ps, stream_size))) if gpu else None
+                t = StreamThread(cmd, f"Video {i}", feeder_cmd=feeder, fallback=fallback,
                                  relay_cmd=_video_relay_cmd(UDP_VIDEO_PORT + i))
                 t.start()
                 host_state.video_threads[i] = t

@@ -203,6 +203,28 @@ assert "size=_portal_stream_size(ps, stream_size)" in \
     "the feeder must be told the same size the encoder reads"
 ok("portal: encoder reads the size the feeder writes when the probe disagrees")
 
+# GPU feeder (LINUXPLAY_PORTAL_GPU=1): GStreamer pads NV12 rows to 4 bytes, so
+# 2194 wide arrives as 2196. The encoder reads the padded frame and crops it;
+# read as 2194, every frame would start 3,702 bytes early and roll the picture.
+with patched(host, ffmpeg_has_encoder=lambda n: True, has_vaapi=lambda: True):
+    old_ip = host.host_state.client_ip
+    host.host_state.client_ip = "127.0.0.1"
+    try:
+        gpu_cmd = host.build_video_cmd(_scaled, "30M", (2195, 1235, 0, 0), 5000,
+                                       portal_stream=_portal_frac, gpu_feeder=True)
+        gpu_720 = host.build_video_cmd(_scaled, "30M", (2195, 1235, 0, 0), 5000,
+                                       portal_stream=_portal_frac, stream_size=(1280, 720),
+                                       gpu_feeder=True)
+    finally:
+        host.host_state.client_ip = old_ip
+assert gpu_cmd[gpu_cmd.index("-pixel_format") + 1] == "nv12", gpu_cmd
+assert gpu_cmd[gpu_cmd.index("-video_size") + 1] == "2196x1234", gpu_cmd
+assert gpu_cmd[gpu_cmd.index("-vf") + 1] == "crop=2194:1234:0:0,format=nv12,hwupload", gpu_cmd
+assert gpu_720[gpu_720.index("-video_size") + 1] == "1280x720", gpu_720
+assert gpu_720[gpu_720.index("-vf") + 1] == "format=nv12,hwupload", gpu_720
+assert frac_cmd[frac_cmd.index("-pixel_format") + 1] == "bgr0", "CPU feeder unchanged"
+ok("GPU feeder: the encoder reads GStreamer's padded NV12 frame and crops it back")
+
 # ── 1d. x11grab keeps the full-monitor region; --resolution scales in ffmpeg ──
 os.environ["LINUXPLAY_CAPTURE"] = "x11grab"
 try:
@@ -332,7 +354,8 @@ class _FakeStream:
     """Stands in for StreamThread: records starts, never spawns ffmpeg."""
     started = []
 
-    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None):
+    def __init__(self, cmd, name, feeder_cmd=None, cmd_factory=None, relay_cmd=None,
+                 fallback=None):
         self.name = name
         self.relay_cmd = relay_cmd
 
@@ -676,6 +699,18 @@ _st = host.StreamThread(None, "Audio", cmd_factory=lambda: ["ffmpeg", "-i", "x"]
 _st._refresh_cmd()
 assert _st.cmd == ["ffmpeg", "-i", "x"]
 ok("a stream with a command factory rebuilds its command before each start")
+
+# A GPU feeder run that fails before it was healthy hands over to the CPU
+# feeder, and the streams of later sessions start on the CPU one.
+host.host_state.portal_gpu_failed = False
+with patched(host, STREAM_MAX_RESTARTS=1, **_quiet):
+    _gt = host.StreamThread(["false"], "Video 8", feeder_cmd=["true"],
+                            fallback=(["true"], ["true"]))
+    _gt.run()
+assert _gt.cmd == ["true"] and _gt.fallback is None, (_gt.cmd, _gt.fallback)
+assert host.host_state.portal_gpu_failed
+host.host_state.portal_gpu_failed = host.host_state.portal_stale = False
+ok("a GPU feeder that fails early hands over to the CPU feeder")
 
 # The handshake reply names the transport only when the client asked for it.
 with patched(host, StreamThread=_FakeStream, build_audio_cmd=lambda: ["ffmpeg"],
